@@ -116,6 +116,13 @@ abstract final class AppConfig {
   static const mtRepeatPenalty = 1.05;
   static const mtMaxTokens = 256;
 
+  // ---- Device requirements ----------------------------------------------
+  // Resident RAM observed: Qwen3-ASR-0.6B ~2.2 GB, Hy-MT2-1.8B ~0.9 GB.
+  // Below these free-RAM levels the OS low-memory killer terminates the app
+  // (silent death, no exception). The provider checks before loading.
+  static const asrNeedFreeBytes = 2300000000;
+  static const mtNeedFreeBytes = 900000000;
+
   // ---- Audio -------------------------------------------------------------
   static const sampleRate = 16000;
   static const channels = 1;

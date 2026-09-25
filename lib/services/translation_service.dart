@@ -40,6 +40,17 @@ class TranslationService {
       e.toString().toLowerCase().contains('stq') ||
       e.toString().toLowerCase().contains('load');
 
+  /// Free device RAM in bytes, or -1 if it cannot be determined.
+  /// Used for the pre-load memory check (the OS kills the app silently
+  /// once both models are resident on a RAM-starved device).
+  Future<int> freeRamBytes() async {
+    try {
+      return (await _controller.detectGpu()).freeRamBytes;
+    } catch (_) {
+      return -1;
+    }
+  }
+
   /// Load a GGUF file. Uses GPU auto-detection (Vulkan) when available.
   Future<void> load(String ggufPath) async {
     if (_loaded && _modelPath == ggufPath) return;

@@ -155,6 +155,22 @@ class SessionProvider extends ChangeNotifier {
 
   /// Load native engines. Call once from Setup before starting a session.
   Future<void> ensureEngines() async {
+    final needMt = translationEnabled && !mt.isLoaded;
+    if (!asr.isReady || needMt) {
+      // Preflight: both models resident need ~3 GB. Without this check the
+      // OS low-memory killer just terminates the app with no error.
+      final free = await mt.freeRamBytes();
+      final need = AppConfig.asrNeedFreeBytes +
+          (needMt ? AppConfig.mtNeedFreeBytes : 0);
+      if (free > 0 && free < need) {
+        throw StateError(
+          'Only ${(free / 1048576).round()} MB RAM free, but ~${(need / 1073741824).toStringAsFixed(1)} GB is needed '
+          '(ASR ~2.2 GB${needMt ? ' + translation ~0.9 GB' : ''}). '
+          'Fix: turn off translation, close other apps, or use a device '
+          'with more RAM (8 GB+ recommended).',
+        );
+      }
+    }
     if (!asr.isReady) {
       status = 'Loading ASR engine…';
       notifyListeners();
