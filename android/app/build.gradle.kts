@@ -23,7 +23,7 @@ android {
 
     defaultConfig {
         applicationId = "com.example.conference_asr_translator"
-        // llama_flutter_android needs API 26+; qwen_asr + record are fine here.
+        // llama_flutter_android needs API 26+; sherpa_onnx + record are fine here.
         minSdk = 26
         targetSdk = 35
         versionCode = 1
@@ -31,7 +31,7 @@ android {
     }
 
     // NOTE: shrinking/minification stay at their defaults (off), which is
-    // what we want — the qwen_asr Rust engine and llama.cpp JNI symbols
+    // what we want — the sherpa-onnx onnxruntime and llama.cpp JNI symbols
     // must never be stripped.
 }
 

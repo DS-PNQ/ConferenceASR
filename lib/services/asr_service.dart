@@ -1,114 +1,131 @@
-import 'dart:async';
 import 'dart:typed_data';
 
-import 'package:qwen_asr/qwen_asr.dart';
+import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa;
 
 import '../config/app_config.dart';
 
-/// Result of one streaming push: committed stable text + revisable tail.
-class AsrPartial {
-  AsrPartial(this.stable, this.provisional);
-  final String stable;
-  final String provisional;
+/// One offline transcription: text plus the model's own language id
+/// (e.g. 'en', 'zh', 'vi', '' when unknown).
+class Transcription {
+  Transcription(this.text, this.lang);
+  final String text;
+  final String lang;
 }
 
-/// Thin wrapper over `qwen_asr`'s [QAsrEngine] with app-level conventions.
+/// Thin wrapper over sherpa-onnx's offline Qwen3-ASR recognizer
+/// (model `sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25`).
 ///
-/// Two decode modes:
-/// * **Utterance mode (default here):** diarization closes an utterance,
-///   we call [transcribeUtterance] (one-shot PCM path — the most
-///   WER-validated path in QwenASR). Best for conferences: clean speaker
-///   turns, no cross-talk smearing.
-/// * **Live streaming mode:** mic frames go straight to [pushStreamChunk]
-///   for lowest latency (stable + provisional text). Speaker labels still
-///   come from the diarizer running in parallel; turns may split mid-chunk.
-///
-/// Language handling (qwen_asr API):
-/// * [setSourceLang] → `setLanguage(qwenName)` before the session, plus
-///   `setMultilingual(true)` when source is Auto so each utterance is
-///   re-detected (vi/en/zh code-switching inside one meeting).
+/// Notes on engine semantics (differences vs the previous implementation):
+/// * **Offline-only.** sherpa-onnx exposes Qwen3-ASR as a non-streaming
+///   model, so every call decodes a complete audio buffer. The app's
+///   diarizer supplies utterance boundaries; low-latency "live" text is a
+///   throttled re-decode of the in-progress utterance (see SessionProvider).
+/// * **Language is auto-detected** by the model per utterance — there is no
+///   `setLanguage` equivalent in `OfflineQwen3AsrModelConfig`. The source
+///   selector in the UI drives translation + labels; [appLangForResult]
+///   maps the model's own `lang` id back to [AppLang] for segment badges.
+/// * `decode()` is **synchronous FFI** and blocks the calling isolate for
+///   the decode duration (matches the official sherpa-onnx Flutter
+///   examples). Calls are short (RTF ~0.1–0.2) and run one at a time from
+///   the provider's serial pipeline.
 class AsrService {
   AsrService();
 
-  QAsrEngine? _engine;
-  bool _ready = false;
+  sherpa.OfflineRecognizer? _recognizer;
+  static bool _bindingsInit = false;
 
-  bool get isReady => _ready;
+  /// Milliseconds the last [transcribeUtterance] decode took (0 = none yet).
+  int lastDecodeMs = 0;
 
-  /// Load the model once (heavy: ~2–3 s, ~1.8 GB dir for the 0.6B model).
-  /// [modelDir] must contain model.safetensors, vocab.json, merges.txt.
-  Future<void> load(String modelDir, {AppLang lang = AppLang.auto}) async {
+  bool get isReady => _recognizer != null;
+
+  /// Load the model once. [modelDir] is [ModelManager.asrDir]: it must
+  /// contain encoder/decoder/conv-frontend ONNX files plus `tokenizer/`.
+  Future<void> load(String modelDir) async {
     await dispose();
-    _engine = await QAsrEngine.load(modelDir);
-    _engine!.setStreamChunkSec(AppConfig.streamChunkSec);
-    _engine!.setStreamUnfixedChunks(AppConfig.streamUnfixedChunks);
-    _engine!.setStreamMaxNewTokens(AppConfig.streamMaxNewTokens);
-    _engine!.setStreamRollback(AppConfig.streamRollback);
-    _engine!.setPastTextConditioning(true);
-    await setSourceLang(lang);
-    _ready = true;
-  }
-
-  Future<void> setSourceLang(AppLang lang) async {
-    final e = _engine;
-    if (e == null) return;
-    if (lang == AppLang.auto) {
-      e.setLanguage('');
-      e.setMultilingual(true);
-    } else {
-      e.setLanguage(lang.qwenName);
-      e.setMultilingual(false);
+    if (!_bindingsInit) {
+      sherpa.initBindings();
+      _bindingsInit = true;
     }
+    final cfg = sherpa.OfflineQwen3AsrModelConfig(
+      convFrontend: '$modelDir/conv_frontend.onnx',
+      encoder: '$modelDir/encoder.int8.onnx',
+      decoder: '$modelDir/decoder.int8.onnx',
+      tokenizer: '$modelDir/tokenizer',
+      maxNewTokens: AppConfig.asrMaxNewTokens,
+    );
     try {
-      await e.streamReset();
-    } catch (_) {
-      // streamReset before first session may no-op on some builds.
+      _recognizer = sherpa.OfflineRecognizer(
+        sherpa.OfflineRecognizerConfig(
+          model: sherpa.OfflineModelConfig(
+            qwen3Asr: cfg,
+            tokens: '',
+            numThreads: AppConfig.asrNumThreads,
+            debug: false,
+          ),
+        ),
+      );
+    } catch (e) {
+      _recognizer = null;
+      throw StateError(
+        'Could not create sherpa-onnx Qwen3-ASR recognizer in $modelDir: $e. '
+        'Re-download the ASR model (Setup → Download models); partial or '
+        'truncated ONNX files fail here.',
+      );
     }
   }
 
-  Future<void> resetStream() async {
-    await _engine?.streamReset();
-  }
-
-  /// One-shot transcription of a diarized utterance (preferred path).
-  Future<String> transcribeUtterance(Float32List pcm16kMono) {
-    final e = _engine;
-    if (e == null) throw StateError('ASR engine not loaded.');
-    return e.transcribePcm(pcm16kMono);
-  }
-
-  /// Streaming push of a mic chunk. [finalize] flushes the tail on Stop.
-  Future<AsrPartial> pushStreamChunk(
-    Float32List chunk, {
-    bool finalize = false,
-  }) async {
-    final e = _engine;
-    if (e == null) throw StateError('ASR engine not loaded.');
-    final StreamPartial p = await e.streamPush(chunk, finalize: finalize);
-    return AsrPartial(p.text, p.provisional);
-  }
-
-  Future<String> transcribeFile(String wavPath) {
-    final e = _engine;
-    if (e == null) throw StateError('ASR engine not loaded.');
-    return e.transcribeFile(wavPath);
-  }
-
-  String perfStats() {
+  /// Transcribe one 16 kHz mono float PCM buffer (e.g. a diarized utterance
+  /// or the in-progress live buffer). Buffers shorter than 0.4 s are
+  /// skipped without touching the engine.
+  Future<Transcription> transcribeUtterance(Float32List pcm16kMono) {
+    final r = _recognizer;
+    if (r == null) throw StateError('ASR engine not loaded.');
+    if (pcm16kMono.length < AppConfig.sampleRate * 4 ~/ 10) {
+      return Future.value(Transcription('', ''));
+    }
+    final stream = r.createStream();
     try {
-      return _engine?.perfStats() ?? '';
-    } catch (_) {
-      return '';
+      stream.acceptWaveform(
+        samples: pcm16kMono,
+        sampleRate: AppConfig.sampleRate,
+      );
+      final sw = Stopwatch()..start();
+      r.decode(stream);
+      lastDecodeMs = sw.elapsedMilliseconds;
+      final result = r.getResult(stream);
+      return Future.value(
+        Transcription(result.text.trim(), result.lang.trim()),
+      );
+    } finally {
+      stream.free();
+    }
+  }
+
+  /// Map a sherpa result `lang` id ('en', 'zh', 'yue', 'vi', …) to [AppLang].
+  /// Unknown/empty ids fall back to [fallback] (the session source setting).
+  static AppLang appLangForResult(String code, AppLang fallback) {
+    switch (code.toLowerCase()) {
+      case 'vi':
+        return AppLang.vi;
+      case 'en':
+        return AppLang.en;
+      case 'zh':
+      case 'zh-cn':
+      case 'zh-hant':
+      case 'yue':
+        return AppLang.zh;
+      default:
+        return fallback;
     }
   }
 
   Future<void> dispose() async {
-    _ready = false;
     try {
-      _engine?.dispose();
+      _recognizer?.free();
     } catch (_) {
-      // Dispose is best-effort across plugin versions.
+      // Best-effort native cleanup.
     }
-    _engine = null;
+    _recognizer = null;
   }
 }

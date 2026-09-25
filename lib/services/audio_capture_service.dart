@@ -8,7 +8,7 @@ import '../config/app_config.dart';
 /// Microphone capture as 16 kHz mono float PCM frames.
 ///
 /// Uses the `record` package's `startStream(pcm16bits)` and converts
-/// Int16 LE bytes → Float32List in [-1, 1] (the format qwen_asr expects).
+/// Int16 LE bytes → Float32List in [-1, 1] (the format sherpa-onnx expects).
 /// Emits fixed ~20 ms frames (320 samples) so VAD/diarization get a steady
 /// cadence regardless of the platform's native callback chunking.
 class AudioCaptureService {

@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:conference_asr_translator/config/app_config.dart';
+import 'package:conference_asr_translator/services/asr_service.dart';
 import 'package:conference_asr_translator/services/model_manager.dart';
 import 'package:conference_asr_translator/services/translation_service.dart';
 import 'package:conference_asr_translator/services/vad.dart';
@@ -11,16 +12,35 @@ import 'package:conference_asr_translator/models/transcript_segment.dart';
 
 void main() {
   group('AppLang', () {
-    test('qwen language names', () {
-      expect(AppLang.vi.qwenName, 'Vietnamese');
-      expect(AppLang.en.qwenName, 'English');
-      expect(AppLang.zh.qwenName, 'Chinese');
-      expect(AppLang.auto.qwenName, '');
-    });
-
     test('hy-mt2 target names', () {
       expect(AppLang.vi.hyName, 'Vietnamese');
       expect(AppLang.zh.hyName, 'Chinese');
+    });
+  });
+
+  group('Sherpa result language mapping', () {
+    test('known codes map to vi/en/zh', () {
+      expect(
+        AsrService.appLangForResult('vi', AppLang.auto),
+        AppLang.vi,
+      );
+      expect(
+        AsrService.appLangForResult('en', AppLang.auto),
+        AppLang.en,
+      );
+      expect(
+        AsrService.appLangForResult('zh', AppLang.auto),
+        AppLang.zh,
+      );
+      expect(
+        AsrService.appLangForResult('yue', AppLang.auto),
+        AppLang.zh,
+      );
+    });
+
+    test('unknown codes fall back to the session source', () {
+      expect(AsrService.appLangForResult('', AppLang.vi), AppLang.vi);
+      expect(AsrService.appLangForResult('fr', AppLang.en), AppLang.en);
     });
   });
 

@@ -31,7 +31,7 @@ class _SetupScreenState extends State<SetupScreen> {
         padding: const EdgeInsets.all(16),
         children: [
           const Text(
-            'On-device ASR (Qwen3-ASR) + translation (Hy-MT2 1.8B) for '
+            'On-device ASR (sherpa-onnx Qwen3-ASR) + translation (Hy-MT2 1.8B) for '
             'Tiếng Việt · English · 中文. Everything runs offline after the '
             'one-time download below.',
           ),
@@ -42,10 +42,13 @@ class _SetupScreenState extends State<SetupScreen> {
                 s.asrReady ? Icons.check_circle : Icons.download,
                 color: s.asrReady ? Colors.green : null,
               ),
-              title: const Text('ASR model — Qwen3-ASR-0.6B (~1.8 GB)'),
-              subtitle: Text(s.asrReady
-                  ? 'Ready'
-                  : 'model.safetensors + vocab.json + merges.txt',),
+              title: const Text('ASR model — Qwen3-ASR-0.6B int8 (~0.94 GB)'),
+              subtitle: Text(
+                s.asrReady
+                    ? 'Ready'
+                    : 'encoder + decoder + conv frontend + tokenizer/'
+                        ' (auto-detects vi/en/zh)',
+              ),
             ),
           ),
           Card(
@@ -129,9 +132,11 @@ class _SetupScreenState extends State<SetupScreen> {
             onChanged: s.setDiarizationEnabled,
           ),
           SwitchListTile(
-            title: const Text('Low-latency streaming ASR'),
-            subtitle:
-                const Text('Word-by-word partials; utterance mode is steadier'),
+            title: const Text('Low-latency live preview'),
+            subtitle: const Text(
+              'Re-decodes the in-progress utterance every few seconds; '
+              'utterance mode is steadier and cheaper',
+            ),
             value: s.lowLatency,
             onChanged: s.setLowLatency,
           ),
@@ -159,15 +164,15 @@ class _SetupScreenState extends State<SetupScreen> {
                 : const Icon(Icons.mic),
             label: Text(s.busy ? s.status : 'Start conference session'),
           ),
-          if (!s.asrReady)
-            const Padding(
-              padding: EdgeInsets.only(top: 8),
-              child: Text(
-                'Download the ASR model first. (The 0.6B model is ~1.8 GB — '
-                'use Wi-Fi.)',
-                style: TextStyle(color: Colors.orange),
+            if (!s.asrReady)
+              const Padding(
+                padding: EdgeInsets.only(top: 8),
+                child: Text(
+                  'Download the ASR model first. (~0.94 GB — use Wi-Fi. '
+                  'Interrupted downloads resume automatically.)',
+                  style: TextStyle(color: Colors.orange),
+                ),
               ),
-            ),
         ],
       ),
     );

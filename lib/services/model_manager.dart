@@ -15,8 +15,9 @@ class DownloadCancelled implements Exception {
 
 /// Download + verify the two on-device models, with progress callbacks.
 ///
-/// * ASR dir `<appdocs>/models/qwen3-asr-0.6b/` must end up containing
-///   model.safetensors, vocab.json, merges.txt (from Qwen/Qwen3-ASR-0.6B).
+/// * ASR dir `<appdocs>/models/sherpa-onnx-qwen3-asr-0.6b-int8/` holds the
+///   sherpa-onnx Qwen3-ASR int8 ONNX files + `tokenizer/` (from
+///   csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25).
 /// * MT file `<appdocs>/models/Hy-MT2-1.8B-1.25Bit.gguf` (~462 MB).
 ///
 /// Both are downloaded once and reused offline afterwards.
@@ -43,17 +44,22 @@ class ModelManager {
   }
 
   Future<String> get asrDir async =>
-      '${(await _modelsDir).path}/qwen3-asr-0.6b';
+      '${(await _modelsDir).path}/${AppConfig.asrDirName}';
 
   Future<String> get mtPath async =>
       '${(await _modelsDir).path}/${AppConfig.mtFileName}';
 
-  /// Which ASR files are still missing?
+  /// Which ASR files are still missing? Paths are relative to [asrDir]
+  /// and may include subdirectories (e.g. `tokenizer/vocab.json`).
+  /// Empty (0-byte) files count as missing so truncated downloads retry.
   Future<List<String>> missingAsrFiles() async {
     final dir = await asrDir;
     final missing = <String>[];
     for (final f in AppConfig.asrRequiredFiles) {
-      if (!await File('$dir/$f').exists()) missing.add(f);
+      final file = File('$dir/$f');
+      if (!await file.exists() || await file.length() == 0) {
+        missing.add(f);
+      }
     }
     return missing;
   }
@@ -87,8 +93,15 @@ class ModelManager {
         onProgress,
   }) async {
     _cancelRequested = false;
+    // One-time migration: drop the previous engine's ~1.9 GB safetensors dir.
+    final legacy =
+        Directory('${(await _modelsDir).path}/${AppConfig.legacyAsrDirName}');
+    if (await legacy.exists()) {
+      await legacy.delete(recursive: true);
+    }
     final dir = await asrDir;
     await Directory(dir).create(recursive: true);
+    await Directory('$dir/tokenizer').create(recursive: true);
     final missing = await missingAsrFiles();
     var done = AppConfig.asrRequiredFiles.length - missing.length;
     for (final name in missing) {

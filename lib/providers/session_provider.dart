@@ -12,16 +12,16 @@ import '../services/translation_service.dart';
 
 /// Owns the whole live-conference pipeline and exposes UI state.
 ///
-/// Pipeline (utterance mode, default — best for conferences):
+/// Pipeline (both modes — sherpa-onnx Qwen3-ASR is an offline engine):
 ///   mic 16 kHz PCM → [DiarizationService] (VAD + turn split + speaker id)
-///   → closed utterance → [AsrService.transcribeUtterance]
+///   → closed utterance → [AsrService.transcribeUtterance] (offline decode)
 ///   → [TranscriptSegment] appended → [TranslationService.translate] (async)
 ///   → segment updated in place.
 ///
-/// Pipeline (low-latency streaming mode):
-///   mic frames → [AsrService.pushStreamChunk] → stable + provisional text
-///   rendered live; on Stop (finalize) the stable text is committed as one
-///   segment with the diarizer's current majority speaker.
+/// Low-latency mode additionally re-decodes the in-progress utterance every
+/// few seconds and renders it as provisional (grey italic) text; the final
+/// committed segment always comes from the utterance-close decode, exactly
+/// like utterance mode.
 class SessionProvider extends ChangeNotifier {
   SessionProvider({
     ModelManager? models,
@@ -74,8 +74,12 @@ class SessionProvider extends ChangeNotifier {
   final List<TranscriptSegment> segments = [];
   int _nextId = 1;
   StreamSubscription<Float32List>? _audioSub;
-  String _streamStable = '';
-  String _lastSpeaker = 'Speaker 1';
+  // Live-preview buffer (low-latency mode): frames of the in-progress
+  // utterance, periodically re-decoded as provisional text.
+  final List<Float32List> _liveBuffer = [];
+  int _liveSamples = 0;
+  DateTime _lastPreview = DateTime.fromMillisecondsSinceEpoch(0);
+  bool _previewRunning = false;
 
   List<String> get speakers => diar.speakers;
 
@@ -154,10 +158,12 @@ class SessionProvider extends ChangeNotifier {
   }
 
   /// Load native engines. Call once from Setup before starting a session.
+  /// sherpa-onnx Qwen3-ASR auto-detects the language per utterance — there
+  /// is no set-language call; [sourceLang] drives translation + labels.
   Future<void> ensureEngines() async {
     final needMt = translationEnabled && !mt.isLoaded;
     if (!asr.isReady || needMt) {
-      // Preflight: both models resident need ~3 GB. Without this check the
+      // Preflight: both models resident need ~2.4 GB. Without this check the
       // OS low-memory killer just terminates the app with no error.
       final free = await mt.freeRamBytes();
       final need = AppConfig.asrNeedFreeBytes +
@@ -165,7 +171,7 @@ class SessionProvider extends ChangeNotifier {
       if (free > 0 && free < need) {
         throw StateError(
           'Only ${(free / 1048576).round()} MB RAM free, but ~${(need / 1073741824).toStringAsFixed(1)} GB is needed '
-          '(ASR ~2.2 GB${needMt ? ' + translation ~0.9 GB' : ''}). '
+          '(ASR ~1.5 GB${needMt ? ' + translation ~0.9 GB' : ''}). '
           'Fix: turn off translation, close other apps, or use a device '
           'with more RAM (8 GB+ recommended).',
         );
@@ -174,9 +180,7 @@ class SessionProvider extends ChangeNotifier {
     if (!asr.isReady) {
       status = 'Loading ASR engine…';
       notifyListeners();
-      await asr.load(await models.asrDir, lang: sourceLang);
-    } else {
-      await asr.setSourceLang(sourceLang);
+      await asr.load(await models.asrDir);
     }
     if (translationEnabled && !mt.isLoaded) {
       final p = await models.mtPath;
@@ -203,8 +207,10 @@ class SessionProvider extends ChangeNotifier {
       segments.clear();
       stableText = '';
       provisionalText = '';
-      _streamStable = '';
-      await asr.resetStream();
+      _liveBuffer.clear();
+      _liveSamples = 0;
+      _previewRunning = false;
+      _lastPreview = DateTime.fromMillisecondsSinceEpoch(0);
       await audio.start();
       _audioSub = audio.frames.listen(
         _onFrame,
@@ -228,84 +234,107 @@ class SessionProvider extends ChangeNotifier {
     await _audioSub?.cancel();
     _audioSub = null;
     await audio.stop();
-    if (lowLatency) {
-      // Flush streaming tail and commit (drain in-flight chunks first so
-      // the finalize push sees the full history, in order).
-      try {
-        await _pushQueue;
-        final tail = await asr.pushStreamChunk(
-          Float32List(0),
-          finalize: true,
-        );
-        _streamStable = tail.stable;
-        _commitStreamTail();
-      } catch (_) {}
-    } else {
-      diar.flush();
-      // Give in-flight utterance transcriptions a moment is handled by
-      // _pending counter below — here we just mark stopping.
-    }
+    // Flush the in-progress utterance so its final decode still commits.
+    diar.flush();
+    // Let the flush-triggered transcription continuation run first, so the
+    // segment lands and the count below is accurate (microtasks drain
+    // before this zero-delay timer fires).
+    await Future<void>.delayed(Duration.zero);
     sessionActive = false;
     stableText = '';
     provisionalText = '';
+    _liveBuffer.clear();
+    _liveSamples = 0;
     micLevel = 0;
-    status = 'Stopped. ${segments.length} utterance(s). ${asr.perfStats()}';
+    // An in-flight utterance left busy=true; the session is over, so clear
+    // it here (late continuations keep it false — see _onUtterance).
+    busy = false;
+    status = 'Stopped. ${segments.length} utterance(s). '
+        'Last decode ${asr.lastDecodeMs} ms.';
     notifyListeners();
   }
 
   int _pending = 0;
-  Future<void> _pushQueue = Future.value();
 
   Future<void> _onFrame(Float32List frame) async {
     if (!sessionActive) return;
-    if (lowLatency) {
-      // Chain pushes so chunks reach the engine in order and never overlap;
-      // listen() itself doesn't await us, so without this, concurrent
-      // streamPush calls would interleave out of order.
-      _pushQueue = _pushQueue.then((_) => _pushOne(frame));
-      await _pushQueue;
-    } else {
-      diar.pushFrame(frame);
-    }
-  }
-
-  Future<void> _pushOne(Float32List frame) async {
-    if (!sessionActive) return;
-    // Streaming ASR path + parallel diarization for speaker turns.
     diar.pushFrame(frame);
+    if (!lowLatency) return;
+    _liveBuffer.add(frame);
+    _liveSamples += frame.length;
+    _maybePreview();
+  }
+
+  /// Throttled provisional re-decode of the in-progress utterance
+  /// (low-latency mode only). Skipped while a final decode is running so
+  /// previews never stack UI-blocking decode work.
+  void _maybePreview() {
+    if (_previewRunning || _pending > 0 || !sessionActive) return;
+    final now = DateTime.now();
+    if (now.difference(_lastPreview).inMilliseconds <
+        AppConfig.livePreviewMinIntervalMs) {
+      return;
+    }
+    if (_liveSamples <
+        AppConfig.sampleRate * AppConfig.livePreviewMinAudioMs ~/ 1000) {
+      return;
+    }
+    _previewRunning = true;
+    _lastPreview = now;
+    final pcm = Float32List(_liveSamples);
+    var o = 0;
+    for (final f in _liveBuffer) {
+      pcm.setRange(o, o + f.length, f);
+      o += f.length;
+    }
+    // transcribeUtterance usually throws asynchronously (handled by
+    // catchError below), but guard the synchronous path too so a throw
+    // can never escape into the audio stream listener.
     try {
-      final p = await asr.pushStreamChunk(frame);
-      _streamStable = p.stable;
-      stableText = p.stable;
-      provisionalText = p.provisional;
-      notifyListeners();
+      asr.transcribeUtterance(pcm).then((t) {
+        if (!sessionActive) return;
+        provisionalText = t.text;
+        notifyListeners();
+      }).catchError((Object e) {
+        status = 'ASR preview error: $e';
+        notifyListeners();
+      }).whenComplete(() => _previewRunning = false);
     } catch (e) {
-      status = 'ASR error: $e';
+      _previewRunning = false;
+      status = 'ASR preview error: $e';
       notifyListeners();
     }
   }
 
-  /// Called by the diarizer each time an utterance closes.
+  /// Called by the diarizer each time an utterance closes: final decode,
+  /// commit as a segment, translate. Same path in both modes.
   Future<void> _onUtterance(String speaker, Float32List pcm) async {
-    if (lowLatency) {
-      _lastSpeaker = speaker; // used at commit time
-      return; // streaming path commits once at Stop / turn flush
-    }
     _pending++;
     busy = true;
     notifyListeners();
     try {
-      final text = (await asr.transcribeUtterance(pcm)).trim();
+      final t = await asr.transcribeUtterance(pcm);
+      final text = t.text;
+      // Utterance finished: drop the live preview state it was built from.
+      _liveBuffer.clear();
+      _liveSamples = 0;
+      provisionalText = '';
       if (text.isEmpty) return;
       final seg = TranscriptSegment(
         id: _nextId++,
         speaker: diarizationEnabled ? speaker : 'Speaker 1',
         text: text,
-        detectedLang: sourceLang,
+        detectedLang: AsrService.appLangForResult(t.lang, sourceLang),
         startedAt: DateTime.now(),
         isTranslating: translationEnabled && mt.isLoaded,
       );
       segments.add(seg);
+      // In low-latency mode the strip shows committed text as stable.
+      if (lowLatency) {
+        stableText = segments.length <= 3
+            ? segments.map((s) => s.text).join(' ')
+            : segments.sublist(segments.length - 3).map((s) => s.text).join(' ');
+      }
       notifyListeners();
       if (translationEnabled && mt.isLoaded) {
         try {
@@ -333,34 +362,6 @@ class SessionProvider extends ChangeNotifier {
         busy = sessionActive ? false : busy;
         notifyListeners();
       }
-    }
-  }
-
-  void _commitStreamTail() {
-    final text = _streamStable.trim();
-    if (text.isEmpty) return;
-    final seg = TranscriptSegment(
-      id: _nextId++,
-      speaker: diarizationEnabled ? _lastSpeaker : 'Speaker 1',
-      text: text,
-      detectedLang: sourceLang,
-      startedAt: DateTime.now(),
-      isTranslating: translationEnabled && mt.isLoaded,
-    );
-    segments.add(seg);
-    if (translationEnabled && mt.isLoaded) {
-      mt
-          .translate(text: text, source: sourceLang, target: targetLang)
-          .then((tr) {
-        seg.translation = tr;
-        seg.translationTarget = targetLang;
-        seg.isTranslating = false;
-        notifyListeners();
-      }).catchError((Object e) {
-        seg.translation = '⚠ $e';
-        seg.isTranslating = false;
-        notifyListeners();
-      });
     }
   }
 

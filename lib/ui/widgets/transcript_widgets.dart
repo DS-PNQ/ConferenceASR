@@ -190,8 +190,9 @@ class LanguageSelector extends StatelessWidget {
   }
 }
 
-/// Live partial-text strip: stable in normal weight, provisional grey italic
-/// (qwen_asr semantics — the tail may still change).
+/// Live partial-text strip: committed text in normal weight, in-progress
+/// preview in grey italic (the preview is re-decoded every few seconds and
+/// may still change until the utterance closes).
 class LiveStrip extends StatelessWidget {
   const LiveStrip(
       {super.key, required this.stable, required this.provisional,});

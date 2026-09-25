@@ -84,14 +84,9 @@ class _LiveSessionScreenState extends State<LiveSessionScreen> {
             child: LanguageSelector(
               source: s.sourceLang,
               target: s.targetLang,
-              onSource: (v) async {
-                s.setSource(v);
-                if (s.asr.isReady) {
-                  try {
-                    await s.asr.setSourceLang(v);
-                  } catch (_) {}
-                }
-              },
+              // sherpa-onnx Qwen3-ASR auto-detects the spoken language;
+              // the source picker drives translation + segment labels.
+              onSource: s.setSource,
               onTarget: (v) {
                 s.setTarget(v);
                 s.retranslateAll();
