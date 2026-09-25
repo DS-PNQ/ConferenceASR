@@ -1,0 +1,45 @@
+name: conference_asr_translator
+description: >
+  On-device conference recorder — live ASR (Qwen3-ASR via qwen_asr) +
+  translation (Tencent Hy-MT2 GGUF via llama.cpp) for Vietnamese / English /
+  Chinese, with speaker diarization. Android-first, fully offline after the
+  one-time model download.
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+  flutter: ">=3.24.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # --- Core ML ---
+  # On-device Qwen3-ASR (Rust engine, precompiled binaries).
+  # https://pub.dev/packages/qwen_asr
+  qwen_asr: ^0.4.0
+  # On-device GGUF LLM inference (llama.cpp, Android, Vulkan GPU).
+  # Runs Tencent Hy-MT2-1.8B-1.25Bit-GGUF for translation.
+  # https://pub.dev/packages/llama_flutter_android
+  llama_flutter_android: ^0.2.6
+
+  # --- Audio / platform ---
+  # Mic streaming as PCM16: https://pub.dev/packages/record
+  record: ^6.0.0
+  permission_handler: ^11.3.1
+  path_provider: ^2.1.4
+  wakelock_plus: ^1.2.8
+
+  # --- App plumbing ---
+  provider: ^6.1.2
+  http: ^1.2.2
+  share_plus: ^10.1.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
