@@ -2,9 +2,8 @@
 //
 // ASR model: sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25 (ONNX int8,
 //   encoder + decoder + conv frontend + tokenizer dir, ~0.94 GB).
-// MT model:  tencent/Hy-MT2-1.8B-1.25Bit-GGUF, file Hy-MT2-1.8B-1.25Bit.gguf
-//            (~462 MB, 1.25-bit, needs a llama.cpp build with Tencent's STQ
-//            kernel — see TranslationService docs for the fallback models).
+// MT model:  tencent/Hy-MT2-1.8B-GGUF, file hy-mt2-1.8b-q4_k_m.gguf
+//            (~1.13 GB, Q4_K_M — loads with any stock llama.cpp build).
 
 /// Supported UI / speech languages. Keep codes BCP-47-ish.
 enum AppLang { auto, vi, en, zh }
@@ -100,23 +99,30 @@ abstract final class AppConfig {
   static const livePreviewMinAudioMs = 3000;
 
   // ---- MT (Hy-MT2) ------------------------------------------------------
-  static const mtHfRepo = 'tencent/Hy-MT2-1.8B-1.25Bit-GGUF';
-  static const mtFileName = 'Hy-MT2-1.8B-1.25Bit.gguf';
+  // Default is Q4_K_M: the most compatible quant — it loads with any stock
+  // llama.cpp. The smaller 1.25-bit file (~462 MB) needs Tencent's STQ
+  // kernel (ggml-org/llama.cpp PR #22836), which the prebuilt llama.cpp in
+  // `llama_flutter_android` lacks, so it is NOT the default.
+  static const mtHfRepo = 'tencent/Hy-MT2-1.8B-GGUF';
+  static const mtFileName = 'Hy-MT2-1.8B-Q4_K_M.gguf';
   static const mtHfUrl =
-      'https://huggingface.co/tencent/Hy-MT2-1.8B-1.25Bit-GGUF/resolve/main/Hy-MT2-1.8B-1.25Bit.gguf';
-  static const mtApproxBytes = 461860800;
+      'https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-Q4_K_M.gguf';
+  static const mtApproxBytes = 1133080448;
 
-  /// Fallbacks if the 1.25-bit file cannot be loaded by the bundled
-  /// llama.cpp (it needs Tencent's STQ kernel, PR ggml-org/llama.cpp#22836).
+  /// Previous default MT file (1.25-bit, unloadable without the STQ kernel).
+  /// Deleted automatically on the next download run to reclaim ~462 MB.
+  static const legacyMtFileName = 'Hy-MT2-1.8B-1.25Bit.gguf';
+
+  /// Alternatives if the default ever fails to load (same prompt format).
   static const mtFallbacks = [
     // (label, url)
     (
       'Hy-MT2-1.8B-GGUF (Q4, most compatible)',
-      'https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/main/hy-mt2-1.8b-q4_k_m.gguf',
+      'https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-Q4_K_M.gguf',
     ),
     (
       'Hy-MT2-1.8B-2bit-GGUF',
-      'https://huggingface.co/tencent/Hy-MT2-1.8B-2bit-GGUF/resolve/main/hy-mt2-1.8b-2bit.gguf',
+      'https://huggingface.co/tencent/Hy-MT2-1.8B-2Bit-GGUF/resolve/main/Hy-MT2-1.8B-2Bit.gguf',
     ),
   ];
 
@@ -129,11 +135,11 @@ abstract final class AppConfig {
 
   // ---- Device requirements ----------------------------------------------
   // Resident RAM: sherpa-onnx Qwen3-ASR-0.6B int8 ~1.5 GB (conservative),
-  // Hy-MT2-1.8B ~0.9 GB. Below these free-RAM levels the OS low-memory
+  // Hy-MT2-1.8B Q4_K_M ~1.5 GB. Below these free-RAM levels the OS low-memory
   // killer terminates the app (silent death, no exception). The provider
   // checks before loading.
   static const asrNeedFreeBytes = 1500000000;
-  static const mtNeedFreeBytes = 900000000;
+  static const mtNeedFreeBytes = 1500000000;
 
   // ---- Audio -------------------------------------------------------------
   static const sampleRate = 16000;

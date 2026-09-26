@@ -8,7 +8,11 @@ allprojects {
 rootProject.buildDir = "../build"
 
 subprojects {
-    project.buildDir = "${rootProject.buildDir}/${project.name}"
+    def subprojectDir = project.projectDir.canonicalPath
+    def rootDir = rootProject.projectDir.canonicalPath
+    if (subprojectDir.substring(0, 2).equalsIgnoreCase(rootDir.substring(0, 2))) {
+        project.buildDir = "${rootProject.buildDir}/${project.name}"
+    }
 }
 subprojects {
     project.evaluationDependsOn(":app")

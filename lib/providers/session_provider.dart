@@ -115,7 +115,7 @@ class SessionProvider extends ChangeNotifier {
         },
       );
       if (translationEnabled) {
-        modelStatus = 'Downloading Hy-MT2 GGUF (~462 MB)…';
+        modelStatus = 'Downloading Hy-MT2 GGUF (~1.13 GB)…';
         notifyListeners();
         await models.downloadMt(
           onProgress: (r, t) {
@@ -171,7 +171,7 @@ class SessionProvider extends ChangeNotifier {
       if (free > 0 && free < need) {
         throw StateError(
           'Only ${(free / 1048576).round()} MB RAM free, but ~${(need / 1073741824).toStringAsFixed(1)} GB is needed '
-          '(ASR ~1.5 GB${needMt ? ' + translation ~0.9 GB' : ''}). '
+          '(ASR ~1.5 GB${needMt ? ' + translation ~1.5 GB' : ''}). '
           'Fix: turn off translation, close other apps, or use a device '
           'with more RAM (8 GB+ recommended).',
         );

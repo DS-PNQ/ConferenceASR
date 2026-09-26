@@ -20,7 +20,7 @@ dependencies:
   # https://pub.dev/packages/sherpa_onnx
   sherpa_onnx: ^1.13.8
   # On-device GGUF LLM inference (llama.cpp, Android, Vulkan GPU).
-  # Runs Tencent Hy-MT2-1.8B-1.25Bit-GGUF for translation.
+  # Runs Tencent Hy-MT2-1.8B Q4_K_M GGUF for translation.
   # https://pub.dev/packages/llama_flutter_android
   llama_flutter_android: ^0.2.6
 

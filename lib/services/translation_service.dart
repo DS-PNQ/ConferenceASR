@@ -4,20 +4,19 @@ import 'package:llama_flutter_android/llama_flutter_android.dart';
 
 import '../config/app_config.dart';
 
-/// On-device translation with Tencent Hy-MT2-1.8B-1.25Bit-GGUF via llama.cpp.
+/// On-device translation with Tencent Hy-MT2-1.8B Q4_K_M via llama.cpp.
 ///
-/// Model: https://huggingface.co/tencent/Hy-MT2-1.8B-1.25Bit-GGUF
-/// File: `Hy-MT2-1.8B-1.25Bit.gguf` (~462 MB), AngelSlim 1.25-bit quant.
+/// Model: https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF
+/// File: `Hy-MT2-1.8B-Q4_K_M.gguf` (~1.13 GB). Q4_K_M was chosen as the
+/// default because it loads with any stock llama.cpp build.
 ///
-/// IMPORTANT COMPATIBILITY NOTE:
-/// The 1.25-bit file depends on Tencent's STQ kernel, released as
-/// ggml-org/llama.cpp PR #22836. The prebuilt llama.cpp inside
-/// `llama_flutter_android` (b8201, Mar 2026) may or may not include it yet.
-/// Behaviour on load failure:
-/// * [load] throws with a message listing the fallback files
-///   (Hy-MT2-1.8B-GGUF Q4 / 2-bit, same prompt format). Download one of
-///   those and pass its path instead — [isFallbackHint] helps the UI show
-///   the right guidance.
+/// HISTORY: the previous default (`Hy-MT2-1.8B-1.25Bit.gguf`, AngelSlim
+/// 1.25-bit quant) depends on Tencent's STQ kernel (ggml-org/llama.cpp PR
+/// #22836), which the prebuilt llama.cpp inside `llama_flutter_android`
+/// lacks — `load` threw "Failed to load model" for it on device. Behaviour
+/// on load failure:
+/// * [load] throws with a message listing the alternative files
+///   (2-bit, same prompt format).
 /// * Everything else (prompt builder, queueing) is identical across the
 ///   Hy-MT2 GGUF family.
 ///

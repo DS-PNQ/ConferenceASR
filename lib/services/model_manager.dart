@@ -18,7 +18,7 @@ class DownloadCancelled implements Exception {
 /// * ASR dir `<appdocs>/models/sherpa-onnx-qwen3-asr-0.6b-int8/` holds the
 ///   sherpa-onnx Qwen3-ASR int8 ONNX files + `tokenizer/` (from
 ///   csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25).
-/// * MT file `<appdocs>/models/Hy-MT2-1.8B-1.25Bit.gguf` (~462 MB).
+/// * MT file `<appdocs>/models/Hy-MT2-1.8B-Q4_K_M.gguf` (~1.13 GB).
 ///
 /// Both are downloaded once and reused offline afterwards.
 ///
@@ -122,6 +122,13 @@ class ModelManager {
     void Function(int received, int total)? onProgress,
   }) async {
     _cancelRequested = false;
+    // One-time migration: drop the previous 1.25-bit file, which the bundled
+    // llama.cpp cannot load (missing STQ kernel).
+    final legacy =
+        File('${(await _modelsDir).path}/${AppConfig.legacyMtFileName}');
+    if (await legacy.exists()) {
+      await legacy.delete();
+    }
     final p = await mtPath;
     await _withRetry(() => _downloadFile(
           urlOverride ?? AppConfig.mtHfUrl,

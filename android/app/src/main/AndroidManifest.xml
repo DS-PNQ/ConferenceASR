@@ -1,7 +1,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!-- Mic for conference capture; Internet only for the one-time model
-         download (ASR ~1.8 GB + Hy-MT2 GGUF ~462 MB). Inference is offline. -->
+         download (ASR ~0.94 GB + Hy-MT2 Q4 GGUF ~1.13 GB). Inference is offline. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />

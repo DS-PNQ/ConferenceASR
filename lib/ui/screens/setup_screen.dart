@@ -57,10 +57,10 @@ class _SetupScreenState extends State<SetupScreen> {
                 s.mtReady ? Icons.check_circle : Icons.download,
                 color: s.mtReady ? Colors.green : null,
               ),
-              title: const Text('MT model — Hy-MT2-1.8B-1.25Bit (~462 MB)'),
+              title: const Text('MT model — Hy-MT2-1.8B Q4 (~1.13 GB)'),
               subtitle: Text(s.mtReady
                   ? 'Ready'
-                  : 'Hy-MT2-1.8B-1.25Bit.gguf from Hugging Face',),
+                  : 'Hy-MT2-1.8B-Q4_K_M.gguf from Hugging Face',),
             ),
           ),
           const SizedBox(height: 8),
