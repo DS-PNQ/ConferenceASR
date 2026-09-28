@@ -1,0 +1,343 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
+using Microsoft.Win32;
+
+namespace ConfLive;
+
+public partial class MainWindow : Window
+{
+    private static readonly string[] SpeakerColors =
+        { "#7C3AED", "#0EA5E9", "#F59E0B", "#10B981", "#EC4899" };
+
+    private readonly BackendManager _backend = new();
+    private ApiClient _api;
+    private readonly MicCapture _mic = new();
+    private readonly List<UtteranceEvent> _history = new();
+    private readonly Dictionary<long, PartialBubble> _partials = new();
+    private readonly SemaphoreSlim _sendLock = new(1, 1);
+    private int _count;
+    private bool _recording;
+    private CancellationTokenSource _initCts = new();
+
+    private sealed class PartialBubble
+    {
+        public Border Frame; public TextBlock Who; public TextBlock Orig;
+        public StackPanel Body; public readonly List<TextBlock> Trs = new();
+    }
+
+    public MainWindow()
+    {
+        InitializeComponent();
+        Loaded += async (_, _) => await InitAsync();
+        Closing += (_, _) => Shutdown();
+    }
+
+    // ---------- startup ----------
+    private async Task InitAsync()
+    {
+        ShowEmpty("Press  ● Record  or  ⇪ Upload —\nutterances appear here as speaker bubbles.");
+        SetStatus("Starting backend…");
+        try
+        {
+            var health = await _backend.EnsureRunningAsync(SetStatus, _initCts.Token);
+            _api = new ApiClient(_backend.BaseUrl);
+            _api.PartialReceived += p => Dispatcher.Invoke(() => UpsertPartial(p));
+            _api.UtteranceReceived += u => Dispatcher.Invoke(() => AddFinal(u));
+            _api.StatusReceived += s => Dispatcher.Invoke(() => SetStatus(s));
+            _api.ErrorReceived += e => Dispatcher.Invoke(() => SetStatus("Error: " + e));
+            ShowHealth(health);
+            foreach (var (i, name) in MicCapture.ListInputs())
+                MicBox.Items.Add($"{i}: {name}");
+            if (MicBox.Items.Count > 0) MicBox.SelectedIndex = 0;
+            _ = WarmupAsync(); // background; UI stays responsive
+        }
+        catch (Exception ex) { SetStatus("Startup failed: " + ex.Message); }
+    }
+
+    private void ShowHealth(HealthInfo h)
+    {
+        string gpu = string.IsNullOrEmpty(h.Device.GpuName) ? "" : " · " + h.Device.GpuName.Split('(')[0].Trim();
+        string fb = _backend.PreferredDevice == "cuda" && h.Device.Device == "cpu" ? " (CPU fallback active)" : "";
+        DeviceBadge.Text = $"device: {h.Device.Device}{gpu}{fb}";
+        ModelText.Text = $"ASR {h.Asr.Model}\nMT {h.Mt.Model}";
+        SetStatus($"Ready — ASR {h.Asr.Model} · MT {h.Mt.Model}. Press Record.");
+    }
+
+    private async Task WarmupAsync()
+    {
+        try
+        {
+            SetStatus("Loading models (first run downloads weights)…");
+            await _backend.WarmupAsync();
+            ShowHealth(await _backend.GetHealthAsync());
+        }
+        catch (Exception ex) { SetStatus("Warmup failed: " + ex.Message); }
+    }
+
+    private string[] Targets()
+    {
+        var t = new List<string>();
+        if (CbEn.IsChecked == true) t.Add("en");
+        if (CbZh.IsChecked == true) t.Add("zh");
+        if (CbVi.IsChecked == true) t.Add("vi");
+        return t.Count > 0 ? t.ToArray() : new[] { "en" };
+    }
+
+    private string SrcLang() => SrcBox.SelectedIndex switch
+    {
+        1 => "Vietnamese", 2 => "English", 3 => "Chinese", _ => null,
+    };
+
+    // ---------- record / stop ----------
+    private async void OnRecord(object sender, RoutedEventArgs e)
+    {
+        if (_api == null) { SetStatus("Backend not ready."); return; }
+        try
+        {
+            await _api.ConnectLiveAsync();
+            await _api.SendStartAsync(Targets(), SrcLang(), DenoiseBox.IsChecked);
+            int dev = -1;
+            if (MicBox.SelectedItem is string s && s.Contains(':')
+                && int.TryParse(s.Split(':')[0], out int idx)) dev = idx;
+            _mic.FrameReady += OnFrame;
+            _mic.LevelChanged += OnLevel;
+            _mic.Start(dev);
+            _recording = true;
+            BtnRecord.IsEnabled = false; BtnStop.IsEnabled = true;
+            LiveText.Visibility = Visibility.Visible;
+            SetStatus("● Recording — speak in vi / en / zh.");
+        }
+        catch (Exception ex) { SetStatus("Could not start: " + ex.Message); }
+    }
+
+    private async void OnStop(object sender, RoutedEventArgs e)
+    {
+        _recording = false;
+        try
+        {
+            _mic.FrameReady -= OnFrame;
+            _mic.LevelChanged -= OnLevel;
+            _mic.Stop();
+            if (_api != null) { await _api.SendStopAsync(); await _api.CloseLiveAsync(); }
+        }
+        catch { }
+        BtnRecord.IsEnabled = true; BtnStop.IsEnabled = false;
+        LiveText.Visibility = Visibility.Collapsed;
+        Meter.Value = 0; MeterText.Text = "mic idle";
+        SetStatus("Stopped.");
+    }
+
+    private async void OnFrame(byte[] frame)
+    {
+        if (!_recording || _api == null) return;
+        await _sendLock.WaitAsync();
+        try { await _api.SendAudioAsync(frame); }
+        catch { }
+        finally { _sendLock.Release(); }
+    }
+
+    private void OnLevel(double v) =>
+        Dispatcher.Invoke(() =>
+        {
+            Meter.Value = v;
+            MeterText.Text = !_recording ? "mic idle" : v > 0.02 ? "listening…" : "quiet…";
+        });
+
+    // ---------- upload / export ----------
+    private async void OnUpload(object sender, RoutedEventArgs e)
+    {
+        if (_api == null) return;
+        var dlg = new OpenFileDialog
+        {
+            Title = "Upload recording",
+            Filter = "Audio|*.wav;*.mp3;*.ogg;*.flac;*.m4a;*.webm|All files|*.*",
+        };
+        if (dlg.ShowDialog() != true) return;
+        SetStatus($"Transcribing {Path.GetFileName(dlg.FileName)}…");
+        try
+        {
+            var list = await _api.TranscribeFileAsync(dlg.FileName, Targets(), SrcLang(), DenoiseBox.IsChecked);
+            foreach (var u in list) AddFinal(u);
+            SetStatus($"Done — {list.Count} utterances.");
+        }
+        catch (Exception ex) { SetStatus("Upload failed: " + ex.Message); }
+    }
+
+    private void OnExportTxt(object s, RoutedEventArgs e) => Export(".txt");
+    private void OnExportSrt(object s, RoutedEventArgs e) => Export(".srt");
+
+    private void Export(string ext)
+    {
+        if (_history.Count == 0) { SetStatus("Nothing to export yet."); return; }
+        var dlg = new SaveFileDialog { DefaultExt = ext, Filter = $"{ext}|*{ext}" };
+        if (dlg.ShowDialog() != true) return;
+        var lines = new List<string>();
+        if (ext == ".txt")
+            foreach (var u in _history)
+                lines.Add($"{u.Speaker} ({u.SrcLang}): {u.Text}\n  -> " +
+                    string.Join(" | ", u.Translations.Select(kv => $"[{kv.Key}] {kv.Value}")));
+        else
+        {
+            int i = 0;
+            foreach (var u in _history)
+            {
+                i++;
+                lines.Add($"{i}\n{Ts(i * 5)} --> {Ts(i * 5 + 4)}\n{u.Speaker}: {u.Text}\n" +
+                    string.Join(" ", u.Translations.Values) + "\n");
+            }
+        }
+        File.WriteAllLines(dlg.FileName, lines);
+        SetStatus("Exported " + dlg.FileName);
+    }
+
+    private static string Ts(int s) => $"{s / 3600:00}:{(s % 3600) / 60:00}:{s % 60:00},000";
+
+    private async void OnWarmup(object s, RoutedEventArgs e) => await WarmupAsync();
+
+    private void OnClear(object s, RoutedEventArgs e)
+    {
+        _partials.Clear();
+        Feed.Children.Clear();
+        _history.Clear();
+        _count = 0;
+        CountText.Text = "0 utterances";
+        ShowEmpty("Cleared — press  ● Record  for a new session.");
+    }
+
+    // ---------- feed ----------
+    private static string ColorFor(string speaker)
+    {
+        int n = 0;
+        foreach (char c in speaker ?? "")
+            if (char.IsDigit(c)) n = n * 10 + (c - '0');
+        return SpeakerColors[n <= 0 ? 0 : (n - 1) % SpeakerColors.Length];
+    }
+
+    private static Color Hex(string h) => (Color)ColorConverter.ConvertFromString(h);
+
+    private Border MakeBubble(string speaker, string meta,
+        out StackPanel body, out TextBlock orig, out TextBlock who)
+    {
+        if (Feed.Children.Count == 1 && Feed.Children[0] is TextBlock tb && tb.Tag as string == "empty")
+            Feed.Children.Clear();
+        var bubble = new Border
+        {
+            Background = new SolidColorBrush(Hex("#FFFFFF")),
+            BorderBrush = new SolidColorBrush(Hex("#E7E5E4")),
+            BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(12),
+            Margin = new Thickness(10, 6, 10, 6), Padding = new Thickness(0),
+        };
+        var grid = new Grid();
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(6) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        var strip = new System.Windows.Shapes.Rectangle
+        {
+            Fill = new SolidColorBrush(Hex(ColorFor(speaker))),
+            RadiusX = 3, RadiusY = 3, Margin = new Thickness(0),
+        };
+        Grid.SetColumn(strip, 0);
+        grid.Children.Add(strip);
+        body = new StackPanel { Margin = new Thickness(12, 10, 12, 10) };
+        Grid.SetColumn(body, 1);
+        grid.Children.Add(body);
+        who = new TextBlock
+        {
+            Text = meta, FontWeight = FontWeights.Bold, FontSize = 11,
+            Foreground = new SolidColorBrush(Hex(ColorFor(speaker))),
+        };
+        body.Children.Add(who);
+        orig = new TextBlock
+        {
+            FontSize = 14, Foreground = new SolidColorBrush(Hex("#1C1917")),
+            TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 2, 0, 0),
+        };
+        body.Children.Add(orig);
+        bubble.Child = grid;
+        Feed.Children.Add(bubble);
+        FeedScroll.ScrollToBottom();
+        return bubble;
+    }
+
+    private static TextBlock MakeTr(StackPanel body, string text)
+    {
+        var lb = new TextBlock
+        {
+            Text = text, FontSize = 13, Foreground = new SolidColorBrush(Hex("#44403C")),
+            Background = new SolidColorBrush(Hex("#F5F5F4")),
+            TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 6, 0, 0),
+            Padding = new Thickness(6),
+        };
+        body.Children.Add(lb);
+        return lb;
+    }
+
+    private void ShowEmpty(string text) =>
+        Feed.Children.Add(new TextBlock
+        {
+            Tag = "empty", Text = text, FontSize = 14,
+            Foreground = new SolidColorBrush(Hex("#78716C")),
+            HorizontalAlignment = HorizontalAlignment.Center,
+            TextAlignment = TextAlignment.Center, Margin = new Thickness(0, 60, 0, 60),
+        });
+
+    private void UpsertPartial(PartialEvent p)
+    {
+        // drop stale partials from older segments
+        foreach (var id in new List<long>(_partials.Keys))
+            if (id != p.Id) { Feed.Children.Remove(_partials[id].Frame); _partials.Remove(id); }
+        if (!_partials.TryGetValue(p.Id, out var b))
+        {
+            var frame = MakeBubble(p.Speaker, $"{p.Speaker} · listening…",
+                out var body, out var orig, out var who);
+            b = new PartialBubble { Frame = frame, Body = body, Orig = orig, Who = who };
+            _partials[p.Id] = b;
+        }
+        b.Orig.Text = p.Text;
+        try { b.Who.Text = $"{p.Speaker} · listening… · {p.RmsDb} dB"; } catch { }
+        int i = 0;
+        foreach (var kv in p.Translations)
+        {
+            string line = $"[{kv.Key}] {kv.Value}";
+            if (i < b.Trs.Count) b.Trs[i].Text = line;
+            else b.Trs.Add(MakeTr(b.Body, line));
+            i++;
+        }
+        FeedScroll.ScrollToBottom();
+    }
+
+    private void AddFinal(UtteranceEvent u)
+    {
+        if (_partials.TryGetValue(u.Id, out var b))
+        {
+            Feed.Children.Remove(b.Frame);
+            _partials.Remove(u.Id);
+        }
+        string badge = u.Denoised ? " · 🔇" : "";
+        var frame = MakeBubble(u.Speaker, $"{u.Speaker} · {u.SrcLang} · {u.RmsDb} dB{badge}",
+            out var body, out var orig, out _);
+        orig.Text = u.Text;
+        foreach (var kv in u.Translations) MakeTr(body, $"[{kv.Key}] {kv.Value}");
+        _history.Add(u);
+        _count++;
+        CountText.Text = $"{_count} utterances";
+        FeedScroll.ScrollToBottom();
+    }
+
+    private void SetStatus(string s) { try { StatusText.Text = s; } catch { } }
+
+    private void Shutdown()
+    {
+        try { _initCts.Cancel(); } catch { }
+        _recording = false;
+        try { _mic.Dispose(); } catch { }
+        try { _api?.Dispose(); } catch { }
+        try { _backend.Dispose(); } catch { }
+    }
+}

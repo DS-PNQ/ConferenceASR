@@ -1,0 +1,47 @@
+# ---- Device / compute ----
+device: auto            # auto | cuda | cpu
+asr_dtype: auto         # auto | bfloat16 | float16 | float32
+mt_dtype: auto
+cuda_fallback_on_oom: true
+
+# ---- ASR: local Zipformer zh-en-vi ONNX (sherpa-onnx, CPU) ----
+# Folder holds encoder/decoder/joiner .onnx (fp32 + int8) + tokens.txt.
+asr_model: D:/DENSEV2 - reading/zipformer zh-en-vi onnx phaseB s2a   # or set ASR_MODEL
+asr_provider: cpu      # sherpa-onnx wheels are CPU-only; cuda if you build with GPU
+asr_quant: auto        # auto | int8 | fp32  (auto = int8 on cpu, fp32 on cuda)
+asr_threads: 4
+
+# ---- Translation (Tencent Hy-MT2: https://huggingface.co/collections/tencent/hy-mt2) ----
+mt_model: tencent/Hy-MT2-1.8B-FP8  # compressed-tensors FP8 on CUDA; CPU/mock fallback
+mt_max_new_tokens: 256     # short utterances only; lower = faster
+mt_do_sample: false        # false = greedy decode (fastest, deterministic)
+mt_temperature: 0.3
+supported_langs: [vi, en, zh]    # app focus languages
+default_targets: [en, zh]        # checked by default in UI
+
+# ---- Voice suppression (DeepFilterNet: https://github.com/Rikorose/DeepFilterNet) ----
+noise_suppress: true       # master toggle; also flippable per-request from the UI
+df_model: null             # null = package default (DeepFilterNet3). Alt: DeepFilterNet2, DeepFilterNet
+df_post_filter: false      # extra attenuation of very noisy sections
+df_atten_lim_db: null      # e.g. 12 = cap suppression at 12 dB, keep some ambience; null = full
+
+# ---- Conference / diarization ----
+sample_rate: 16000
+segment_seconds: 5.0             # legacy fixed-window path (web API); desktop streams instead
+frame_seconds: 0.5               # mic frame size fed to the streaming recognizer
+endpoint_silence: 1.0            # pause (s) that finalizes a segment — breaks at pauses, not mid-word
+endpoint_min_speech: 0.5         # ignore shorter blips
+max_segment: 20.0                # force-finalize run-on speech without pauses
+partial_translate_interval: 2.5  # min seconds between live re-translations
+partial_min_delta: 6             # …and min new characters since last one
+partial_min_chars: 10            # don't translate tiny fragments
+silence_turn_gap: 0.6            # pause (s) that marks a possible speaker turn
+max_speakers: 3
+diarizer: volume                 # volume | nemo
+use_nemo: false                  # set true to try NeMo MSD diarizer (heavy, optional)
+nemo_diarizer_model: null        # e.g. diar_msdd_telephonic ; null = default
+
+# ---- Server ----
+host: 127.0.0.1
+port: 8000
+demo_mode: auto                  # auto | true | false ; auto = mock when models can't load

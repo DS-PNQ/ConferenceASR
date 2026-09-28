@@ -44,3 +44,12 @@ build/
 *.so
 *.apk
 *.aab
+
+# --- ConfLive desktop branch (C# + Python) ---
+.venv/
+__pycache__/
+installer/stage/
+release/
+[Bb]in/
+[Oo]bj/
+.cache/

@@ -1,0 +1,43 @@
+# Core server
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+pyyaml>=6.0
+numpy>=1.26
+soundfile>=0.12
+
+# Desktop app (native window, no browser)
+customtkinter>=5.2
+sounddevice>=0.4.6   # mic capture; bundles PortAudio on Windows
+
+# Torch: install the CUDA build for your RTX 4060 (CUDA 12.x), e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu126
+# CPU-only fallback works too (slower): pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.3
+transformers>=4.44
+accelerate>=0.33
+safetensors>=0.4
+huggingface_hub>=0.23
+
+# ASR: local Zipformer zh-en-vi ONNX via sherpa-onnx (CPU int8, ~15x realtime)
+sherpa-onnx>=1.11
+
+# MT: Hy-MT2 FP8 needs compressed-tensors (CUDA). Falls back gracefully if missing.
+compressed-tensors>=0.18
+
+# Voice suppression before ASR (DeepFilterNet3 full-band denoiser).
+# Needs torchaudio alongside torch, e.g.:
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu126
+# Graceful pass-through if missing, but install for the real thing:
+#   pip install deepfilternet   (then models auto-download on first warmup)
+# NOTE: deepfilterlib ships prebuilt wheels for Python 3.8-3.11. On 3.12+
+# `pip install deepfilternet` needs a Rust toolchain (or use Python 3.11).
+deepfilternet>=0.5
+
+# Optional: server-side mic capture (browser mic is default; this is for scripts/record_cli.py)
+# sounddevice>=0.4.6
+# webrtcvad-wheels>=2.0.14
+
+# Optional: NVIDIA NeMo speaker diarization (heavy). Only needed if diarizer: nemo
+# See https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/asr/speaker_diarization/intro.html
+# nemo_toolkit[asr]>=2.0

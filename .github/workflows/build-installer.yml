@@ -1,0 +1,54 @@
+# Builds the C# frontend and the Inno Setup installer on every tag (v*),
+# then attaches ConfLive-Setup-*.exe to a GitHub Release.
+# Trigger manually too (Actions tab -> Run workflow).
+name: build-installer
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Publish frontend
+        run: >
+          dotnet publish csharp/ConfLive/ConfLive.csproj -c Release
+          -r win-x64 --self-contained
+          -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
+          -o installer/stage
+
+      - name: Stage backend
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory installer/stage/backend -Force | Out-Null
+          $exclude = @("csharp","installer","release",".venv","__pycache__",
+                       ".git",".cache","stage")
+          Get-ChildItem . -Force | Where-Object { $exclude -notcontains $_.Name } |
+            ForEach-Object {
+              if ($_.PSIsContainer) { Copy-Item $_.FullName "installer/stage/backend/$($_.Name)" -Recurse -Force }
+              else { Copy-Item $_.FullName installer/stage/backend -Force }
+            }
+
+      - name: Build Setup.exe
+        uses: Minionguyjpro/Inno-Setup-Action@v1.2.6
+        with:
+          path: installer/ConfLive.iss
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: release/ConfLive-Setup-*.exe
+          body: |
+            ConfLive desktop installer (C# UI + Python backend).
+            Requires Python 3.11/3.12; models download on first run.
+            CUDA is used when an NVIDIA GPU is present, CPU otherwise.
