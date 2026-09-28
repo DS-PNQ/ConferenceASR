@@ -7,6 +7,8 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
+using System.Windows.Media.Effects;
 using Microsoft.Win32;
 
 namespace ConfLive;
@@ -223,45 +225,46 @@ public partial class MainWindow : Window
     private static Color Hex(string h) => (Color)ColorConverter.ConvertFromString(h);
 
     private Border MakeBubble(string speaker, string meta,
-        out StackPanel body, out TextBlock orig, out TextBlock who)
+        out StackPanel body, out TextBlock orig, out TextBlock who, bool animate = false)
     {
         if (Feed.Children.Count == 1 && Feed.Children[0] is TextBlock tb && tb.Tag as string == "empty")
             Feed.Children.Clear();
+        // System-like card: white fill, no outline, depth from a whisper of shadow.
         var bubble = new Border
         {
             Background = new SolidColorBrush(Hex("#FFFFFF")),
-            BorderBrush = new SolidColorBrush(Hex("#E7E5E4")),
-            BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(12),
-            Margin = new Thickness(10, 6, 10, 6), Padding = new Thickness(0),
+            BorderThickness = new Thickness(0), CornerRadius = new CornerRadius(14),
+            Margin = new Thickness(10, 6, 10, 6),
+            Effect = new DropShadowEffect
+            {
+                BlurRadius = 10, ShadowDepth = 1, Opacity = 0.12, Color = Colors.Black,
+            },
         };
-        var grid = new Grid();
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(6) });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        var strip = new System.Windows.Shapes.Rectangle
-        {
-            Fill = new SolidColorBrush(Hex(ColorFor(speaker))),
-            RadiusX = 3, RadiusY = 3, Margin = new Thickness(0),
-        };
-        Grid.SetColumn(strip, 0);
-        grid.Children.Add(strip);
-        body = new StackPanel { Margin = new Thickness(12, 10, 12, 10) };
-        Grid.SetColumn(body, 1);
-        grid.Children.Add(body);
+        body = new StackPanel { Margin = new Thickness(14, 12, 14, 12) };
         who = new TextBlock
         {
-            Text = meta, FontWeight = FontWeights.Bold, FontSize = 11,
+            Text = meta, FontWeight = FontWeights.SemiBold, FontSize = 12,
             Foreground = new SolidColorBrush(Hex(ColorFor(speaker))),
         };
         body.Children.Add(who);
         orig = new TextBlock
         {
-            FontSize = 14, Foreground = new SolidColorBrush(Hex("#1C1917")),
+            FontSize = 15, Foreground = new SolidColorBrush(Hex("#1C1917")),
             TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 2, 0, 0),
         };
         body.Children.Add(orig);
-        bubble.Child = grid;
+        bubble.Child = body;
         Feed.Children.Add(bubble);
         FeedScroll.ScrollToBottom();
+        if (animate)
+        {
+            // Calm fade-in: explains arrival, decorates nothing.
+            var anim = new DoubleAnimation(0, 1, new Duration(TimeSpan.FromMilliseconds(250)))
+            {
+                EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut },
+            };
+            bubble.BeginAnimation(UIElement.OpacityProperty, anim);
+        }
         return bubble;
     }
 
@@ -321,7 +324,7 @@ public partial class MainWindow : Window
         }
         string badge = u.Denoised ? " · 🔇" : "";
         var frame = MakeBubble(u.Speaker, $"{u.Speaker} · {u.SrcLang} · {u.RmsDb} dB{badge}",
-            out var body, out var orig, out _);
+            out var body, out var orig, out _, animate: true);
         orig.Text = u.Text;
         foreach (var kv in u.Translations) MakeTr(body, $"[{kv.Key}] {kv.Value}");
         _history.Add(u);
