@@ -144,6 +144,11 @@ class HyMT2Engine:
                 do_sample=not greedy,
                 pad_token_id=self._tok.eos_token_id,
             )
+            # The repo config ships use_cache=false (slow recompute decode).
+            # Override to true unless explicitly disabled — standard
+            # transformers generate honors it when the modeling supports cache.
+            if bool(self.cfg.get("mt_use_cache", True)):
+                gen_kwargs["use_cache"] = True
             if not greedy:  # sampling hyperparams only matter off-greedy
                 gen_kwargs.update(temperature=float(self.cfg.get("mt_temperature", 0.3)),
                                   top_p=0.6, top_k=20)

@@ -1,0 +1,30 @@
+{
+  "name": "conflive",
+  "version": "1.0.0",
+  "description": "ConfLive desktop client (Electron + TypeScript) for the Python conference ASR backend",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "tsc && electron .",
+    "dist": "tsc && electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "electron": "^38.0.0",
+    "typescript": "^5.6.0",
+    "electron-builder": "^26.0.0",
+    "@types/node": "^22.0.0"
+  },
+  "build": {
+    "appId": "com.conflive.app",
+    "productName": "ConfLive",
+    "win": {
+      "target": ["nsis"]
+    },
+    "files": [
+      "dist/**/*",
+      "index.html",
+      "styles.css",
+      "package.json"
+    ]
+  }
+}

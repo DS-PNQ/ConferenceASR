@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ConfLive</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand">●&nbsp; ConfLive</div>
+    <div class="brand-sub">Zipformer zh-en-vi · Hy-MT2 FP8</div>
+    <div class="device" id="device-badge">device: …</div>
+
+    <label class="h">Microphone</label>
+    <select id="mic-list"></select>
+
+    <label class="h">Spoken language</label>
+    <select id="src-lang">
+      <option value="auto" selected>auto-detect</option>
+      <option value="Vietnamese">Tiếng Việt</option>
+      <option value="English">English</option>
+      <option value="Chinese">中文</option>
+    </select>
+
+    <label class="h">Translate to</label>
+    <div class="row">
+      <label class="tg"><input type="checkbox" id="tgt-en" checked /> EN</label>
+      <label class="tg"><input type="checkbox" id="tgt-zh" checked /> 中文</label>
+      <label class="tg"><input type="checkbox" id="tgt-vi" /> VI</label>
+    </div>
+    <label class="tg denoise" title="DeepFilterNet voice suppression before ASR">
+      <input type="checkbox" id="tgt-denoise" checked /> 🔇 DeepFilterNet denoise
+    </label>
+    <div class="models" id="model-text"></div>
+
+    <button class="btn primary" id="btn-record">●&nbsp; Record</button>
+    <button class="btn" id="btn-stop" disabled>■&nbsp; Stop</button>
+    <div class="row">
+      <label class="btn ghost file">⇪ Upload <input type="file" id="file" accept="audio/*" hidden /></label>
+      <button class="btn ghost" id="btn-warmup">Load models</button>
+    </div>
+    <div class="row">
+      <button class="btn ghost" id="btn-txt">.txt</button>
+      <button class="btn ghost" id="btn-srt">.srt</button>
+      <button class="btn ghost" id="btn-clear">Clear</button>
+    </div>
+    <p class="hint" id="status">…</p>
+  </aside>
+
+  <main>
+    <div class="head">
+      <h1>Live transcript</h1>
+      <span class="count" id="feed-count">0 utterances</span>
+      <span class="live" id="live-pill" style="display:none">● LIVE</span>
+    </div>
+    <div class="feed" id="feed">
+      <div class="empty">Press <b>● Record</b> or <b>⇪ Upload</b> — utterances appear here as speaker bubbles.</div>
+    </div>
+    <div class="meter-wrap">
+      <div class="meter"><div id="meter-fill"></div></div>
+      <span id="meter-label">mic idle</span>
+    </div>
+  </main>
+</div>
+<script src="dist/renderer.js"></script>
+</body>
+</html>

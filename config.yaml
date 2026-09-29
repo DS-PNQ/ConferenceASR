@@ -15,6 +15,7 @@ asr_threads: 4
 mt_model: tencent/Hy-MT2-1.8B-FP8  # compressed-tensors FP8 on CUDA; CPU/mock fallback
 mt_max_new_tokens: 256     # short utterances only; lower = faster
 mt_do_sample: false        # false = greedy decode (fastest, deterministic)
+mt_use_cache: true         # KV-cache (repo default false = slow recompute)
 mt_temperature: 0.3
 supported_langs: [vi, en, zh]    # app focus languages
 default_targets: [en, zh]        # checked by default in UI

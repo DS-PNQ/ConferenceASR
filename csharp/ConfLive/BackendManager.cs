@@ -83,34 +83,56 @@ public sealed class BackendManager : IDisposable
             "Python backend (run.py) not found. Set CONF_LIVE_BACKEND to its folder.");
     }
 
+    public static void Log(string msg)
+    {
+        try
+        {
+            File.AppendAllText(Path.Combine(Path.GetTempPath(), "conflive_ui.log"),
+                $"{DateTime.Now:HH:mm:ss} {msg}\n");
+        }
+        catch { }
+    }
+
     public static string LocatePython(string backendDir)
     {
         // Prefer a venv inside the backend, then py launcher, then PATH python.
+        // Each candidate must actually import the backend's server deps —
+        // a bare venv (torch but no fastapi) is skipped, not failed on.
+        var candidates = new List<string>();
         var venv = Path.Combine(backendDir, ".venv", "Scripts", "python.exe");
-        if (File.Exists(venv)) return venv;
-        foreach (var candidate in new[] { "py", "python" })
+        if (File.Exists(venv)) candidates.Add(venv);
+        candidates.Add("py");
+        candidates.Add("python");
+        foreach (var candidate in candidates)
         {
+            Log("python probe: " + candidate);
             try
             {
-                var psi = new ProcessStartInfo(candidate, "--version")
+                var psi = new ProcessStartInfo(candidate,
+                    "-c \"import fastapi, uvicorn, yaml, numpy\"")
                 {
                     RedirectStandardOutput = true, RedirectStandardError = true,
                     UseShellExecute = false, CreateNoWindow = true,
                 };
                 using var p = Process.Start(psi);
-                if (p == null) continue;
-                p.WaitForExit(10000);
+                if (p == null) { Log("python probe null: " + candidate); continue; }
+                p.WaitForExit(30000);
+                Log($"python probe exit={p.ExitCode}: " + candidate);
                 if (p.ExitCode == 0) return candidate;
             }
             catch { }
         }
-        throw new FileNotFoundException("No Python found. Install Python 3.11/3.12 and retry.");
+        throw new FileNotFoundException(
+            "No Python with backend deps found (need fastapi, uvicorn, pyyaml, numpy). " +
+            "Install Python 3.11/3.12 and: pip install -r requirements.txt");
     }
 
     public async Task<HealthInfo> EnsureRunningAsync(
         Action<string> log, CancellationToken ct = default)
     {
+        Log("ensure: locating backend");
         BackendDir = LocateBackend();
+        Log("ensure: backend dir = " + BackendDir);
         // Reuse a backend that is already up (e.g. started manually).
         try
         {
@@ -122,7 +144,10 @@ public sealed class BackendManager : IDisposable
                 return existing;
             }
         }
-        catch { /* not running -> launch it */ }
+        catch { /* not running -> launch it */ Log("ensure: no backend on port, will launch"); }
+
+        PreferredDevice = CudaPresent() ? "cuda" : "cpu";
+        Log("ensure: cuda-present=" + (PreferredDevice == "cuda"));
 
         PreferredDevice = CudaPresent() ? "cuda" : "cpu";
         log(PreferredDevice == "cuda"
@@ -130,6 +155,7 @@ public sealed class BackendManager : IDisposable
             : "No NVIDIA GPU detected — starting backend on CPU (fallback).");
 
         string python = LocatePython(BackendDir);
+        Log("ensure: python = " + python);
         var psi = new ProcessStartInfo(python, "run.py")
         {
             WorkingDirectory = BackendDir,

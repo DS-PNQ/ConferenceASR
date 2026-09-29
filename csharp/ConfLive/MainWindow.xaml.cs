@@ -44,6 +44,7 @@ public partial class MainWindow : Window
     // ---------- startup ----------
     private async Task InitAsync()
     {
+        BackendManager.Log("ui: init start");
         ShowEmpty("Press  ● Record  or  ⇪ Upload —\nutterances appear here as speaker bubbles.");
         SetStatus("Starting backend…");
         try
@@ -59,8 +60,13 @@ public partial class MainWindow : Window
                 MicBox.Items.Add($"{i}: {name}");
             if (MicBox.Items.Count > 0) MicBox.SelectedIndex = 0;
             _ = WarmupAsync(); // background; UI stays responsive
+            BackendManager.Log("ui: init done");
         }
-        catch (Exception ex) { SetStatus("Startup failed: " + ex.Message); }
+        catch (Exception ex)
+        {
+            BackendManager.Log("ui: init FAILED: " + ex.GetType().Name + ": " + ex.Message);
+            SetStatus("Startup failed: " + ex.Message);
+        }
     }
 
     private void ShowHealth(HealthInfo h)

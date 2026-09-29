@@ -6,11 +6,24 @@ like a chat app: speaker-labelled bubbles, live transcription, side-by-side tran
 Two frontends, one Python inference backend (`run.py`: Zipformer ASR, Hy-MT2 FP8 MT,
 volume diarization, DeepFilterNet hook):
 
-- **C# desktop app** (`csharp/ConfLive`, primary): native WPF window, mic capture
-  via NAudio, streaming `/ws/live` protocol (live partials + endpointed finals),
-  CUDA auto-detect with CPU fallback. Ship it with `installer/ConfLive.iss`.
+- **Electron + TypeScript app** (`electron/`, primary): `npm run build && npx electron .`.
+  Finds `run.py`, picks CUDA/CPU itself, streams mic over `/ws/live` with live
+  partials. `npm run dist` builds a Windows installer via electron-builder.
+- **C# desktop app** (`csharp/ConfLive`): native WPF window, same protocol.
 - **Python desktop app** (`desktop_app.py`): same UI in CustomTkinter, no build step.
 - Legacy browser UI (`web/`) kept for reference.
+
+## GPU usage notes (measured RTX 4060 Laptop, Hy-MT2-1.8B-FP8)
+
+- Weights load to `cuda:0` (fp16 after compressed-tensors decompress) and generate
+  runs there too — verified: params on `cuda:0`, SM utilization 21–43% during
+  decode, ~4 tok/s batch-1 greedy. If `nvidia-smi` shows ~0% between utterances,
+  that is normal: single-stream decode of a 1.8B model is latency-bound with
+  tiny kernels, and the GPU idles between segments.
+- ASR (sherpa-onnx wheels) is CPU-only by build; int8 decodes ~15x realtime,
+  so it never bottlenecks. MT stays on CUDA.
+- `mt_use_cache: true` is set, though this custom modeling largely ignores it;
+  per-token latency is a property of the checkpoint, not a device bug.
 
 | Module | Model (default) | Source |
 |---|---|---|
@@ -35,9 +48,16 @@ pip install -r requirements.txt
 ```
 
 > Python version note: `deepfilternet` bundles prebuilt wheels for Python
-> 3.8–3.11. On 3.12+ its build needs a Rust toolchain — either use Python 3.11
-> or install via rustup + MSVC Build Tools. Without it the app runs in
-> pass-through mode (verified) and everything else still works.
+> 3.8–3.11. **DeepFilterNet is fully working under Python 3.11** (verified:
+> 41.6 dB noise reduction, full denoise→ASR→MT chain, enhancer even lands on
+> `cuda:0`). On 3.12 its build needs a Rust toolchain — without it the app runs
+> in pass-through mode and everything else still works.
+>
+> To run with denoising, use the 3.11 venv (torch cu126 + all requirements
+> install cleanly there) and launch the app from it. The model weights
+> ([DeepFilterNet/models](https://github.com/Rikorose/DeepFilterNet/tree/main/models))
+> are fetched automatically by `init_df()` on first warmup (see
+> `scripts/download_models.py`) — nothing to download by hand.
 
 Optional (faster / extra):
 ```powershell
@@ -47,7 +67,17 @@ pip install "nemo_toolkit[asr]"                                   # only if diar
 
 ## 2. Run (desktop app)
 
-### C# app (recommended for GitHub/sharing)
+### Electron + TypeScript app (current primary GUI)
+
+```powershell
+cd electron
+npm install        # once: electron + typescript + electron-builder
+npm run build      # tsc -> dist/
+npx electron .     # launches; finds run.py, picks CUDA/CPU, opens the window
+npm run dist       # Windows NSIS installer (needs electron-builder downloads)
+```
+
+### C# app (WPF alternative, same protocol)
 
 ```powershell
 # needs: .NET 8 SDK + Python 3.11/3.12 with requirements installed
@@ -58,7 +88,6 @@ dotnet build csharp/ConfLive/ConfLive.csproj -c Release
 The exe finds `run.py` next to it, picks CUDA (`nvidia-smi` present) or CPU
 (`DEVICE=cpu`), launches the backend itself, and shows the effective device in
 the badge — `(CPU fallback active)` if CUDA was requested but unavailable.
-No console windows, no browser.
 
 ```powershell
 # one-file exe + Setup.exe installer:
@@ -163,6 +192,8 @@ config.yaml  desktop_app.py  run.py  requirements.txt
 app/device.py  app/zipformer_engine.py  app/mt_engine.py  app/diarizer.py
 app/enhancer.py  app/audio_io.py  app/pipeline.py  app/main.py   (web, legacy)
 desktop/bootstrap.py  desktop/recorder.py  desktop/worker.py  desktop/ui.py
+electron/package.json  electron/tsconfig.json  electron/index.html
+electron/styles.css  electron/src/main.ts  electron/src/preload.ts  electron/src/renderer.ts
 web/index.html  web/styles.css  web/app.js                       (web, legacy)
 scripts/download_models.py  scripts/smoke_test.py
 scripts/desktop_smoke.py  scripts/desktop_ui_test.py  scripts/streaming_smoke.py

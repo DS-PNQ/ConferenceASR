@@ -10,6 +10,7 @@ from pathlib import Path
 
 import yaml
 from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -51,6 +52,14 @@ if DEMO == "true":
     enhancer.ensure_loaded(demo_ok=True)
 
 app = FastAPI(title="Trilingual Conference ASR + Translator", version="1.0.0")
+# Local desktop clients (Electron renderer, Tauri, browser tabs) call the API
+# from non-http origins. The server binds 127.0.0.1 only, so this is safe.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 app.mount("/static", StaticFiles(directory=str(ROOT / "web")), name="static")
 
 
