@@ -1,5 +1,5 @@
 // Main process: window + Python backend lifecycle (find, CUDA-detect, spawn, reap).
-import { app, BrowserWindow } from "electron";
+import { app, BrowserWindow, Menu } from "electron";
 import { spawn, execFile, ChildProcess } from "child_process";
 import * as path from "path";
 import * as fs from "fs";
@@ -106,6 +106,9 @@ async function ensureBackend(): Promise<void> {
 }
 
 async function createWindow(): Promise<void> {
+  // No native menu bar: the UI is fully custom (sidebar nav). The default
+  // Electron menu renders as a light strip that clashes with the design.
+  Menu.setApplicationMenu(null);
   win = new BrowserWindow({
     width: 1200,
     height: 780,
@@ -113,8 +116,10 @@ async function createWindow(): Promise<void> {
     minHeight: 640,
     title: "ConfLive",
     backgroundColor: "#F2F2F7",
+    autoHideMenuBar: true,
     webPreferences: { preload: path.join(__dirname, "preload.js") },
   });
+  win.setMenu(null);
   await win.loadFile(path.join(__dirname, "..", "ui", "dist", "index.html"));
   win.on("closed", () => (win = null));
 }

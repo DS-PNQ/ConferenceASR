@@ -6,6 +6,13 @@ export interface Translations {
   [k: string]: string;
 }
 
+export interface Timings {
+  asr_ms: number;
+  diar_ms: number;
+  mt_ms: number;
+  total_ms: number;
+}
+
 export interface Utterance {
   id: number;
   speaker: string;
@@ -16,6 +23,7 @@ export interface Utterance {
   translations: Translations;
   start: number; // epoch seconds (server clock)
   diar_backend?: string;
+  timings?: Timings;
 }
 
 export interface PartialMsg {
@@ -292,10 +300,12 @@ export interface ArchivedUtterance {
   translations: Record<string, string>;
   /** pre-multilang archives stored one string; still readable */
   translation?: string;
+  timings?: Timings;
 }
 
 export interface ArchivedSession {
   id: string;
+  label: string;
   startedAt: number;
   seconds: number;
   utterances: ArchivedUtterance[];

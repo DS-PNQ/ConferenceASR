@@ -211,6 +211,7 @@ class StreamingSession:
     # -- finalize ---------------------------------------------------------------
     def _finalize(self, t: float):
         seg = np.concatenate(self._seg_audio) if self._seg_audio else np.zeros(0, np.float32)
+        t_start = time.time()
         denoised = False
         if self._want_denoise() and self.enhancer is not None and seg.size:
             seg = self.enhancer.enhance_array(seg, 16000)
@@ -253,6 +254,7 @@ class StreamingSession:
             self._fresh_stream()
             self._reset_segment()
             return
+        t_asr = time.time()
         context = self._context()
         terms = self.terms or None
         # Neural speaker verdict: NeMo embedding attribution overrides the
@@ -268,6 +270,7 @@ class StreamingSession:
                     diar_backend = verdict.get("backend")
         except Exception as e:
             log.warning("segment attribution failed: %s", e)
+        t_diar = time.time()
         translations: dict[str, str] = {}
         try:
             # Token-stream each target so the UI fills in live ("tok" events),
@@ -291,6 +294,7 @@ class StreamingSession:
                     text, tgt=tgt, src="auto", context=context, terms=terms)
         except Exception as e:
             translations = {tgt: f"[MT error: {e}]" for tgt in self.targets}
+        t_mt = time.time()
         self.history.append(text)
         entry = {
             "id": self._seg_id, "type": "utterance", "speaker": speaker,
@@ -298,6 +302,12 @@ class StreamingSession:
             "denoised": denoised, "src_lang": "auto", "text": text,
             "translations": translations, "start": round(self._seg_start or t, 2),
             "asr_backend": asr_backend,
+            "timings": {
+                "asr_ms": int((t_asr - t_start) * 1000),
+                "diar_ms": int((t_diar - t_asr) * 1000),
+                "mt_ms": int((t_mt - t_diar) * 1000),
+                "total_ms": int((t_mt - t_start) * 1000),
+            },
         }
         if diar_backend:
             entry["diar_backend"] = diar_backend

@@ -87,6 +87,13 @@ interface Row {
   speaker: string;
   text: string;
   translations: Record<string, string>;
+  timings?: { asr_ms: number; diar_ms: number; mt_ms: number; total_ms: number };
+}
+
+function fmtLatency(t?: Row["timings"]): string | null {
+  if (!t) return null;
+  const s = (ms: number) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`);
+  return `asr ${s(t.asr_ms)} · mt ${s(t.mt_ms)} · diar ${s(t.diar_ms)} · e2e ${s(t.total_ms)}`;
 }
 
 const DISPLAY_LANGS = [
@@ -190,6 +197,14 @@ export default function App() {
   const [terms, setTerms] = useState<Record<string, string>>(() => loadGlossary());
   const [archive, setArchive] = useState<ArchivedSession[]>(() => loadArchive());
   const [openArchived, setOpenArchived] = useState<string | null>(null);
+  // developer latency readout (per-segment ASR/MT/diar timings); on by default
+  const [dev, setDev] = useState(() => {
+    try {
+      return localStorage.getItem("conflive.dev") !== "0";
+    } catch {
+      return true;
+    }
+  });
   // token-streamed translation for the segment currently finalizing
   const [tok, setTok] = useState<{ id: number; text: string } | null>(null);
   const tokAcc = useRef<Record<number, string>>({});
@@ -202,6 +217,10 @@ export default function App() {
   const elapsedRef = useRef(0);
   const liveRef = useRef(false);
   const pausedRef = useRef(false);
+  // rowsRef eagerly mirrors rows (appendUtterance updates both) so archiving
+  // is race-free from timeouts, uploads and unload handlers alike.
+  const rowsRef = useRef<Row[]>([]);
+  const savedCountRef = useRef(0);
   liveRef.current = live;
   pausedRef.current = paused;
   elapsedRef.current = elapsed;
@@ -252,6 +271,42 @@ export default function App() {
 
   useEffect(() => saveGlossary(terms), [terms]);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem("conflive.dev", dev ? "1" : "0");
+    } catch {
+      /* noop */
+    }
+  }, [dev]);
+
+  // flush unarchived rows if the window closes mid-session/upload
+  useEffect(() => {
+    const flush = () => {
+      const all = rowsRef.current;
+      if (all.length > savedCountRef.current) {
+        const fresh = all.slice(savedCountRef.current);
+        const s: ArchivedSession = {
+          id: `${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
+          label: "Interrupted session",
+          startedAt: (anchorRef.current ?? Date.now() / 1000) * 1000,
+          seconds: elapsedRef.current,
+          utterances: fresh.map((r) => ({
+            time: formatTime(r.at),
+            speaker: speakerName(r.speaker),
+            text: r.text,
+            translations: r.translations,
+            timings: r.timings,
+          })),
+        };
+        savedCountRef.current = all.length;
+        const next = [s, ...loadArchive()].slice(0, 50);
+        saveArchive(next);
+      }
+    };
+    window.addEventListener("beforeunload", flush);
+    return () => window.removeEventListener("beforeunload", flush);
+  }, []);
+
   function anchorFor(serverStart: number | null): number {
     if (anchorRef.current === null) {
       anchorRef.current = serverStart ?? Date.now() / 1000;
@@ -267,7 +322,9 @@ export default function App() {
       speaker: u.speaker,
       text: u.text,
       translations: u.translations,
+      timings: u.timings,
     };
+    rowsRef.current = [...rowsRef.current, row];
     setRows((prev) => [...prev, row]);
     setSelectedSegment(u.id);
   }
@@ -339,19 +396,26 @@ export default function App() {
     setStatus(next ? "Paused — resume to continue the same session." : "● Listening — streaming ASR + translation.");
   }
 
-  function archiveCurrent(): ArchivedSession | null {
-    if (rows.length === 0) return null;
+  function archiveDelta(label: string): ArchivedSession | null {
+    // Archive only rows not archived before, so stop/upload/new can each
+    // flush without ever duplicating. rowsRef mirrors state for unload flush.
+    const all = rowsRef.current;
+    const fresh = all.slice(savedCountRef.current);
+    if (fresh.length === 0) return null;
     const s: ArchivedSession = {
-      id: String(Date.now()),
+      id: `${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
+      label,
       startedAt: (anchorRef.current ?? Date.now() / 1000) * 1000,
       seconds: elapsedRef.current,
-      utterances: rows.map((r) => ({
+      utterances: fresh.map((r) => ({
         time: formatTime(r.at),
         speaker: speakerName(r.speaker),
         text: r.text,
         translations: r.translations,
+        timings: r.timings,
       })),
     };
+    savedCountRef.current = all.length;
     setArchive((prev) => {
       const next = [s, ...prev].slice(0, 50);
       saveArchive(next);
@@ -377,7 +441,7 @@ export default function App() {
       socketRef.current?.close();
       socketRef.current = null;
     }, 4000);
-    archiveCurrent();
+    archiveDelta("Live session");
     setLive(false);
     setPaused(false);
     setPartial(null);
@@ -386,8 +450,10 @@ export default function App() {
 
   function newSession() {
     if (liveRef.current) stopSession();
-    else archiveCurrent();
+    else archiveDelta("Live session");
     setRows([]);
+    rowsRef.current = [];
+    savedCountRef.current = 0;
     setPartial(null);
     setSelectedSegment(null);
     setElapsed(0);
@@ -409,7 +475,10 @@ export default function App() {
         anchorRef.current = Math.min(...list.map((u) => u.start));
       }
       list.forEach(appendUtterance);
-      setStatus(`Done — ${list.length} utterances.`);
+      // rowsRef is updated eagerly, so flush synchronously: uploads never
+      // hit stopSession, and without this they would never reach Library.
+      const s = archiveDelta(`Upload · ${f.name}`);
+      setStatus(s ? `Done — ${list.length} utterances, archived to Library.` : `Done — ${list.length} utterances.`);
     } catch (e) {
       setStatus("Upload failed: " + (e as Error).message);
     }
@@ -491,7 +560,7 @@ export default function App() {
             onCopy={copyTranscript} onSelectSegment={setSelectedSegment}
             selectedSegment={selectedSegment} onTogglePause={togglePause} onStop={stopSession}
             onUpload={uploadFile} setQuery={setQuery} showTranslation={showTranslation}
-            toggleTranslation={() => setShowTranslation((v) => !v)}
+            toggleTranslation={() => setShowTranslation((v) => !v)} dev={dev}
             visibleRows={visibleRows} partial={partial} tok={tok} displayLang={displayLang}
             speakerCount={speakerCount} sessionDate={sessionDate} status={status}
             health={health} targets={targets}
@@ -499,7 +568,7 @@ export default function App() {
         ) : activeView === "Library" ? (
           <LibraryView archive={archive} openId={openArchived} onOpen={setOpenArchived}
             onDelete={(id) => setArchive((prev) => { const n = prev.filter((s) => s.id !== id); saveArchive(n); return n; })}
-            displayLang={displayLang} onNavigate={() => setActiveView("Live session")} />
+            displayLang={displayLang} dev={dev} onNavigate={() => setActiveView("Live session")} />
         ) : activeView === "Glossary" ? (
           <GlossaryView terms={terms} onChange={setTerms} onNavigate={() => setActiveView("Live session")} />
         ) : activeView === "Translate" ? (
@@ -508,7 +577,7 @@ export default function App() {
           <SettingsView
             health={health} mics={mics} micId={micId} onMic={setMicId}
             srcChoice={srcChoice} onSrc={setSrcChoice} targets={targets} onTargets={setTargets}
-            denoise={denoise} onDenoise={setDenoise} status={status}
+            denoise={denoise} onDenoise={setDenoise} dev={dev} onDev={setDev} status={status}
             onRefresh={async () => {
               try {
                 setStatus("Loading models…");
@@ -541,6 +610,7 @@ function LiveSession(props: {
   selectedSegment: number | null; onTogglePause: () => void; onStop: () => void;
   onUpload: (f: File) => void; setQuery: (v: string) => void;
   showTranslation: boolean; toggleTranslation: () => void;
+  dev: boolean;
   visibleRows: Row[]; partial: PartialMsg | null;
   tok: { id: number; text: string } | null; displayLang: string;
   speakerCount: number; sessionDate: string; status: string;
@@ -596,6 +666,9 @@ function LiveSession(props: {
                   {text}
                 </span>
               ))}
+              {props.dev && fmtLatency(entry.timings) ? (
+                <span className="latency">{fmtLatency(entry.timings)}</span>
+              ) : null}
             </span>
             <span className="row-more"><Icon name="more" size={18} /></span>
           </button>
@@ -659,12 +732,12 @@ function WaveBars({ level, live }: { level: number; live: boolean }) {
 
 function LibraryView(props: {
   archive: ArchivedSession[]; openId: string | null; onOpen: (id: string | null) => void;
-  onDelete: (id: string) => void; displayLang: string; onNavigate: () => void;
+  onDelete: (id: string) => void; displayLang: string; dev: boolean; onNavigate: () => void;
 }) {
   const open = props.archive.find((s) => s.id === props.openId) ?? null;
   if (open) {
     return <section className="secondary-view wide">
-      <p className="secondary-label">Archive · {new Date(open.startedAt).toLocaleString()}</p>
+      <p className="secondary-label">Archive · {open.label || "Live session"} · {new Date(open.startedAt).toLocaleString()}</p>
       <h1>{formatTime(open.seconds)} session</h1>
       <p>{open.utterances.length} segments.</p>
       <div className="archive-actions">
@@ -685,6 +758,9 @@ function LibraryView(props: {
                   {text}
                 </span>
               ))}
+              {props.dev && fmtLatency(u.timings) ? (
+                <span className="latency">{fmtLatency(u.timings)}</span>
+              ) : null}
             </span>
           </div>
         ))}
@@ -700,7 +776,7 @@ function LibraryView(props: {
       {props.archive.length === 0 && <p className="archive-empty">No archived sessions yet — stop a session to save it here.</p>}
       {props.archive.map((s) => (
         <button className="archive-row" key={s.id} onClick={() => props.onOpen(s.id)}>
-          <span className="archive-title">{new Date(s.startedAt).toLocaleString()}</span>
+          <span className="archive-title">{s.label || "Live session"} · {new Date(s.startedAt).toLocaleString()}</span>
           <span className="archive-meta">{s.utterances.length} segments · {formatTime(s.seconds)}</span>
           <Icon name="arrow" size={16} />
         </button>
@@ -806,6 +882,7 @@ function SettingsView(props: {
   onMic: (id: string | undefined) => void; srcChoice: string; onSrc: (v: string) => void;
   targets: string[]; onTargets: (t: string[]) => void;
   denoise: boolean; onDenoise: (v: boolean) => void; status: string;
+  dev: boolean; onDev: (v: boolean) => void;
   onRefresh: () => void; onDiarizer: (m: "pyannote" | "volume" | "nemo") => void; onNavigate: () => void;
 }) {
   const h = props.health;
@@ -860,6 +937,9 @@ function SettingsView(props: {
       </div>
       <label className="check">DeepFilterNet denoise
         <input type="checkbox" checked={props.denoise} onChange={(e) => props.onDenoise(e.target.checked)} />
+      </label>
+      <label className="check">Developer latency readout
+        <input type="checkbox" checked={props.dev} onChange={(e) => props.onDev(e.target.checked)} />
       </label>
     </div>
     <div className="backend-status">
