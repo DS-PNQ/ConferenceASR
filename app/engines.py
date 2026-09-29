@@ -1,4 +1,5 @@
-"""Desktop bootstrap: config + engines + pipeline + worker (no web server involved)."""
+"""Engine wiring shared by the server and scripts: config + ASR/MT/diarizer/
+enhancer + pipeline. Models stay lazy until warmup/ensure_loaded."""
 from __future__ import annotations
 
 import logging
@@ -13,9 +14,8 @@ from app.enhancer import DeepFilterNetEnhancer
 from app.mt_engine import HyMT2Engine
 from app.pipeline import ConferencePipeline
 from app.zipformer_engine import ZipformerEngine
-from desktop.worker import InferenceWorker
 
-log = logging.getLogger("conf.desktop")
+log = logging.getLogger("conf.engines")
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -26,7 +26,7 @@ def load_cfg() -> dict:
 
 
 def build_app() -> dict:
-    """Create everything the desktop UI needs. Models stay lazy until warmup."""
+    """Create engines + pipeline. Models stay lazy until warmup."""
     cfg = load_cfg()
     device = resolve_device(os.getenv("DEVICE", cfg.get("device", "auto")))
     mt_dtype = resolve_dtype(device, os.getenv("MT_DTYPE", cfg.get("mt_dtype", "auto")))
@@ -37,7 +37,5 @@ def build_app() -> dict:
     enhancer = DeepFilterNetEnhancer(cfg)
     pipe = ConferencePipeline(cfg, asr, mt, diarizer, enhancer)
 
-    demo_ok = os.getenv("DEMO_MODE", str(cfg.get("demo_mode", "auto"))).lower() != "false"
-    worker = InferenceWorker(cfg, pipe, asr, mt, diarizer, enhancer, demo_ok=demo_ok)
     return {"cfg": cfg, "device": device_report(cfg), "asr": asr, "mt": mt,
-            "diarizer": diarizer, "enhancer": enhancer, "pipe": pipe, "worker": worker}
+            "diarizer": diarizer, "enhancer": enhancer, "pipe": pipe}

@@ -16,7 +16,7 @@ class FakeASR:
 
 
 class FakeMT:
-    def translate(self, text, tgt="en", src="auto"):
+    def translate(self, text, tgt="en", src="auto", context=None):
         return f"[{tgt}] {text}"
 
 

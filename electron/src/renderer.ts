@@ -37,7 +37,8 @@ let frameBuf: Float32Array[] = [];
 let frameLen = 0;
 let utterances: Utterance[] = [];
 let count = 0;
-let partialEl: { id: number; root: HTMLElement; orig: HTMLElement; who: HTMLElement; trBox: HTMLElement } | null = null;
+let partialEl: { id: number; root: HTMLElement; body: HTMLElement; orig: HTMLElement; who: HTMLElement; trBox: HTMLElement; streamBox: HTMLElement | null } | null = null;
+const tokLines = new Map<string, HTMLElement>();
 
 // ---------- controls ----------
 function targets(): string[] {
@@ -68,7 +69,7 @@ function scrollBottom() {
   f.scrollTop = f.scrollHeight;
 }
 
-function makeBubble(speaker: string, meta: string, animate: boolean): { root: HTMLElement; orig: HTMLElement; who: HTMLElement; trBox: HTMLElement } {
+function makeBubble(speaker: string, meta: string, animate: boolean): { root: HTMLElement; body: HTMLElement; orig: HTMLElement; who: HTMLElement; trBox: HTMLElement } {
   clearEmpty();
   const root = document.createElement("div");
   root.className = "utt";
@@ -80,6 +81,7 @@ function makeBubble(speaker: string, meta: string, animate: boolean): { root: HT
   scrollBottom();
   return {
     root,
+    body: root,
     orig: root.querySelector(".orig") as HTMLElement,
     who: root.querySelector(".who") as HTMLElement,
     trBox: root.querySelector(".trs") as HTMLElement,
@@ -108,7 +110,7 @@ function upsertPartial(p: PartialMsg) {
   }
   if (!partialEl) {
     const b = makeBubble(p.speaker, `${p.speaker} · listening…`, false);
-    partialEl = { id: p.id, ...b };
+    partialEl = { id: p.id, ...b, streamBox: null };
   }
   partialEl.orig.textContent = p.text;
   partialEl.who.textContent = `${p.speaker} · listening… · ${p.rms_db} dB`;
@@ -116,13 +118,43 @@ function upsertPartial(p: PartialMsg) {
   scrollBottom();
 }
 
+function upsertTok(id: number, tgt: string, delta: string) {
+  // Token-streamed final translation: appended live under the (partial) bubble.
+  // The final utterance event replaces the whole bubble, confirming the text.
+  if (!partialEl || partialEl.id !== id) {
+    if (partialEl) {
+      partialEl.root.remove();
+      partialEl = null;
+    }
+    const b = makeBubble("SPEAKER_??", "streaming…", false);
+    partialEl = { id, ...b, streamBox: null };
+  }
+  if (!partialEl.streamBox) {
+    const box = document.createElement("div");
+    box.className = "trs-stream";
+    partialEl.body.appendChild(box);
+    partialEl.streamBox = box;
+  }
+  const key = `${id}:${tgt}`;
+  let line = tokLines.get(key);
+  if (!line) {
+    line = document.createElement("div");
+    line.className = "tr streaming";
+    line.textContent = `[${tgt}] `;
+    partialEl.streamBox.appendChild(line);
+    tokLines.set(key, line);
+  }
+  line.textContent += delta;
+  scrollBottom();
+}
+
 function addFinal(u: Utterance) {
-  if (partialEl && partialEl.id === u.id) {
+  if (partialEl) {
     partialEl.root.remove();
     partialEl = null;
-  } else if (partialEl) {
-    partialEl.root.remove();
-    partialEl = null;
+  }
+  for (const key of Array.from(tokLines.keys())) {
+    if (key.startsWith(`${u.id}:`)) tokLines.delete(key);
   }
   const badge = u.denoised ? " · 🔇" : "";
   const b = makeBubble(u.speaker, `${u.speaker} · ${u.src_lang} · ${u.rms_db} dB${badge}`, true);
@@ -218,6 +250,7 @@ async function startRecording() {
       return;
     }
     if (m.type === "partial") upsertPartial(m as PartialMsg);
+    else if (m.type === "tok") upsertTok(m.id, m.tgt, m.delta || "");
     else if (m.type === "utterance") addFinal(m as Utterance);
     else if (m.type === "stream_started") setStatus("● Listening — streaming ASR + translation.");
     else if (m.type === "stream_stopped") setStatus(`Stopped (${m.finalized} segments).`);

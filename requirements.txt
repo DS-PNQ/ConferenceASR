@@ -1,14 +1,10 @@
-# Core server
+# Core server (FastAPI inference API for the Electron/C# clients)
 fastapi>=0.110
 uvicorn[standard]>=0.29
 python-multipart>=0.0.9
 pyyaml>=6.0
 numpy>=1.26
 soundfile>=0.12
-
-# Desktop app (native window, no browser)
-customtkinter>=5.2
-sounddevice>=0.4.6   # mic capture; bundles PortAudio on Windows
 
 # Torch: install the CUDA build for your RTX 4060 (CUDA 12.x), e.g.:
 #   pip install torch --index-url https://download.pytorch.org/whl/cu126
@@ -33,10 +29,6 @@ compressed-tensors>=0.18
 # NOTE: deepfilterlib ships prebuilt wheels for Python 3.8-3.11. On 3.12+
 # `pip install deepfilternet` needs a Rust toolchain (or use Python 3.11).
 deepfilternet>=0.5
-
-# Optional: server-side mic capture (browser mic is default; this is for scripts/record_cli.py)
-# sounddevice>=0.4.6
-# webrtcvad-wheels>=2.0.14
 
 # Optional: NVIDIA NeMo speaker diarization (heavy). Only needed if diarizer: nemo
 # See https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/asr/speaker_diarization/intro.html

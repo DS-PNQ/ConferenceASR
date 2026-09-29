@@ -1,4 +1,8 @@
-"""FastAPI server: landing + live conference studio + REST/WS inference API."""
+"""FastAPI inference server for the Electron/C# desktop clients.
+
+API-only (no bundled UI): REST (/api/*) + streaming WebSocket (/ws/live).
+Interactive docs at /docs when running.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -11,8 +15,7 @@ from pathlib import Path
 import yaml
 from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from .audio_io import chunk_stream, decode_b64_pcm16, decode_bytes
 from .device import device_report, resolve_device, resolve_dtype
@@ -60,12 +63,15 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
-app.mount("/static", StaticFiles(directory=str(ROOT / "web")), name="static")
-
-
-@app.get("/", include_in_schema=False)
+@app.get("/")
 def index():
-    return FileResponse(str(ROOT / "web" / "index.html"))
+    return {
+        "service": "ConfLive inference API",
+        "frontends": ["electron/", "csharp/ConfLive"],
+        "docs": "/docs",
+        "health": "/api/health",
+        "websocket": "/ws/live",
+    }
 
 
 @app.get("/api/health")
@@ -196,12 +202,14 @@ async def _ws_stream_msg(ws: WebSocket, data: dict, holder: dict):
             await ws.send_json({"ok": False, "error": f"stop failed: {e}"})
             return
         holder["session"] = None
-    # drain session events (partial / utterance) without blocking
+    # drain session events (partial / tok / utterance) without blocking
     try:
         while True:
             ev_kind, payload = session.results.get_nowait()
             if ev_kind == "partial":
                 await ws.send_json({"ok": True, "type": "partial", **payload})
+            elif ev_kind == "tok":
+                await ws.send_json({"ok": True, "type": "tok", **payload})
             elif ev_kind == "utterance":
                 await ws.send_json({"ok": True, "type": "utterance", **payload})
     except _queue.Empty:
@@ -220,8 +228,8 @@ async def ws_live(ws: WebSocket):
     Streaming (C# desktop client): {"type": "stream_start", targets, src_lang,
     denoise} opens a StreamingSession, then {"type": "stream_audio", audio_b64,
     sr} feeds short frames, then {"type": "stream_stop"}. Server emits
-    ("partial", ...) live events and ("utterance", ...) finals from the
-    session's result queue.
+    ("partial", ...) live events, ("tok", ...) per-target token deltas during
+    final translation, and ("utterance", ...) finals from the session queue.
     """
     await ws.accept()
     holder: dict = {"session": None}

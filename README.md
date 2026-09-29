@@ -8,10 +8,8 @@ volume diarization, DeepFilterNet hook):
 
 - **Electron + TypeScript app** (`electron/`, primary): `npm run build && npx electron .`.
   Finds `run.py`, picks CUDA/CPU itself, streams mic over `/ws/live` with live
-  partials. `npm run dist` builds a Windows installer via electron-builder.
+  partials and token-streamed finals. `npm run dist` builds a Windows installer.
 - **C# desktop app** (`csharp/ConfLive`): native WPF window, same protocol.
-- **Python desktop app** (`desktop_app.py`): same UI in CustomTkinter, no build step.
-- Legacy browser UI (`web/`) kept for reference.
 
 ## GPU usage notes (measured RTX 4060 Laptop, Hy-MT2-1.8B-FP8)
 
@@ -32,9 +30,9 @@ volume diarization, DeepFilterNet hook):
 | Translation | `tencent/Hy-MT2-1.8B-FP8` (compressed-tensors, CUDA) | https://huggingface.co/collections/tencent/hy-mt2 |
 | Diarization | volume-based (default) · NeMo optional | https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/asr/speaker_diarization/intro.html |
 
-UI is a native desktop window (CustomTkinter, neutral tones + AI-purple `#7C3AED`):
-sidebar controls + chat-style transcript feed with streaming typewriter effect,
-speaker colours, volume meter, and TXT/SRT export. No browser needed.
+UI is a native desktop window (neutral tones + AI-purple `#7C3AED`):
+sidebar controls + chat-style transcript feed with live partials, token-streamed
+translations, speaker colours, volume meter, and TXT/SRT export. No browser needed.
 
 ## 1. Setup (Python 3.12, RTX 4060 / CPU)
 
@@ -59,9 +57,8 @@ pip install -r requirements.txt
 > are fetched automatically by `init_df()` on first warmup (see
 > `scripts/download_models.py`) — nothing to download by hand.
 
-Optional (faster / extra):
+Optional (extra):
 ```powershell
-pip install sounddevice                                           # mic capture (or in requirements.txt)
 pip install "nemo_toolkit[asr]"                                   # only if diarizer: nemo
 ```
 
@@ -95,28 +92,26 @@ powershell -ExecutionPolicy Bypass -File installer/build.ps1
 # needs Inno Setup (iscc) for the final Setup.exe; without it, ship installer/stage.
 ```
 
-### Python app (no build step)
+### Python backend only (no GUI)
 
 ```powershell
 python scripts/download_models.py   # optional pre-download (first run auto-downloads)
-python desktop_app.py               # native window, no browser
+python run.py                        # API on http://127.0.0.1:8000, docs at /docs
 ```
 
 In the window:
 - Models load in the background (status line reports ASR / MT / denoise backends).
 - **● Record**: the streaming Zipformer recognizer stays open while you speak —
-  a live partial bubble grows in realtime with debounced translations streaming
-  in behind it. Segments finalize on **pauses, not the clock**, so sentences are
-  never cut mid-word; the partial is then replaced by the final translated bubble.
+  a live partial bubble grows in realtime; final translations **stream in token
+  by token** (`tok` events) behind it. Segments finalize on **pauses, not the
+  clock**, so sentences are never cut mid-word; the partial is then replaced by
+  the final translated bubble.
 - **⇪ Upload**: any recording streams through the same endpointing pipeline.
 - Sidebar: mic picker, source language (or auto-detect), EN / 中文 / VI targets,
   DeepFilterNet switch, volume meter, **.txt / .srt export**, Clear.
 
-No weights / no GPU? The app boots in clearly-labelled **demo mode** (mock ASR/MT)
-so the window, recorder, diarizer and exports all still work.
-
-> Legacy web interface (`python run.py` → http://127.0.0.1:8000) is still in
-> the repo (`app/main.py`, `web/`) but no longer the primary app.
+No weights / no GPU? The backend boots in clearly-labelled **demo mode**
+(mock ASR/MT) so the UI, diarizer and exports all still work.
 
 ## 3. Config (`config.yaml`)
 
@@ -129,6 +124,15 @@ asr_threads: 4
 mt_model: tencent/Hy-MT2-1.8B-FP8
 mt_max_new_tokens: 256
 mt_do_sample: false     # greedy decode = fastest
+mt_use_cache: true      # passed through; this custom modeling largely ignores it
+mt_speculative: false   # prompt-lookup speculative decoding (drafter-free, exact).
+                        # MEASURED RTX 4060, interleaved n=3-4: 0.76-1.0x cross-lingual,
+                        # ~1.0x same-language. No reliable win on this task: OFF.
+                        # Auto-fires for src==tgt or ASCII->English regardless.
+mt_lookup_tokens: 10
+mt_history_turns: 3     # past segments as translation context (terminology/style)
+mt_history_chars: 600
+mt_do_sample: false     # greedy decode = fastest
 noise_suppress: true    # DeepFilterNet pre-ASR denoising (UI toggle overrides per request)
 df_model: null          # null = DeepFilterNet3; alt: DeepFilterNet2, DeepFilterNet
 df_post_filter: false
@@ -140,7 +144,7 @@ endpoint_silence: 1.0    # pause (s) that finalizes a segment
 endpoint_min_speech: 0.5
 max_segment: 20.0        # force-finalize run-on speech
 partial_translate_interval: 2.5
-segment_seconds: 5.0     # legacy fixed-window path (web API only)
+segment_seconds: 5.0     # fixed-window size for the /api/transcribe upload path
 max_speakers: 3
 ```
 
@@ -167,36 +171,49 @@ NeMo path: set `diarizer: nemo`, `use_nemo: true`, install `nemo_toolkit[asr]`;
 `NeMoDiarizer` wraps `MSDDiarizationModel` per the NeMo diarization docs and falls
 back to volume mode with a warning if NeMo is unavailable.
 
-## 6. Verify (no weights required)
+## 6. MT upgrades: token streaming, dialogue context, speculative decoding
+
+- **Token streaming** (`translate_stream`): finals generate into `tok` events
+  (`{id, tgt, seq, delta}`) over `/ws/live`, rendered live with a blinking caret
+  in Electron. Implemented with an id-collecting streamer because this custom
+  modeling echoes prompt tokens through `TextIteratorStreamer`; verified
+  `joined == one-shot` output exactly.
+- **Dialogue context** (`mt_history_turns/chars`): recent finalized segments travel
+  in the prompt as terminology/style reference, fenced with DO-NOT-translate.
+  (Appending history after the instruction made the model translate the history
+  and ramble 3x — prompt order matters.)
+- **Prompt-lookup speculative decoding** (`mt_speculative`, drafter-free, exact):
+  measured on RTX 4060, interleaved n=3–4 — **0.76–1.0x cross-lingual, ~1.0x
+  same-language: no reliable win**, so OFF by default. It auto-fires for
+  `src==tgt` or ASCII→English where drafts can only help. A dedicated drafter
+  model would be needed for real speculative gains; none exists in Hy-MT2.
+
+## 7. Verify (engines need cached weights; fakes don't)
 
 ```powershell
-python scripts/smoke_test.py      # engines: device, denoiser, diarizer, pipeline
-python scripts/desktop_smoke.py   # desktop: worker tasks, mic listing, UI import
-python scripts/desktop_ui_test.py # real hidden window: bubbles, partial->final, settings
+python scripts/smoke_test.py      # device, denoiser, diarizer, pipeline, API routes
 python scripts/streaming_smoke.py # REAL engines: live partials + endpointed finals + MT
 ```
 
-## 7. Web API (legacy)
-
-The FastAPI server is kept for programmatic access:
+## 8. Backend API (serves Electron + C#)
 
 - `POST /api/transcribe` (multipart `file`, `targets=en,zh`, `src_lang=auto`, `denoise=auto|true|false`)
-- `POST /api/translate` (`{text, targets[], src}`)
-- `WS /ws/live` — stream `{audio_b64 (pcm16), sr, targets[], src_lang, denoise}` → utterance JSON
+- `POST /api/translate` (`{text, targets[], src}`) — text translation
+- `WS /ws/live` — `stream_start` / `stream_audio` / `stream_stop` → `partial`,
+  per-target `tok` token deltas during final translation, `utterance` finals
 - `GET /api/health` — device, ASR/MT/denoise status
 
 ## Layout
 
 ```
-config.yaml  desktop_app.py  run.py  requirements.txt
-app/device.py  app/zipformer_engine.py  app/mt_engine.py  app/diarizer.py
-app/enhancer.py  app/audio_io.py  app/pipeline.py  app/main.py   (web, legacy)
-desktop/bootstrap.py  desktop/recorder.py  desktop/worker.py  desktop/ui.py
+config.yaml  run.py  requirements.txt
+app/engines.py  app/device.py  app/zipformer_engine.py  app/mt_engine.py
+app/diarizer.py  app/enhancer.py  app/audio_io.py  app/pipeline.py
+app/streaming.py  app/main.py
 electron/package.json  electron/tsconfig.json  electron/index.html
 electron/styles.css  electron/src/main.ts  electron/src/preload.ts  electron/src/renderer.ts
-web/index.html  web/styles.css  web/app.js                       (web, legacy)
-scripts/download_models.py  scripts/smoke_test.py
-scripts/desktop_smoke.py  scripts/desktop_ui_test.py  scripts/streaming_smoke.py
+csharp/ConfLive/*.csproj,*.xaml,*.cs  installer/ConfLive.iss + build.ps1
+scripts/download_models.py  scripts/smoke_test.py  scripts/streaming_smoke.py
 ```
 
 > Note on `AGENTS.md`: the workspace-root `AGENTS.md` is the Apple design-review

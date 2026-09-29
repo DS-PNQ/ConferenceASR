@@ -16,6 +16,14 @@ mt_model: tencent/Hy-MT2-1.8B-FP8  # compressed-tensors FP8 on CUDA; CPU/mock fa
 mt_max_new_tokens: 256     # short utterances only; lower = faster
 mt_do_sample: false        # false = greedy decode (fastest, deterministic)
 mt_use_cache: true         # KV-cache (repo default false = slow recompute)
+mt_speculative: false      # prompt-lookup speculative decoding (drafter-free, exact:
+                           # output identical). MEASURED on RTX 4060, n=3-4 interleaved:
+                           # 0.76-1.0x cross-lingual, ~1.0x same-language. No reliable win
+                           # on this task, so OFF by default; auto-rule still fires for
+                           # src==tgt or ASCII->English where it can only help.
+mt_lookup_tokens: 10       # max draft tokens per step
+mt_history_turns: 3        # past segments fed as translation context
+mt_history_chars: 600      # …capped at this many characters
 mt_temperature: 0.3
 supported_langs: [vi, en, zh]    # app focus languages
 default_targets: [en, zh]        # checked by default in UI
@@ -28,7 +36,7 @@ df_atten_lim_db: null      # e.g. 12 = cap suppression at 12 dB, keep some ambie
 
 # ---- Conference / diarization ----
 sample_rate: 16000
-segment_seconds: 5.0             # legacy fixed-window path (web API); desktop streams instead
+segment_seconds: 5.0             # fixed-window size for the /api/transcribe upload path
 frame_seconds: 0.5               # mic frame size fed to the streaming recognizer
 endpoint_silence: 1.0            # pause (s) that finalizes a segment — breaks at pauses, not mid-word
 endpoint_min_speech: 0.5         # ignore shorter blips

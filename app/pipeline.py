@@ -4,6 +4,7 @@ from __future__ import annotations
 import itertools
 import logging
 import time
+from collections import deque
 
 import numpy as np
 
@@ -37,6 +38,23 @@ class ConferencePipeline:
         self.enhancer = enhancer  # DeepFilterNetEnhancer | None
         self._ids = itertools.count(1)
         self.history: list[dict] = []
+        self.mt_history: deque[str] = deque(
+            maxlen=max(1, int(cfg.get("mt_history_turns", 3))))
+        self.mt_history_chars = int(cfg.get("mt_history_chars", 600))
+
+    def _mt_context(self) -> list[str]:
+        out: list[str] = []
+        total = 0
+        for text in reversed(self.mt_history):
+            text = (text or "").strip()
+            if not text:
+                continue
+            if total + len(text) > self.mt_history_chars and out:
+                break
+            out.append(text)
+            total += len(text)
+        out.reverse()
+        return out
 
     def _want_denoise(self, denoise: bool | None) -> bool:
         if denoise is not None:
@@ -69,12 +87,14 @@ class ConferencePipeline:
         detected = norm_lang_code(lang_name)
         targets = targets or list(self.cfg.get("default_targets", ["en", "zh"]))
         translations = {}
+        context = self._mt_context()
         for tgt in targets:
             if tgt == detected:
                 translations[tgt] = text
                 continue
             try:
-                translations[tgt] = self.mt.translate(text, tgt=tgt, src=detected)
+                translations[tgt] = self.mt.translate(text, tgt=tgt, src=detected,
+                                                      context=context)
             except Exception as e:
                 translations[tgt] = f"[MT error: {e}]"
         entry = {
@@ -89,6 +109,7 @@ class ConferencePipeline:
             "start": round(t, 2),
         }
         self.history.append(entry)
+        self.mt_history.append(text)
         if len(self.history) > 500:
             self.history = self.history[-500:]
         return entry

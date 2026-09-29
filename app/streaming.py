@@ -6,17 +6,21 @@ are finalized on *silence* (endpointing) — utterances break at pauses::
 
     mic/file frames -> recognizer stream -> partial text (live on screen)
                      -> silence >= endpoint_silence -> finalize:
-                        diarize segment -> translate -> utterance event
+                        diarize segment -> stream-translate finals
+                        (token events) -> utterance event
 
-Partial events also carry debounced re-translations, so the translation
-streams in a couple of seconds behind the transcript and is replaced by
-the final translation on endpoint.
+Translation is context-aware: the last few finalized segments travel in the
+prompt as terminology/style history. Finals are generated token-streamed
+("tok" events) with prompt-lookup speculative decoding (drafter-free:
+candidate n-grams come from the prompt/history itself). Partials keep the
+cheaper debounced full-string re-translation.
 """
 from __future__ import annotations
 
 import itertools
 import logging
 import time
+from collections import deque
 
 import numpy as np
 
@@ -46,6 +50,9 @@ class StreamingSession:
         self.targets: list[str] = list(cfg.get("default_targets", ["en", "zh"]))
         self.src_lang = None
         self.denoise: bool | None = None
+
+        self.history: deque[str] = deque(maxlen=max(1, int(cfg.get("mt_history_turns", 3))))
+        self.history_chars = int(cfg.get("mt_history_chars", 600))
 
         self._stream = None
         self._rec = None
@@ -82,6 +89,21 @@ class StreamingSession:
         if self.enhancer is not None:
             return bool(self.enhancer.enabled)
         return bool(self.cfg.get("noise_suppress", True))
+
+    def _context(self) -> list[str]:
+        """Recent finalized source texts, oldest-first, capped by chars."""
+        out: list[str] = []
+        total = 0
+        for text in reversed(self.history):
+            text = (text or "").strip()
+            if not text:
+                continue
+            if total + len(text) > self.history_chars and out:
+                break
+            out.append(text)
+            total += len(text)
+        out.reverse()
+        return out
 
     # -- streaming input ------------------------------------------------------
     def feed(self, pcm: np.ndarray, sr: int, t: float | None = None):
@@ -143,7 +165,8 @@ class StreamingSession:
                 and len(text) - len(self._last_tr_text) >= self.tr_min_delta
                 and (t - self._last_tr_t) >= self.tr_interval):
             try:
-                translations = self.mt.translate_multi(text, self.targets, src="auto")
+                translations = self.mt.translate_multi(
+                    text, self.targets, src="auto", context=self._context())
                 self._last_tr_text = text
                 self._last_tr_t = t
             except Exception as e:
@@ -187,10 +210,30 @@ class StreamingSession:
             self._fresh_stream()
             self._reset_segment()
             return
+        context = self._context()
+        translations: dict[str, str] = {}
         try:
-            translations = self.mt.translate_multi(text, self.targets, src="auto")
+            # Token-stream each target so the UI fills in live ("tok" events),
+            # then confirm with the assembled strings in the utterance event.
+            for tgt in self.targets:
+                parts: list[str] = []
+                seq = 0
+                try:
+                    for delta in self.mt.translate_stream(text, tgt=tgt, src="auto",
+                                                          context=context):
+                        if delta:
+                            parts.append(delta)
+                            self.results.put(("tok", {"id": self._seg_id, "tgt": tgt,
+                                                      "seq": seq, "delta": delta}))
+                            seq += 1
+                except Exception as e:
+                    log.warning("streamed translate (%s) failed: %s", tgt, e)
+                chunk = "".join(parts).strip()
+                translations[tgt] = chunk or self.mt.translate(
+                    text, tgt=tgt, src="auto", context=context)
         except Exception as e:
             translations = {tgt: f"[MT error: {e}]" for tgt in self.targets}
+        self.history.append(text)
         entry = {
             "id": self._seg_id, "type": "utterance", "speaker": self._seg_speaker,
             "rms_db": round(rms_dbfs(seg), 1) if seg.size else -80.0,

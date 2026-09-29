@@ -13,8 +13,8 @@ import soundfile as sf
 from app.audio_io import _to_16k
 from app.diarizer import VolumeDiarizer
 from app.enhancer import DeepFilterNetEnhancer
+from app.engines import build_app
 from app.streaming import StreamingSession
-from desktop.bootstrap import build_app
 
 
 def main():
