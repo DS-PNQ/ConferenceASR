@@ -115,7 +115,7 @@ async function createWindow(): Promise<void> {
     backgroundColor: "#F2F2F7",
     webPreferences: { preload: path.join(__dirname, "preload.js") },
   });
-  await win.loadFile(path.join(__dirname, "..", "index.html"));
+  await win.loadFile(path.join(__dirname, "..", "ui", "dist", "index.html"));
   win.on("closed", () => (win = null));
 }
 

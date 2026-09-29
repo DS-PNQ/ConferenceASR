@@ -19,6 +19,18 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: electron/ui/package-lock.json
+
+      - name: Build Electron React UI
+        run: |
+          npm ci --no-audit --no-fund --prefix electron/ui
+          npm run build --prefix electron/ui
+
       - name: Publish frontend
         run: >
           dotnet publish csharp/ConfLive/ConfLive.csproj -c Release
@@ -31,12 +43,14 @@ jobs:
         run: |
           New-Item -ItemType Directory installer/stage/backend -Force | Out-Null
           $exclude = @("csharp","installer","release",".venv","__pycache__",
-                       ".git",".cache","stage")
+                       ".git",".cache","stage","node_modules","dist")
           Get-ChildItem . -Force | Where-Object { $exclude -notcontains $_.Name } |
             ForEach-Object {
               if ($_.PSIsContainer) { Copy-Item $_.FullName "installer/stage/backend/$($_.Name)" -Recurse -Force }
               else { Copy-Item $_.FullName installer/stage/backend -Force }
             }
+          Get-ChildItem installer/stage/backend -Include node_modules,dist -Recurse -Directory |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: Build Setup.exe
         uses: Minionguyjpro/Inno-Setup-Action@v1.2.6

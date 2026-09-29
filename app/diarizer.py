@@ -1,14 +1,13 @@
 """Speaker diarization.
 
-Default: volume-based diarizer (lightweight, no extra weights).
-It segments speaker turns from per-chunk loudness (RMS dBFS), pause gaps,
-and stereo pan when available — matching this app's "based on volume" spec.
+Default: pyannote embedding diarizer (WeSpeaker on GPU) with graceful
+fallback chain pyannote -> NeMo Titanet -> volume levels. The active backend
+is always reported (status / entry diar_backend), never silently swapped.
 
-Optional: NVIDIA NeMo diarization
-(https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/asr/speaker_diarization/intro.html).
-Set config `diarizer: nemo` + `use_nemo: true` with nemo_toolkit[asr] installed
-to route through NeMo's MSDD/Sortformer pipeline. If NeMo is unavailable,
-we log once and fall back to volume mode automatically.
+Volume mode segments speaker turns from per-chunk loudness (RMS dBFS), pause
+gaps, and stereo pan when available. NeMo/pyannote attribute finalized
+segments with neural embeddings + online cosine clustering; live partials
+use the instant volume guess, the embedding verdict lands at finalize.
 """
 from __future__ import annotations
 
@@ -118,43 +117,378 @@ class VolumeDiarizer:
 
 
 class NeMoDiarizer:
-    """Thin wrapper around NeMo MSD diarization; falls back to volume mode."""
+    """Neural diarization with NeMo Titanet speaker embeddings.
+
+    Per finalized segment: embed with
+    ``nvidia/speakerverification_en_titanet_large`` (CUDA when available),
+    cosine-match against running speaker centroids, opening a new speaker
+    below ``nemo_cos_thresh`` (up to ``max_speakers``). Stable global IDs,
+    no cross-chunk permutation problem.
+
+    Live partials still use the volume diarizer (embedding every 0.5 s frame
+    would cost more than it tells); the embedding verdict lands at finalize
+    via :meth:`attribute_segment` and overrides the guess.
+    """
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        self._pipe = None
+        self.max_speakers = max(1, int(cfg.get("max_speakers", 3)))
+        self.cos_thresh = float(cfg.get("nemo_cos_thresh", 0.55))
+        self.model_name = (cfg.get("nemo_embedding_model")
+                           or "nvidia/speakerverification_en_titanet_large")
         self._volume = VolumeDiarizer(
-            max_speakers=int(cfg.get("max_speakers", 3)),
+            max_speakers=self.max_speakers,
             silence_turn_gap=float(cfg.get("silence_turn_gap", 0.6)),
         )
+        self._lock = None
+        self._model = None
+        self._ready = False
+        self._available = False
+        self.centroids: list = []  # L2-normalized torch tensors on CPU
+        self.counts: list[int] = []
 
-    def _ensure(self):
-        global _NEMO_WARNED
-        if self._pipe is not None:
-            return self._pipe
-        try:
-            # NeMo 2.x diarization entry points vary by version; try common ones.
-            from nemo.collections.asr.models import MSDDiarizationModel  # type: ignore
+    def reset(self):
+        self.centroids = []
+        self.counts = []
 
-            model_name = self.cfg.get("nemo_diarizer_model") or "diar_msdd_telephonic"
-            self._pipe = MSDDiarizationModel.from_pretrained(model_name)
-            log.info("NeMo diarizer ready: %s", model_name)
-        except Exception as e:
-            if not _NEMO_WARNED:
-                log.warning("NeMo unavailable (%s) — using volume diarizer.", e)
-                _NEMO_WARNED = True
-            self._pipe = False
-        return self._pipe if self._pipe else None
+    # -- lifecycle ---------------------------------------------------------
+    def ensure_loaded(self, demo_ok: bool = True):
+        if self._ready:
+            return
+        import threading
 
+        if self._lock is None:
+            self._lock = threading.Lock()
+        with self._lock:
+            if self._ready:
+                return
+            global _NEMO_WARNED
+            try:
+                from nemo.collections.asr.models import EncDecSpeakerLabelModel  # type: ignore
+
+                log.info("Loading NeMo embedding model %s", self.model_name)
+                self._model = EncDecSpeakerLabelModel.from_pretrained(self.model_name)
+                self._model.eval()
+                try:
+                    dev = next(self._model.parameters()).device
+                except Exception:
+                    dev = "?"
+                log.info("NeMo diarizer ready on %s", dev)
+                self._available = True
+            except Exception as e:
+                if not _NEMO_WARNED:
+                    log.warning("NeMo diarizer unavailable (%s) — volume fallback.", e)
+                    _NEMO_WARNED = True
+                self._available = False
+                if not demo_ok:
+                    raise
+            self._ready = True
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    # -- fast path: volume guess for live partials --------------------------
     def assign(self, pcm: np.ndarray, t=None) -> dict:
-        self._ensure()  # warm / warn once; per-chunk NeMo is out of scope for realtime
         out = self._volume.assign(pcm, t)
-        out["backend"] = "nemo" if self._pipe else "volume(fallback)"
+        out["backend"] = "nemo" if self._available else "volume(fallback)"
         return out
+
+    # -- authoritative path: embedding attribution for finalized segments ----
+    def embed(self, pcm: np.ndarray, sr: int = 16000):
+        """L2-normalized 192-d embedding (CPU tensor) or None."""
+        import torch
+
+        self.ensure_loaded()
+        if not self._available:
+            return None
+        x = np.asarray(pcm, dtype=np.float32).ravel()
+        if x.size < int(sr * 0.4):  # too short to embed reliably
+            return None
+        import os
+        import soundfile as sf
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            path = f.name
+        try:
+            sf.write(path, np.clip(x, -1.0, 1.0).astype(np.float32), int(sr))
+            with self._lock, torch.no_grad():
+                e = self._model.get_embedding(path)
+        except Exception as e:
+            log.warning("NeMo embed failed (%s)", e)
+            return None
+        finally:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+        import torch
+
+        e = torch.as_tensor(
+            e.detach().cpu() if torch.is_tensor(e) else e, dtype=torch.float32).ravel()
+        n = float(e.norm())
+        return e / max(n, 1e-9) if n > 1e-9 else None
+
+    def attribute_segment(self, pcm: np.ndarray, sr: int = 16000) -> dict:
+        """Authoritative speaker for a finalized segment.
+
+        Returns {"speaker", "speaker_id", "cos", "backend"}; falls back to
+        the volume guess when NeMo is unavailable or the segment is short.
+        """
+        import torch
+        import torch.nn.functional as F
+
+        e = self.embed(pcm, sr)
+        if e is None:
+            out = self._volume.assign(np.asarray(pcm, dtype=np.float32).ravel())
+            out["backend"] = "volume(fallback)"
+            return out
+        best, best_cos = -1, -2.0
+        for i, c in enumerate(self.centroids):
+            cos = float(F.cosine_similarity(e, c, dim=0))
+            if cos > best_cos:
+                best, best_cos = i, cos
+        if best < 0 or (best_cos < self.cos_thresh and len(self.centroids) < self.max_speakers):
+            self.centroids.append(e.clone())
+            self.counts.append(1)
+            best, best_cos = len(self.centroids) - 1, 1.0
+        else:
+            n = self.counts[best] + 1
+            updated = self.centroids[best] + (e - self.centroids[best]) / n
+            self.centroids[best] = updated / max(float(updated.norm()), 1e-9)
+            self.counts[best] = n
+        return {
+            "speaker": f"SPEAKER_{best + 1:02d}",
+            "speaker_id": best,
+            "cos": round(best_cos, 3),
+            "n_speakers": len(self.centroids),
+            "backend": "nemo-titanet",
+        }
+
+    def status(self) -> dict:
+        dev = "?"
+        if self._available and self._model is not None:
+            try:
+                dev = str(next(self._model.parameters()).device)
+            except Exception:
+                pass
+        return {
+            "backend": "nemo-titanet" if self._available else "volume(fallback)",
+            "model": self.model_name,
+            "device": dev,
+            "n_speakers": len(self.centroids),
+            "ready": self._ready,
+        }
+
+
+class PyannoteDiarizer:
+    """Neural diarization with a pyannote embedding model on GPU.
+
+    Per finalized segment: embed with ``pyannote/embedding`` (WeSpeaker,
+    CUDA) and cosine-match against running speaker centroids, opening a new
+    speaker below ``pyannote_cos_thresh`` (up to ``max_speakers``).
+
+    pyannote weights are license-gated: the account behind the HF token must
+    accept the conditions at https://hf.co/pyannote/embedding once. Token is
+    read from config ``hf_token`` → ``HF_TOKEN``/``HUGGING_FACE_HUB_TOKEN``
+    env → cached ``huggingface login``. Until then (or without the package)
+    this degrades gracefully: NeMo Titanet → volume levels, always reporting
+    which backend is actually active.
+
+    Live partials use the volume guess; the embedding verdict lands at
+    finalize via :meth:`attribute_segment` and overrides it.
+    """
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.max_speakers = max(1, int(cfg.get("max_speakers", 3)))
+        self.cos_thresh = float(cfg.get("pyannote_cos_thresh",
+                                        cfg.get("nemo_cos_thresh", 0.55)))
+        self.model_name: str = (cfg.get("pyannote_model") or "pyannote/embedding")
+        self._volume = VolumeDiarizer(
+            max_speakers=self.max_speakers,
+            silence_turn_gap=float(cfg.get("silence_turn_gap", 0.6)),
+        )
+        self._nemo = NeMoDiarizer(cfg)  # second rung of the fallback chain
+        self._lock = None
+        self._infer = None
+        self._ready = False
+        self._available = False
+        self.centroids: list = []
+        self.counts: list[int] = []
+
+    def reset(self):
+        self.centroids = []
+        self.counts = []
+        self._nemo.reset()
+
+    # -- lifecycle ---------------------------------------------------------
+    def _token(self):
+        import os
+
+        for src in (self.cfg.get("hf_token"), os.getenv("HF_TOKEN"),
+                    os.getenv("HUGGING_FACE_HUB_TOKEN")):
+            if src:
+                return src
+        return None  # huggingface_hub falls back to the cached login token
+
+    def ensure_loaded(self, demo_ok: bool = True):
+        if self._ready:
+            return
+        import threading
+
+        if self._lock is None:
+            self._lock = threading.Lock()
+        with self._lock:
+            if self._ready:
+                return
+            global _NEMO_WARNED
+            try:
+                import torch
+                from pyannote.audio import Inference  # type: ignore
+                from pyannote.audio.core.model import Model  # type: ignore
+
+                device = torch.device(
+                    "cuda" if torch.cuda.is_available() else "cpu")
+                log.info("Loading pyannote embedding %s on %s",
+                         self.model_name, device)
+                ckpt = Model.from_pretrained(self.model_name, token=self._token())
+                self._infer = Inference(ckpt, window="whole", device=device,
+                                        batch_size=1)
+                log.info("pyannote diarizer ready on %s", device)
+                self._available = True
+            except Exception as e:
+                if not _NEMO_WARNED:
+                    log.warning("pyannote unavailable (%s) — trying NeMo.", e)
+                    _NEMO_WARNED = True
+                self._available = False
+                if not demo_ok:
+                    raise
+            self._ready = True
+            if not self._available:
+                # warm the next rung now so finalize never blocks on it later
+                try:
+                    self._nemo.ensure_loaded(demo_ok=True)
+                except Exception:
+                    pass
+
+    @property
+    def _active_name(self) -> str:
+        if self._available:
+            return "pyannote"
+        if self._nemo.available:
+            return "nemo"
+        return "volume(fallback)"
+
+    # -- fast path: volume guess for live partials --------------------------
+    def assign(self, pcm: np.ndarray, t=None) -> dict:
+        out = self._volume.assign(pcm, t)
+        out["backend"] = self._active_name
+        return out
+
+    # -- authoritative path ---------------------------------------------------
+    def embed(self, pcm: np.ndarray, sr: int = 16000):
+        """L2-normalized embedding (CPU tensor) or None."""
+        import torch
+
+        self.ensure_loaded()
+        if not self._available or self._infer is None:
+            return None
+        x = np.asarray(pcm, dtype=np.float32).ravel()
+        if x.size < int(sr * 0.4):
+            return None
+        import os
+        import soundfile as sf
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            path = f.name
+        try:
+            sf.write(path, np.clip(x, -1.0, 1.0).astype(np.float32), int(sr))
+            with self._lock, torch.no_grad():
+                e = self._infer(path)
+        except Exception as e:
+            log.warning("pyannote embed failed (%s)", e)
+            return None
+        finally:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+        e = torch.as_tensor(
+            np.asarray(e, dtype=np.float32)).ravel()
+        n = float(e.norm())
+        return e / max(n, 1e-9) if n > 1e-9 else None
+
+    def attribute_segment(self, pcm: np.ndarray, sr: int = 16000) -> dict:
+        import torch
+        import torch.nn.functional as F
+
+        e = self.embed(pcm, sr)
+        if e is None:
+            # next rung: NeMo (itself falls back to volume internally)
+            nemo_attr = getattr(self._nemo, "attribute_segment", None)
+            if callable(nemo_attr):
+                try:
+                    return nemo_attr(pcm, sr)
+                except Exception:
+                    pass
+            out = self._volume.assign(np.asarray(pcm, dtype=np.float32).ravel())
+            out["backend"] = "volume(fallback)"
+            return out
+        best, best_cos = -1, -2.0
+        for i, c in enumerate(self.centroids):
+            cos = float(F.cosine_similarity(e, c, dim=0))
+            if cos > best_cos:
+                best, best_cos = i, cos
+        if best < 0 or (best_cos < self.cos_thresh and len(self.centroids) < self.max_speakers):
+            self.centroids.append(e.clone())
+            self.counts.append(1)
+            best, best_cos = len(self.centroids) - 1, 1.0
+        else:
+            n = self.counts[best] + 1
+            updated = self.centroids[best] + (e - self.centroids[best]) / n
+            self.centroids[best] = updated / max(float(updated.norm()), 1e-9)
+            self.counts[best] = n
+        return {
+            "speaker": f"SPEAKER_{best + 1:02d}",
+            "speaker_id": best,
+            "cos": round(best_cos, 3),
+            "n_speakers": len(self.centroids),
+            "backend": "pyannote",
+        }
+
+    def status(self) -> dict:
+        if self._available:
+            backend, model = "pyannote", self.model_name
+        else:
+            sub = self._nemo.status() if hasattr(self._nemo, "status") else {}
+            backend = sub.get("backend", "volume(fallback)")
+            model = sub.get("model", "")
+        return {
+            "backend": backend,
+            "model": model or self.model_name,
+            "device": "cuda" if _cuda() else "cpu",
+            "n_speakers": len(self.centroids),
+            "ready": self._ready,
+        }
+
+
+def _cuda() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
 
 
 def make_diarizer(cfg: dict):
-    if str(cfg.get("diarizer", "volume")).lower() == "nemo" or bool(cfg.get("use_nemo", False)):
+    mode = str(cfg.get("diarizer", "pyannote")).lower()
+    if mode == "pyannote":
+        return PyannoteDiarizer(cfg)
+    if mode == "nemo" or bool(cfg.get("use_nemo", False)):
         return NeMoDiarizer(cfg)
     return VolumeDiarizer(
         max_speakers=int(cfg.get("max_speakers", 3)),

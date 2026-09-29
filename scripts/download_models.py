@@ -31,4 +31,15 @@ try:
 except Exception as e:
     print("DeepFilterNet note (app will run in pass-through mode):", e)
 
+print("Prefetching NeMo Titanet embedding model…")
+try:
+    from nemo.collections.asr.models import EncDecSpeakerLabelModel
+
+    m = EncDecSpeakerLabelModel.from_pretrained(
+        "nvidia/speakerverification_en_titanet_large")
+    print("NeMo Titanet OK")
+    del m
+except Exception as e:
+    print("NeMo note (app will use volume diarizer):", e)
+
 print("Done.")

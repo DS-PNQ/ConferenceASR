@@ -50,6 +50,8 @@ class StreamingSession:
         self.targets: list[str] = list(cfg.get("default_targets", ["en", "zh"]))
         self.src_lang = None
         self.denoise: bool | None = None
+        self.terms: dict[str, str] = {}
+        self.display_lang: str | None = None  # streamed + translated first
 
         self.history: deque[str] = deque(maxlen=max(1, int(cfg.get("mt_history_turns", 3))))
         self.history_chars = int(cfg.get("mt_history_chars", 600))
@@ -60,16 +62,38 @@ class StreamingSession:
         self._n_final = 0
 
     # -- setup --------------------------------------------------------------
-    def configure(self, targets=None, src_lang=None, denoise=None):
+    def configure(self, targets=None, src_lang=None, denoise=None, terms=None,
+                  display_lang=None):
         if targets:
             self.targets = list(targets)
         self.src_lang = src_lang
         self.denoise = denoise
+        self.terms = dict(terms or {})
+        self.display_lang = (display_lang or None)
         self.asr.ensure_loaded()
         self._rec = self.asr._rec
         if self._rec is False or self._rec is None:
             raise RuntimeError("ASR unavailable for streaming")
         self._stream = self._rec.create_stream()
+
+    def live_update(self, targets=None, denoise=None, terms=None,
+                    display_lang=None):
+        """Hot-update mid-stream settings (no recognizer reset)."""
+        if targets:
+            self.targets = list(targets)
+        if denoise is not None:
+            self.denoise = bool(denoise)
+        if terms is not None:
+            self.terms = dict(terms)
+        if display_lang is not None:
+            self.display_lang = display_lang or None
+
+    def _ordered_targets(self) -> list[str]:
+        """Display language first so its tokens stream earliest."""
+        if self.display_lang and self.display_lang in self.targets:
+            return [self.display_lang] + [t for t in self.targets
+                                          if t != self.display_lang]
+        return list(self.targets)
 
     def _reset_segment(self):
         self._seg_audio: list[np.ndarray] = []
@@ -165,8 +189,14 @@ class StreamingSession:
                 and len(text) - len(self._last_tr_text) >= self.tr_min_delta
                 and (t - self._last_tr_t) >= self.tr_interval):
             try:
+                # Live re-translation covers the display language only: one
+                # MT call keeps the feed loop realtime; full targets land
+                # at finalize. Falls back to all targets when unset.
+                dl = self.display_lang
+                live_tgts = [dl] if dl and dl in self.targets else self.targets
                 translations = self.mt.translate_multi(
-                    text, self.targets, src="auto", context=self._context())
+                    text, live_tgts, src="auto", context=self._context(),
+                    terms=self.terms or None)
                 self._last_tr_text = text
                 self._last_tr_t = t
             except Exception as e:
@@ -185,6 +215,21 @@ class StreamingSession:
         if self._want_denoise() and self.enhancer is not None and seg.size:
             seg = self.enhancer.enhance_array(seg, 16000)
             denoised = self.enhancer.active
+        # Final text: GPU one-shot re-decode when available (also lets the
+        # denoised segment be heard fresh), else the live-stream result.
+        # Either way seg is what the diarizer/translator see below.
+        asr_backend = "stream"
+        text = ""
+        rd = getattr(self.asr, "redecode_cuda", None)
+        if callable(rd) and seg.size:
+            try:
+                cuda_text = rd(seg, 16000)
+            except Exception as e:
+                log.warning("CUDA redecode failed (%s).", e)
+                cuda_text = None
+            if cuda_text:
+                text, asr_backend = cuda_text, "ort-cuda"
+        if not text:
             if denoised:
                 # streaming ASR ran on raw audio — re-decode the enhanced
                 # segment one-shot so the final text matches what was heard
@@ -200,27 +245,40 @@ class StreamingSession:
                     log.warning("enhanced re-decode failed: %s", e)
                     text = self._last_partial
             else:
-                text = self._last_partial
-        else:
-            try:
-                text = self._rec.get_result(self._stream).strip()
-            except Exception:
-                text = self._last_partial
+                try:
+                    text = self._rec.get_result(self._stream).strip()
+                except Exception:
+                    text = self._last_partial
         if not text:
             self._fresh_stream()
             self._reset_segment()
             return
         context = self._context()
+        terms = self.terms or None
+        # Neural speaker verdict: NeMo embedding attribution overrides the
+        # volume guess used for live partials (no-op on volume diarizers).
+        speaker = self._seg_speaker
+        diar_backend = None
+        try:
+            attr = getattr(self.diarizer, "attribute_segment", None)
+            if callable(attr) and seg.size:
+                verdict = attr(seg, 16000)
+                if verdict and verdict.get("speaker"):
+                    speaker = verdict["speaker"]
+                    diar_backend = verdict.get("backend")
+        except Exception as e:
+            log.warning("segment attribution failed: %s", e)
         translations: dict[str, str] = {}
         try:
             # Token-stream each target so the UI fills in live ("tok" events),
             # then confirm with the assembled strings in the utterance event.
-            for tgt in self.targets:
+            # Display language streams first so visible progress starts ASAP.
+            for tgt in self._ordered_targets():
                 parts: list[str] = []
                 seq = 0
                 try:
                     for delta in self.mt.translate_stream(text, tgt=tgt, src="auto",
-                                                          context=context):
+                                                          context=context, terms=terms):
                         if delta:
                             parts.append(delta)
                             self.results.put(("tok", {"id": self._seg_id, "tgt": tgt,
@@ -230,16 +288,19 @@ class StreamingSession:
                     log.warning("streamed translate (%s) failed: %s", tgt, e)
                 chunk = "".join(parts).strip()
                 translations[tgt] = chunk or self.mt.translate(
-                    text, tgt=tgt, src="auto", context=context)
+                    text, tgt=tgt, src="auto", context=context, terms=terms)
         except Exception as e:
             translations = {tgt: f"[MT error: {e}]" for tgt in self.targets}
         self.history.append(text)
         entry = {
-            "id": self._seg_id, "type": "utterance", "speaker": self._seg_speaker,
+            "id": self._seg_id, "type": "utterance", "speaker": speaker,
             "rms_db": round(rms_dbfs(seg), 1) if seg.size else -80.0,
             "denoised": denoised, "src_lang": "auto", "text": text,
             "translations": translations, "start": round(self._seg_start or t, 2),
+            "asr_backend": asr_backend,
         }
+        if diar_backend:
+            entry["diar_backend"] = diar_backend
         self.results.put(("utterance", entry))
         self._n_final += 1
         self._fresh_stream()

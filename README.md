@@ -18,17 +18,24 @@ volume diarization, DeepFilterNet hook):
   decode, ~4 tok/s batch-1 greedy. If `nvidia-smi` shows ~0% between utterances,
   that is normal: single-stream decode of a 1.8B model is latency-bound with
   tiny kernels, and the GPU idles between segments.
-- ASR (sherpa-onnx wheels) is CPU-only by build; int8 decodes ~15x realtime,
-  so it never bottlenecks. MT stays on CUDA.
+- ASR runs split-brain by design: live partials from sherpa-onnx CPU int8
+  (~15x realtime — the wheels are CPU-only builds), finalized segments
+  re-decoded on GPU by `app/cuda_zipformer.py`, which drives the same ONNX
+  files through ORT CUDA directly (byte-identical protocol, verified
+  character-for-character vs sherpa CPU; ~9x realtime steady, fp32).
+  Entries carry `asr_backend: ort-cuda|stream`. Two load-bearing details:
+  `onnxruntime-gpu~=1.22` (1.30 wants CUDA 13; torch vendors CUDA 12) and
+  **import torch before onnxruntime** so its bundled CUDA DLLs preload —
+  without that ordering even a good install silently falls back to CPU.
 - `mt_use_cache: true` is set, though this custom modeling largely ignores it;
   per-token latency is a property of the checkpoint, not a device bug.
 
 | Module | Model (default) | Source |
 |---|---|---|
-| Denoise | `DeepFilterNet3` (auto-download) | https://github.com/Rikorose/DeepFilterNet |
-| ASR | Zipformer zh-en-vi ONNX, `phaseB_s2a` (local folder, sherpa-onnx CPU int8) | `D:\DENSEV2 - reading\zipformer zh-en-vi onnx phaseB s2a` |
-| Translation | `tencent/Hy-MT2-1.8B-FP8` (compressed-tensors, CUDA) | https://huggingface.co/collections/tencent/hy-mt2 |
-| Diarization | volume-based (default) · NeMo optional | https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/asr/speaker_diarization/intro.html |
+| Denoise | `DeepFilterNet3` (auto-download, Python 3.11 runtime) | https://github.com/Rikorose/DeepFilterNet |
+| ASR | Zipformer zh-en-vi ONNX, `phaseB_s2a` (CPU int8 partials + ORT-CUDA finals) | `D:\DENSEV2 - reading\zipformer zh-en-vi onnx phaseB s2a` |
+| Translation | `tencent/Hy-MT2-1.8B-FP8` (compressed-tensors, CUDA, token-streamed) | https://huggingface.co/collections/tencent/hy-mt2 |
+| Diarization | pyannote embeddings on GPU (NeMo → volume fallback chain) | https://github.com/pyannote/pyannote-audio |
 
 UI is a native desktop window (neutral tones + AI-purple `#7C3AED`):
 sidebar controls + chat-style transcript feed with live partials, token-streamed
@@ -69,10 +76,22 @@ pip install "nemo_toolkit[asr]"                                   # only if diar
 ```powershell
 cd electron
 npm install        # once: electron + typescript + electron-builder
-npm run build      # tsc -> dist/
+npm run build      # builds React UI (ui/) + tsc -> dist/
 npx electron .     # launches; finds run.py, picks CUDA/CPU, opens the window
 npm run dist       # Windows NSIS installer (needs electron-builder downloads)
 ```
+
+The window is the `redesign-conferenceasr-desktop-ui` React design, wired live:
+dark sidebar (Live session / Library / Glossary + Settings), recording stage
+with real mic level, transcript rows with timestamps + speaker avatars, live
+caption partials, translation toggle + search, session stats panel, localStorage
+session archive, and a working glossary (terms steer every translation).
+Every row shows **all** requested target translations (display language first,
+with lang chips); live partials stream theirs the same way. The display
+language streams first at finalize too (`display_lang` in `stream_start`,
+hot-updatable mid-session via `stream_config`), and live re-translation
+covers the display language only — one MT call keeps the feed loop realtime.
+Layout: fixed-height shell, sidebar scrolls independently of the transcript.
 
 ### C# app (WPF alternative, same protocol)
 
@@ -99,16 +118,20 @@ python scripts/download_models.py   # optional pre-download (first run auto-down
 python run.py                        # API on http://127.0.0.1:8000, docs at /docs
 ```
 
-In the window:
+In the window (React redesign: Live session / Library / Glossary / Translate + Settings):
 - Models load in the background (status line reports ASR / MT / denoise backends).
 - **● Record**: the streaming Zipformer recognizer stays open while you speak —
-  a live partial bubble grows in realtime; final translations **stream in token
-  by token** (`tok` events) behind it. Segments finalize on **pauses, not the
-  clock**, so sentences are never cut mid-word; the partial is then replaced by
-  the final translated bubble.
+  a live partial bubble grows in realtime; when a segment finalizes, its
+  translation **streams in token by token** (blinking caret) into the display
+  language, then the final bubble lands with **every requested target**.
+  Segments finalize on **pauses, not the clock**, so sentences are never cut
+  mid-word.
 - **⇪ Upload**: any recording streams through the same endpointing pipeline.
-- Sidebar: mic picker, source language (or auto-detect), EN / 中文 / VI targets,
-  DeepFilterNet switch, volume meter, **.txt / .srt export**, Clear.
+- **Translate view**: type any phrase, pick a target (vi/en/zh + more),
+  translate with glossary applied. Enter to submit.
+- Settings: mic picker, source language, **target chooser (vi/en/zh)** for what
+  gets translated, DeepFilterNet switch, diarizer switch (pyannote/nemo/volume),
+  model status + reload.
 
 No weights / no GPU? The backend boots in clearly-labelled **demo mode**
 (mock ASR/MT) so the UI, diarizer and exports all still work.
@@ -137,8 +160,10 @@ noise_suppress: true    # DeepFilterNet pre-ASR denoising (UI toggle overrides p
 df_model: null          # null = DeepFilterNet3; alt: DeepFilterNet2, DeepFilterNet
 df_post_filter: false
 df_atten_lim_db: null   # e.g. 12 caps suppression, keeps ambience
-diarizer: volume        # volume | nemo
-use_nemo: false
+diarizer: nemo                   # nemo (Titanet embeddings) | volume (levels)
+use_nemo: true
+nemo_embedding_model: nvidia/speakerverification_en_titanet_large
+nemo_cos_thresh: 0.55            # below this cosine -> new speaker (to max_speakers)
 frame_seconds: 0.5       # mic frame size for the streaming recognizer
 endpoint_silence: 1.0    # pause (s) that finalizes a segment
 endpoint_min_speech: 0.5
@@ -161,15 +186,23 @@ pass-through (check `/api/health → denoise.backend`). Toggle per session with
 the **🔇 Denoise** checkbox, `denoise=true|false` on `/api/transcribe`, or
 `{"denoise": false}` on `/ws/live`.
 
-## 5. Speaker diarization — “based on volume” + NeMo path
+## 5. Speaker diarization — volume default, NeMo on demand
 
 Default `VolumeDiarizer` (`app/diarizer.py`): per-chunk RMS dBFS + pause-gap turn
 detection + running loudness centroids per speaker (+ stereo pan when present).
 Transparent, dependency-free, good for conference mics / per-seat level differences.
 
-NeMo path: set `diarizer: nemo`, `use_nemo: true`, install `nemo_toolkit[asr]`;
-`NeMoDiarizer` wraps `MSDDiarizationModel` per the NeMo diarization docs and falls
-back to volume mode with a warning if NeMo is unavailable.
+NeMo path (`diarizer: nemo`, `use_nemo: true`, needs `nemo_toolkit[asr]`):
+each finalized segment is embedded with `nvidia/speakerverification_en_titanet_large`
+(CUDA, ~0.05 s) and cosine-matched against running speaker centroids — new
+speaker below `nemo_cos_thresh` (0.55), capped at `max_speakers`. Stable global
+IDs, no cross-chunk permutation problem. Verified: same voice → one ID (cos
+0.77 across segments), noise → its own ID, every entry stamped
+`diar_backend: nemo-titanet`. Live partials always use the volume guess; the
+neural verdict lands at finalize and overrides it. Without NeMo installed
+everything degrades to volume with a one-line warning. Switch at runtime
+without restart: `POST /api/settings {"diarizer": "pyannote"|"nemo"|"volume"}` (Settings
+view does this; in-flight sessions keep theirs).
 
 ## 6. MT upgrades: token streaming, dialogue context, speculative decoding
 
@@ -197,11 +230,15 @@ python scripts/streaming_smoke.py # REAL engines: live partials + endpointed fin
 
 ## 8. Backend API (serves Electron + C#)
 
-- `POST /api/transcribe` (multipart `file`, `targets=en,zh`, `src_lang=auto`, `denoise=auto|true|false`)
-- `POST /api/translate` (`{text, targets[], src}`) — text translation
-- `WS /ws/live` — `stream_start` / `stream_audio` / `stream_stop` → `partial`,
-  per-target `tok` token deltas during final translation, `utterance` finals
-- `GET /api/health` — device, ASR/MT/denoise status
+- `POST /api/transcribe` (multipart `file`, `targets=en,zh`, `src_lang=auto`, `denoise=auto|true|false`, `terms={json}`)
+- `POST /api/translate` (`{text, targets[], src, terms?}`) — text translation
+- `WS /ws/live` — `stream_start {targets, src_lang, denoise, terms?}` /
+  `stream_audio` / `stream_stop` → `partial`, per-target `tok` token deltas
+  during final translation, `utterance` finals
+- `POST /api/settings` (`{"diarizer": "pyannote"|"nemo"|"volume"}`) — runtime switch
+- `GET /api/health` — device, ASR/MT/denoise/diarizer status
+- Glossary `terms` (`{source: target}`) ride Hy-MT2's documented terminology
+  block; verified steering output (e.g. forced `光子引擎`).
 
 ## Layout
 
@@ -210,8 +247,9 @@ config.yaml  run.py  requirements.txt
 app/engines.py  app/device.py  app/zipformer_engine.py  app/mt_engine.py
 app/diarizer.py  app/enhancer.py  app/audio_io.py  app/pipeline.py
 app/streaming.py  app/main.py
-electron/package.json  electron/tsconfig.json  electron/index.html
-electron/styles.css  electron/src/main.ts  electron/src/preload.ts  electron/src/renderer.ts
+electron/package.json  electron/tsconfig.json
+electron/src/main.ts  electron/src/preload.ts
+electron/ui/ (React+Vite+Tailwind redesign, wired live: src/App.tsx, src/api.ts)
 csharp/ConfLive/*.csproj,*.xaml,*.cs  installer/ConfLive.iss + build.ps1
 scripts/download_models.py  scripts/smoke_test.py  scripts/streaming_smoke.py
 ```

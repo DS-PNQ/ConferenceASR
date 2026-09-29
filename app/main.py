@@ -47,6 +47,20 @@ mt = HyMT2Engine(CFG, DEVICE, MT_DTYPE)
 diarizer = make_diarizer(CFG)
 enhancer = DeepFilterNetEnhancer(CFG)
 pipe = ConferencePipeline(CFG, asr, mt, diarizer, enhancer)
+# Runtime-swappable diarizer (POST /api/settings). New streaming sessions and
+# the legacy pipeline resolve through here; in-flight sessions keep theirs.
+RUNTIME: dict = {"diarizer": diarizer}
+
+
+def _diarizer_status() -> dict:
+    d = RUNTIME.get("diarizer", diarizer)
+    status = getattr(d, "status", None)
+    if callable(status):
+        try:
+            return status()
+        except Exception:
+            pass
+    return {"backend": type(d).__name__, "ready": False}
 
 DEMO = os.getenv("DEMO_MODE", str(CFG.get("demo_mode", "auto"))).lower()
 if DEMO == "true":
@@ -82,9 +96,26 @@ def health():
         "asr": asr.status(),
         "mt": mt.status(),
         "langs": CFG.get("supported_langs", ["vi", "en", "zh"]),
-        "diarizer": type(diarizer).__name__,
+        "diarizer": type(RUNTIME.get("diarizer", diarizer)).__name__,
+        "diarizer_status": _diarizer_status(),
         "denoise": enhancer.status(),
     }
+
+
+def _parse_terms(v) -> dict[str, str]:
+    """Glossary pairs {source: target}. Accepts dict, JSON string, or null."""
+    if not v:
+        return {}
+    if isinstance(v, dict):
+        return {str(k): str(w) for k, w in v.items() if k and w}
+    if isinstance(v, str):
+        try:
+            parsed = json.loads(v)
+        except Exception:
+            return {}
+        if isinstance(parsed, dict):
+            return {str(k): str(w) for k, w in parsed.items() if k and w}
+    return {}
 
 
 def _parse_denoise(v) -> bool | None:
@@ -108,7 +139,44 @@ def warmup():
     asr.ensure_loaded(demo_ok=demo_ok)
     mt.ensure_loaded(demo_ok=demo_ok)
     enhancer.ensure_loaded(demo_ok=demo_ok)
-    return {"asr": asr.status(), "mt": mt.status(), "denoise": enhancer.status()}
+    d = RUNTIME.get("diarizer", diarizer)
+    ensure = getattr(d, "ensure_loaded", None)
+    if callable(ensure):
+        try:
+            ensure(demo_ok=demo_ok)
+        except Exception as e:
+            log.warning("diarizer warmup failed: %s", e)
+    return {"asr": asr.status(), "mt": mt.status(), "denoise": enhancer.status(),
+            "diarizer": _diarizer_status()}
+
+
+@app.post("/api/settings")
+def settings(payload: dict):
+    """Runtime settings. Currently: {"diarizer": "pyannote"|"nemo"|"volume"}.
+
+    Applies to new streaming sessions and the legacy pipeline immediately;
+    in-flight sessions keep theirs. Affects /api/health output.
+    """
+    out: dict = {"ok": True}
+    which = (payload or {}).get("diarizer")
+    if which is not None:
+        mode = str(which).strip().lower()
+        if mode not in ("pyannote", "volume", "nemo"):
+            return JSONResponse({"ok": False,
+                                 "error": "diarizer must be 'pyannote', 'nemo' or 'volume'"},
+                                status_code=400)
+        cfg = dict(CFG)
+        cfg["diarizer"] = mode
+        cfg["use_nemo"] = (mode == "nemo")
+        try:
+            new_d = make_diarizer(cfg)
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": f"diarizer init failed: {e}"},
+                                status_code=500)
+        RUNTIME["diarizer"] = new_d
+        pipe.diarizer = new_d
+        out["diarizer"] = _diarizer_status()
+    return out
 
 
 @app.post("/api/transcribe")
@@ -117,6 +185,7 @@ async def transcribe(
     targets: str = Form("en,zh"),
     src_lang: str = Form("auto"),
     denoise: str = Form("auto"),
+    terms: str = Form("{}"),
 ):
     raw = await file.read()
     try:
@@ -126,7 +195,8 @@ async def transcribe(
     tgt_list = [t.strip() for t in targets.split(",") if t.strip()]
     entries = pipe.process_file(pcm, sr, targets=tgt_list,
                                 src_lang=None if src_lang == "auto" else src_lang,
-                                denoise=_parse_denoise(denoise))
+                                denoise=_parse_denoise(denoise),
+                                terms=_parse_terms(terms))
     return {"ok": True, "utterances": entries, "asr": asr.status(),
             "denoise": enhancer.status()}
 
@@ -136,7 +206,8 @@ async def translate(payload: dict):
     text = payload.get("text", "")
     targets = payload.get("targets", ["en"])
     src = payload.get("src", "auto")
-    return {"ok": True, "translations": mt.translate_multi(text, targets, src=src)}
+    return {"ok": True, "translations": mt.translate_multi(
+        text, targets, src=src, terms=_parse_terms(payload.get("terms")))}
 
 
 @app.get("/api/export.txt")
@@ -161,7 +232,8 @@ async def _ws_stream_msg(ws: WebSocket, data: dict, holder: dict):
             except Exception:
                 pass
         q: _queue.Queue = _queue.Queue()
-        session = StreamingSession(CFG, asr, mt, diarizer, enhancer, q)
+        session = StreamingSession(CFG, asr, mt, RUNTIME.get("diarizer", diarizer),
+                                   enhancer, q)
         try:
             # configure() may download/load the ASR model: keep it off the
             # event loop so WS pings and other clients stay responsive.
@@ -170,17 +242,34 @@ async def _ws_stream_msg(ws: WebSocket, data: dict, holder: dict):
                 targets=data.get("targets") or list(CFG.get("default_targets", ["en", "zh"])),
                 src_lang=data.get("src_lang") or None,
                 denoise=_parse_denoise(data.get("denoise", "auto")),
+                terms=_parse_terms(data.get("terms")),
+                display_lang=data.get("display_lang") or None,
             )
         except Exception as e:
             await ws.send_json({"ok": False, "error": f"stream start failed: {e}"})
             return
         holder["session"] = session
         await ws.send_json({"ok": True, "type": "stream_started",
-                            "asr": asr.status(), "mt": mt.status()})
+                            "asr": asr.status(), "mt": mt.status(),
+                            "diarizer": _diarizer_status()})
         return
     session = holder.get("session")
     if session is None:
         await ws.send_json({"ok": False, "error": "no stream open (send stream_start first)"})
+        return
+    if kind == "stream_config":
+        # Hot-update mid-stream settings without resetting the recognizer.
+        try:
+            session.live_update(
+                targets=data.get("targets") or None,
+                denoise=_parse_denoise(data.get("denoise", "auto"))
+                if "denoise" in data else None,
+                terms=_parse_terms(data.get("terms")) if "terms" in data else None,
+                display_lang=data.get("display_lang", None) if "display_lang" in data else None,
+            )
+            await ws.send_json({"ok": True, "type": "stream_configured"})
+        except Exception as e:
+            await ws.send_json({"ok": False, "error": f"config failed: {e}"})
         return
     if kind == "stream_audio":
         try:
@@ -244,7 +333,8 @@ async def ws_live(ws: WebSocket):
             if data.get("type") == "ping":
                 await ws.send_json({"ok": True, "type": "pong", "asr": asr.status()})
                 continue
-            if data.get("type") in ("stream_start", "stream_audio", "stream_stop"):
+            if data.get("type") in ("stream_start", "stream_audio", "stream_stop",
+                                      "stream_config"):
                 await _ws_stream_msg(ws, data, holder)
                 continue
             try:

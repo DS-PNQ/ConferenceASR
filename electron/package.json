@@ -4,9 +4,10 @@
   "description": "ConfLive desktop client (Electron + TypeScript) for the Python conference ASR backend",
   "main": "dist/main.js",
   "scripts": {
-    "build": "tsc",
-    "start": "tsc && electron .",
-    "dist": "tsc && electron-builder --win nsis"
+    "build": "npm run build:ui && tsc",
+    "build:ui": "npm --prefix ui run build",
+    "start": "npm run build && electron .",
+    "dist": "npm run build && electron-builder --win nsis"
   },
   "devDependencies": {
     "electron": "^38.0.0",
@@ -22,8 +23,7 @@
     },
     "files": [
       "dist/**/*",
-      "index.html",
-      "styles.css",
+      "ui/dist/index.html",
       "package.json"
     ]
   }

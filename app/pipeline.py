@@ -65,7 +65,8 @@ class ConferencePipeline:
 
     def process_chunk(self, pcm: np.ndarray, sr: int, targets: list[str] | None = None,
                       src_lang: str | None = None, t: float | None = None,
-                      denoise: bool | None = None) -> dict | None:
+                      denoise: bool | None = None,
+                      terms: dict[str, str] | None = None) -> dict | None:
         pcm = np.asarray(pcm, dtype=np.float32).ravel()
         if pcm.size < sr * 0.3:  # ignore blips
             return None
@@ -86,6 +87,17 @@ class ConferencePipeline:
             return {"type": "empty", "speaker": dia["speaker"], "rms_db": dia["rms_db"]}
         detected = norm_lang_code(lang_name)
         targets = targets or list(self.cfg.get("default_targets", ["en", "zh"]))
+        # Neural speaker verdict overrides the volume guess (no-op otherwise).
+        speaker, diar_backend = dia["speaker"], dia.get("backend")
+        try:
+            attr = getattr(self.diarizer, "attribute_segment", None)
+            if callable(attr):
+                verdict = attr(pcm, sr)
+                if verdict and verdict.get("speaker"):
+                    speaker = verdict["speaker"]
+                    diar_backend = verdict.get("backend")
+        except Exception as e:
+            log.warning("segment attribution failed: %s", e)
         translations = {}
         context = self._mt_context()
         for tgt in targets:
@@ -94,13 +106,13 @@ class ConferencePipeline:
                 continue
             try:
                 translations[tgt] = self.mt.translate(text, tgt=tgt, src=detected,
-                                                      context=context)
+                                                      context=context, terms=terms)
             except Exception as e:
                 translations[tgt] = f"[MT error: {e}]"
         entry = {
             "id": next(self._ids),
             "type": "utterance",
-            "speaker": dia["speaker"],
+            "speaker": speaker,
             "rms_db": dia["rms_db"],
             "denoised": denoised,
             "src_lang": detected,
@@ -108,6 +120,8 @@ class ConferencePipeline:
             "translations": translations,
             "start": round(t, 2),
         }
+        if diar_backend:
+            entry["diar_backend"] = diar_backend
         self.history.append(entry)
         self.mt_history.append(text)
         if len(self.history) > 500:
@@ -115,7 +129,8 @@ class ConferencePipeline:
         return entry
 
     def process_file(self, pcm: np.ndarray, sr: int, targets: list[str] | None = None,
-                     src_lang: str | None = None, denoise: bool | None = None) -> list[dict]:
+                     src_lang: str | None = None, denoise: bool | None = None,
+                     terms: dict[str, str] | None = None) -> list[dict]:
         out = []
         # Whole-file denoise in one pass (cleaner than per-chunk: no boundaries),
         # then split the *enhanced* audio for diarization + ASR.
@@ -127,7 +142,7 @@ class ConferencePipeline:
         t0 = time.time() - len(pcm) / sr
         for ch in chunk_stream(pcm, sr, seg):
             r = self.process_chunk(ch, sr, targets=targets, src_lang=src_lang, t=t0,
-                                   denoise=False)  # already denoised above
+                                   denoise=False, terms=terms)  # already denoised above
             t0 += len(ch) / sr
             if r and r.get("type") == "utterance":
                 r["denoised"] = file_denoised

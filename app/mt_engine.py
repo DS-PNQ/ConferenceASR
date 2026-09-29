@@ -160,13 +160,20 @@ class HyMT2Engine:
                 else:
                     raise
 
-    def _prompt(self, text: str, tgt_full: str, context: list[str] | None = None) -> str:
+    def _prompt(self, text: str, tgt_full: str, context: list[str] | None = None,
+                terms: dict[str, str] | None = None) -> str:
         # History is context-ONLY: fenced first with an explicit do-not-translate
         # line, then the documented instruction + the single segment to translate.
         # (Appending history after the instruction made the model translate the
         # history too and ramble.)
         parts: list[str] = []
         hist = "\n".join(f"- {c}" for c in (context or []) if (c or "").strip())
+        term_lines = "\n".join(f"`{s}` translates to `{t}`"
+                               for s, t in (terms or {}).items() if s and t)
+        if term_lines:
+            parts.append(
+                "Reference the following translations:\n" + term_lines
+            )
         if hist:
             parts.append(
                 "Conversation context for terminology consistency only. "
@@ -178,12 +185,13 @@ class HyMT2Engine:
         )
         return "\n\n".join(parts)
 
-    def _prepare(self, text: str, tgt: str, context: list[str] | None = None):
+    def _prepare(self, text: str, tgt: str, context: list[str] | None = None,
+                 terms: dict[str, str] | None = None):
         """Tokenize prompt -> (input_ids, attn_mask). Caller must hold _lock."""
         import torch
 
         tgt_full = to_full(tgt)
-        messages = [{"role": "user", "content": self._prompt(text, tgt_full, context)}]
+        messages = [{"role": "user", "content": self._prompt(text, tgt_full, context, terms)}]
         enc = self._tok.apply_chat_template(
             messages, add_generation_prompt=True, return_tensors="pt"
         )
@@ -251,7 +259,8 @@ class HyMT2Engine:
                     input_ids, attention_mask=attn_mask, **gen_kwargs)
 
     def translate(self, text: str, tgt: str = "en", src: str = "auto",
-                  context: list[str] | None = None) -> str:
+                  context: list[str] | None = None,
+                  terms: dict[str, str] | None = None) -> str:
         text = (text or "").strip()
         if not text:
             return ""
@@ -259,20 +268,21 @@ class HyMT2Engine:
         with self._lock:
             if self._mock:
                 return self._model.translate(text, src=src, tgt=tgt)
-            return self._translate_locked(text, tgt, context,
+            return self._translate_locked(text, tgt, context, terms,
                                           self._should_speculate(src, tgt, text))
 
     def _translate_locked(self, text: str, tgt: str, context: list[str] | None,
-                          speculate: bool) -> str:
+                          terms: dict[str, str] | None, speculate: bool) -> str:
         """Plain one-shot generation. Caller MUST hold _lock."""
-        input_ids, attn_mask = self._prepare(text, tgt, context)
+        input_ids, attn_mask = self._prepare(text, tgt, context, terms)
         out = self._generate(input_ids, attn_mask,
                              self._gen_kwargs(speculate=speculate))
         gen = out[0][input_ids.shape[-1]:]
         return self._tok.decode(gen, skip_special_tokens=True).strip()
 
     def translate_stream(self, text: str, tgt: str = "en", src: str = "auto",
-                         context: list[str] | None = None):
+                         context: list[str] | None = None,
+                         terms: dict[str, str] | None = None):
         """Yield translation text deltas as tokens generate.
 
         Uses an id-collecting streamer (not TextIteratorStreamer: this custom
@@ -292,7 +302,7 @@ class HyMT2Engine:
         import threading
 
         with self._lock:
-            input_ids, attn_mask = self._prepare(text, tgt, context)
+            input_ids, attn_mask = self._prepare(text, tgt, context, terms)
             prompt_len = int(input_ids.shape[-1])
             collector = _IdCollector()
             speculate = self._should_speculate(src, tgt, text)
@@ -321,11 +331,13 @@ class HyMT2Engine:
             if not shown.strip():
                 # Modeling never streamed (or streamed nothing usable):
                 # one-shot fallback WITHOUT re-locking (lock already held).
-                yield self._translate_locked(text, tgt, context, speculate)
+                yield self._translate_locked(text, tgt, context, terms, speculate)
 
     def translate_multi(self, text: str, targets: list[str], src: str = "auto",
-                        context: list[str] | None = None) -> dict:
-        return {t: self.translate(text, tgt=t, src=src, context=context) for t in targets}
+                        context: list[str] | None = None,
+                        terms: dict[str, str] | None = None) -> dict:
+        return {t: self.translate(text, tgt=t, src=src, context=context, terms=terms)
+                for t in targets}
 
     def status(self) -> dict:
         return {

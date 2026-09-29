@@ -18,18 +18,28 @@ huggingface_hub>=0.23
 # ASR: local Zipformer zh-en-vi ONNX via sherpa-onnx (CPU int8, ~15x realtime)
 sherpa-onnx>=1.11
 
+# GPU finals: drive the same ONNX files with ORT CUDA directly
+# (app/cuda_zipformer.py, byte-identical protocol, ~9x realtime steady).
+# Pin 1.22.x: built for CUDA 12 like torch's vendored libs (1.30 wants CUDA 13).
+# The driver imports torch FIRST so its bundled CUDA DLLs preload; without
+# that ordering even a good install falls back to CPU. Missing = CPU finals.
+onnxruntime-gpu~=1.22
+
 # MT: Hy-MT2 FP8 needs compressed-tensors (CUDA). Falls back gracefully if missing.
 compressed-tensors>=0.18
 
 # Voice suppression before ASR (DeepFilterNet3 full-band denoiser).
 # Needs torchaudio alongside torch, e.g.:
 #   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu126
-# Graceful pass-through if missing, but install for the real thing:
-#   pip install deepfilternet   (then models auto-download on first warmup)
-# NOTE: deepfilterlib ships prebuilt wheels for Python 3.8-3.11. On 3.12+
-# `pip install deepfilternet` needs a Rust toolchain (or use Python 3.11).
-deepfilternet>=0.5
+# NOTE: deepfilterlib ships prebuilt wheels for Python 3.8-3.11 ONLY.
+# On 3.12 `pip install deepfilternet` needs a Rust toolchain, so it stays
+# commented here (it would break `pip install -r`). For real denoising, use
+# the Python 3.11 venv and: pip install deepfilternet torchaudio
+# (models auto-download on first warmup). Missing = pass-through mode.
+# deepfilternet>=0.5
 
-# Optional: NVIDIA NeMo speaker diarization (heavy). Only needed if diarizer: nemo
-# See https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/asr/speaker_diarization/intro.html
-# nemo_toolkit[asr]>=2.0
+# Speaker diarization: pyannote embeddings on GPU (default), NeMo Titanet and
+# volume levels as automatic fallbacks. pyannote weights are license-gated:
+# accept once at https://hf.co/pyannote/embedding (uses cached HF login).
+pyannote.audio>=4.0
+nemo_toolkit[asr]>=3.0
