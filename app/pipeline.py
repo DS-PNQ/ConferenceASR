@@ -10,6 +10,7 @@ import numpy as np
 
 from .audio_io import chunk_stream
 from .diarizer import rms_dbfs
+from .streaming import for_mt
 
 log = logging.getLogger("conf.pipe")
 
@@ -105,8 +106,9 @@ class ConferencePipeline:
                 translations[tgt] = text
                 continue
             try:
-                translations[tgt] = self.mt.translate(text, tgt=tgt, src=detected,
-                                                      context=context, terms=terms)
+                translations[tgt] = self.mt.translate(for_mt(text), tgt=tgt, src=detected,
+                                                      context=[for_mt(c) for c in context],
+                                                      terms=terms)
             except Exception as e:
                 translations[tgt] = f"[MT error: {e}]"
         entry = {

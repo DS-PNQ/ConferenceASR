@@ -47,7 +47,9 @@ class _IdCollector:
             import torch
 
             if torch.is_tensor(value):
-                value = value[0].tolist()
+                # the prompt arrives as [1, n]; each new token as [1] (transformers 5), where
+                # value[0].tolist() gave a bare int and every generated token was dropped
+                value = value[0].tolist() if value.dim() > 1 else value.reshape(-1).tolist()
             self._ids.extend(int(x) for x in value)
             self.saw_any = True
         except Exception:
@@ -307,24 +309,33 @@ class HyMT2Engine:
             collector = _IdCollector()
             speculate = self._should_speculate(src, tgt, text)
             gen_kwargs = self._gen_kwargs(streamer=collector, speculate=speculate)
-            thread = threading.Thread(
-                target=self._generate, args=(input_ids, attn_mask, gen_kwargs),
-                daemon=True)
+            n_threads = torch.get_num_threads()
+
+            def run():
+                # a new thread doesn't inherit the CPU thread count: without this, generate ran
+                # ~100x slower on CPU (2.7 s -> 262 s measured, 16-core hybrid laptop CPU)
+                torch.set_num_threads(n_threads)
+                self._generate(input_ids, attn_mask, gen_kwargs)
+
+            thread = threading.Thread(target=run, daemon=True)
             thread.start()
             try:
                 shown = ""
                 gen_all: list[int] = []  # decoded cumulatively: BPE merges
                 consumed = 0  # total ids seen (prompt_len skipped once overall)
                 while True:
+                    alive = thread.is_alive()  # read before take(): ids put before the end get drained
                     ids = collector.take(timeout=2.0) or []
                     if ids:
                         gen_all += ids[max(0, prompt_len - consumed):]
                         consumed += len(ids)
-                        new_text = self._tok.decode(gen_all, skip_special_tokens=True)
-                        if len(new_text) > len(shown):
+                        # hold back a trailing U+FFFD: a Vietnamese/Chinese character split over
+                        # tokens decodes as '�' until its last byte arrives ("TH� M��I")
+                        new_text = self._tok.decode(gen_all, skip_special_tokens=True).rstrip("�")
+                        if len(new_text) > len(shown) and new_text.startswith(shown):
                             yield new_text[len(shown):]
                             shown = new_text
-                    if not thread.is_alive():
+                    elif not alive:
                         break
             finally:
                 thread.join(timeout=10)

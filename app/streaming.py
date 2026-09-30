@@ -19,14 +19,43 @@ from __future__ import annotations
 
 import itertools
 import logging
+import re
 import time
 from collections import deque
 
 import numpy as np
 
 from .diarizer import rms_dbfs
+from .zipformer_engine import TAIL_SECONDS
 
 log = logging.getLogger("conf.stream")
+
+_UPPER_WORD = re.compile(r"(?<![A-Za-z'])[A-Z][A-Z']*(?![A-Za-z'])")  # ASCII-only edges:
+                                        # English is often glued to Chinese ("MORROW是")
+
+
+def for_mt(text: str) -> str:
+    """ASR text -> translator input. The zh-en-vi Zipformer writes English in UPPERCASE (its
+    training convention: Vietnamese lowercase, English uppercase, Chinese as characters);
+    translators read normal-case English much better, so UPPERCASE words are lowercased."""
+    return _UPPER_WORD.sub(lambda m: m.group(0).lower(), text or "")
+
+
+_CJK = re.compile(r"[㐀-鿿]")
+
+
+def guess_lang(text: str, share: float = 0.9) -> str:
+    """Language of an ASR segment from the model's writing convention: Chinese characters = zh,
+    UPPERCASE words = en, lowercase words = vi. Returns "zh" / "en" / "vi" when at least `share`
+    of the scoring units (Chinese characters, words) are that language, else "mix"."""
+    units = re.findall(r"[㐀-鿿]|[^\s㐀-鿿]+", text or "")
+    if not units:
+        return "mix"
+    n = {"zh": 0, "en": 0, "vi": 0}
+    for u in units:
+        n["zh" if _CJK.match(u) else "en" if _UPPER_WORD.fullmatch(u) else "vi"] += 1
+    lang, k = max(n.items(), key=lambda x: x[1])
+    return lang if k >= share * len(units) else "mix"
 
 
 class StreamingSession:
@@ -195,7 +224,7 @@ class StreamingSession:
                 dl = self.display_lang
                 live_tgts = [dl] if dl and dl in self.targets else self.targets
                 translations = self.mt.translate_multi(
-                    text, live_tgts, src="auto", context=self._context(),
+                    for_mt(text), live_tgts, src="auto", context=[for_mt(c) for c in self._context()],
                     terms=self.terms or None)
                 self._last_tr_text = text
                 self._last_tr_t = t
@@ -237,7 +266,7 @@ class StreamingSession:
                 try:
                     s2 = self._rec.create_stream()
                     s2.accept_waveform(16000, np.clip(seg, -1.0, 1.0))
-                    s2.accept_waveform(16000, np.zeros(int(16000 * 0.4), dtype=np.float32))
+                    s2.accept_waveform(16000, np.zeros(int(16000 * TAIL_SECONDS), dtype=np.float32))
                     s2.input_finished()
                     while self._rec.is_ready(s2):
                         self._rec.decode_stream(s2)
@@ -255,7 +284,9 @@ class StreamingSession:
             self._reset_segment()
             return
         t_asr = time.time()
-        context = self._context()
+        context = [for_mt(c) for c in self._context()]
+        mt_text = for_mt(text)
+        src_lang = guess_lang(text)
         terms = self.terms or None
         # Neural speaker verdict: NeMo embedding attribution overrides the
         # volume guess used for live partials (no-op on volume diarizers).
@@ -277,10 +308,15 @@ class StreamingSession:
             # then confirm with the assembled strings in the utterance event.
             # Display language streams first so visible progress starts ASAP.
             for tgt in self._ordered_targets():
+                if tgt == src_lang:  # already in that language: no translation needed
+                    translations[tgt] = mt_text
+                    self.results.put(("tok", {"id": self._seg_id, "tgt": tgt, "seq": 0,
+                                              "delta": mt_text}))
+                    continue
                 parts: list[str] = []
                 seq = 0
                 try:
-                    for delta in self.mt.translate_stream(text, tgt=tgt, src="auto",
+                    for delta in self.mt.translate_stream(mt_text, tgt=tgt, src="auto",
                                                           context=context, terms=terms):
                         if delta:
                             parts.append(delta)
@@ -291,7 +327,7 @@ class StreamingSession:
                     log.warning("streamed translate (%s) failed: %s", tgt, e)
                 chunk = "".join(parts).strip()
                 translations[tgt] = chunk or self.mt.translate(
-                    text, tgt=tgt, src="auto", context=context, terms=terms)
+                    mt_text, tgt=tgt, src="auto", context=context, terms=terms)
         except Exception as e:
             translations = {tgt: f"[MT error: {e}]" for tgt in self.targets}
         t_mt = time.time()
@@ -299,7 +335,7 @@ class StreamingSession:
         entry = {
             "id": self._seg_id, "type": "utterance", "speaker": speaker,
             "rms_db": round(rms_dbfs(seg), 1) if seg.size else -80.0,
-            "denoised": denoised, "src_lang": "auto", "text": text,
+            "denoised": denoised, "src_lang": src_lang if src_lang != "mix" else "auto", "text": text,
             "translations": translations, "start": round(self._seg_start or t, 2),
             "asr_backend": asr_backend,
             "timings": {

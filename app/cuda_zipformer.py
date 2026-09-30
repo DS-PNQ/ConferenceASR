@@ -45,23 +45,18 @@ def _torch_dll_dirs() -> list[str]:
 
 
 class CudaZipformer:
-    def __init__(self, model_dir: str, quant: str = "fp32"):
+    def __init__(self, model_dir: str, quant: str = "fp32", name: str | None = None):
         self.model_dir = str(model_dir)
         self.quant = quant  # fp32 only on CUDA (int8 lacks CUDA EP kernels)
+        self.name = name  # export name when the folder holds several models (asr_model_name)
         self._lock = threading.Lock()
         self._sessions = None
         self._tokens: list[str] | None = None
 
     def _paths(self) -> dict:
-        import pathlib
+        from .zipformer_engine import find_model_files
 
-        d = pathlib.Path(self.model_dir)
-        return {
-            "encoder": str(d / "encoder-phaseB_s2a.onnx"),
-            "decoder": str(d / "decoder-phaseB_s2a.onnx"),
-            "joiner": str(d / "joiner-phaseB_s2a.onnx"),
-            "tokens": str(d / "tokens.txt"),
-        }
+        return find_model_files(self.model_dir, "fp32", getattr(self, "name", None))
 
     def ensure_loaded(self):
         if self._sessions is not None:

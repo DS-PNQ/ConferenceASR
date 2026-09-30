@@ -28,7 +28,33 @@ import numpy as np
 log = logging.getLogger("conf.asr")
 
 DEFAULT_DIR = "D:/DENSEV2 - reading/zipformer zh-en-vi onnx phaseB s2a"
-TAIL_SECONDS = 0.4  # zero-pad flushes trailing words out of the streaming model
+TAIL_SECONDS = 0.66  # zero-pad flushes trailing words out of the streaming model (0.66 s is what
+                     # the model's own evaluation uses; 0.4 s can drop the last word)
+
+
+def find_model_files(model_dir, quant: str = "fp32", name: str | None = None) -> dict:
+    """encoder/decoder/joiner/tokens in `model_dir`, for any export name (encoder-<name>.onnx ...).
+
+    `name` (config asr_model_name) picks one when the folder holds several models; otherwise
+    there must be exactly one. int8 = int8 encoder + joiner with the fp32 decoder, the pairing
+    the model's evaluation uses.
+    """
+    model_dir = Path(model_dir)
+
+    def pick(part: str, int8: bool) -> Path:
+        pat = f"{part}-{name}*.onnx" if name else f"{part}-*.onnx"
+        hits = sorted(p for p in model_dir.glob(pat) if (".int8." in p.name) == int8)
+        if len(hits) != 1:
+            raise FileNotFoundError(f"expected one {'int8 ' if int8 else ''}{part} file in {model_dir} "
+                                    f"(set asr_model_name if it holds several): {[h.name for h in hits]}")
+        return hits[0]
+
+    q = quant == "int8"
+    files = {"encoder": pick("encoder", q), "decoder": pick("decoder", False),
+             "joiner": pick("joiner", q), "tokens": model_dir / "tokens.txt"}
+    if not files["tokens"].is_file():
+        raise FileNotFoundError(f"tokens.txt missing in {model_dir}")
+    return {k: str(v) for k, v in files.items()}
 
 
 class ZipformerEngine:
@@ -51,17 +77,7 @@ class ZipformerEngine:
         return self._rec is not None
 
     def _paths(self) -> dict:
-        q = "" if self.quant == "fp32" else ".int8"
-        files = {
-            "encoder": self.model_dir / f"encoder-phaseB_s2a{q}.onnx",
-            "decoder": self.model_dir / f"decoder-phaseB_s2a{q}.onnx",
-            "joiner": self.model_dir / f"joiner-phaseB_s2a{q}.onnx",
-            "tokens": self.model_dir / "tokens.txt",
-        }
-        missing = [str(p) for p in files.values() if not p.is_file()]
-        if missing:
-            raise FileNotFoundError(f"Zipformer model files missing: {missing}")
-        return {k: str(v) for k, v in files.items()}
+        return find_model_files(self.model_dir, self.quant, self.cfg.get("asr_model_name"))
 
     def ensure_loaded(self, demo_ok: bool = True):
         if self._rec is not None:
@@ -132,7 +148,7 @@ class ZipformerEngine:
                 from .cuda_zipformer import CudaZipformer
 
                 if not hasattr(self, "_cuda") or self._cuda is None:
-                    self._cuda = CudaZipformer(str(self.model_dir))
+                    self._cuda = CudaZipformer(str(self.model_dir), name=self.cfg.get("asr_model_name"))
                 with self._lock:
                     text = self._cuda.transcribe_array(x, sr)
                 return text.strip(), "ort-cuda"
@@ -159,7 +175,7 @@ class ZipformerEngine:
             return None
         try:
             if not hasattr(self, "_cuda") or self._cuda is None:
-                self._cuda = CudaZipformer(str(self.model_dir))
+                self._cuda = CudaZipformer(str(self.model_dir), name=self.cfg.get("asr_model_name"))
             with self._lock:
                 return self._cuda.transcribe_array(x, sr).strip() or None
         except CudaUnavailable as e:
