@@ -38,7 +38,8 @@ df_atten_lim_db: null      # e.g. 12 = cap suppression at 12 dB, keep some ambie
 
 # ---- Conference / diarization ----
 sample_rate: 16000
-segment_seconds: 5.0             # fixed-window size for the /api/transcribe upload path
+segment_seconds: 5.0             # fixed-window size for the fixed-window mode of /ws/live
+upload_min_pause: 0.4            # uploads (/api/transcribe) are cut at pauses this long (s), not fixed windows
 frame_seconds: 0.5               # mic frame size fed to the streaming recognizer
 endpoint_silence: 1.0            # pause (s) that finalizes a segment — breaks at pauses, not mid-word
 endpoint_min_speech: 0.5         # ignore shorter blips

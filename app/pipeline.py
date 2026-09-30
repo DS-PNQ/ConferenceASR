@@ -8,9 +8,9 @@ from collections import deque
 
 import numpy as np
 
-from .audio_io import chunk_stream
+from .audio_io import split_at_pauses
 from .diarizer import rms_dbfs
-from .streaming import for_mt
+from .streaming import for_mt, guess_lang
 
 log = logging.getLogger("conf.pipe")
 
@@ -87,6 +87,9 @@ class ConferencePipeline:
         if not (text or "").strip():
             return {"type": "empty", "speaker": dia["speaker"], "rms_db": dia["rms_db"]}
         detected = norm_lang_code(lang_name)
+        if detected in ("", "auto"):  # the zipformer has no language head: tell from the text
+            g = guess_lang(text)
+            detected = g if g != "mix" else "auto"
         targets = targets or list(self.cfg.get("default_targets", ["en", "zh"]))
         # Neural speaker verdict overrides the volume guess (no-op otherwise).
         speaker, diar_backend = dia["speaker"], dia.get("backend")
@@ -102,8 +105,8 @@ class ConferencePipeline:
         translations = {}
         context = self._mt_context()
         for tgt in targets:
-            if tgt == detected:
-                translations[tgt] = text
+            if tgt == detected:  # already in that language (lowercased, as the live path shows it)
+                translations[tgt] = for_mt(text)
                 continue
             try:
                 translations[tgt] = self.mt.translate(for_mt(text), tgt=tgt, src=detected,
@@ -140,9 +143,9 @@ class ConferencePipeline:
         if self.enhancer is not None and self._want_denoise(denoise):
             pcm = self.enhancer.enhance_array(np.asarray(pcm, dtype=np.float32).ravel(), sr)
             file_denoised = self.enhancer.active
-        seg = float(self.cfg.get("segment_seconds", 5.0))
         t0 = time.time() - len(pcm) / sr
-        for ch in chunk_stream(pcm, sr, seg):
+        for ch in split_at_pauses(pcm, sr, min_pause=float(self.cfg.get("upload_min_pause", 0.4)),
+                                  max_seconds=float(self.cfg.get("max_segment", 20.0))):
             r = self.process_chunk(ch, sr, targets=targets, src_lang=src_lang, t=t0,
                                    denoise=False, terms=terms)  # already denoised above
             t0 += len(ch) / sr

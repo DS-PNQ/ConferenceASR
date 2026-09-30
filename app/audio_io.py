@@ -67,3 +67,46 @@ def chunk_stream(a: np.ndarray, sr: int, seconds: float):
     n = int(sr * seconds)
     for i in range(0, len(a), n):
         yield a[i:i + n]
+
+
+def split_at_pauses(a: np.ndarray, sr: int, min_pause: float = 0.4, max_seconds: float = 20.0,
+                    silence_db: float = -45.0, frame: float = 0.02):
+    """Cut a whole file into utterances at pauses (fixed windows cut words in half).
+
+    A pause is >= min_pause s of frames below the silence level (silence_db, raised to
+    10 dB above the file's noise floor for noisy audio). Cuts go in the middle of each
+    pause; a stretch longer than max_seconds is cut at its quietest frame.
+    """
+    a = np.asarray(a, dtype=np.float32).ravel()
+    hop = max(1, int(sr * frame))
+    n = len(a) // hop
+    if n < 2:
+        if len(a):
+            yield a
+        return
+    db = 10 * np.log10(np.mean(a[:n * hop].reshape(n, hop) ** 2, axis=1) + 1e-12)
+    thr = max(silence_db, float(np.percentile(db, 5)) + 10)
+    quiet = db < thr
+    cuts, i, need = [], 0, max(1, int(min_pause / frame))
+    while i < n:
+        if quiet[i]:
+            j = i
+            while j < n and quiet[j]:
+                j += 1
+            if j - i >= need and i > 0 and j < n:
+                cuts.append((i + j) // 2)
+            i = j
+        else:
+            i += 1
+    bounds, start, max_f = [], 0, int(max_seconds / frame)
+    for c in cuts + [n]:
+        while c - start > max_f:  # run-on speech: cut at the quietest frame in its second half
+            lo = start + max_f // 2
+            k = lo + int(np.argmin(db[lo:start + max_f]))
+            bounds.append((start, k))
+            start = k
+        bounds.append((start, c))
+        start = c
+    for s, e in bounds:
+        if (~quiet[s:e]).any():
+            yield a[s * hop: len(a) if e == n else e * hop]
