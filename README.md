@@ -11,7 +11,20 @@ volume diarization, DeepFilterNet hook):
   partials and token-streamed finals. `npm run dist` builds a Windows installer.
 - **C# desktop app** (`csharp/ConfLive`): native WPF window, same protocol.
 
-## GPU usage notes (measured RTX 4060 Laptop, Hy-MT2-1.8B-FP8)
+## GPU usage notes (measured RTX 4060 Laptop)
+
+- The local `HY-MT` INT8 ONNX prose is driven directly (`app/onnx_mt.py`):
+  prefill + greedy loop with past cache, repetition penalty like the HF path,
+  TRUE per-token streaming (no collector thread needed). Verified quality
+  matches the FP8 reference (same 大家早上好… output).
+- **CUDA does NOT run it**: the int8 graph builds CUDA sessions that pass tiny
+  probes, then crash mid-inference (garbage Expand dims); CPU EP verified
+  clean (all prefill lengths + full decode loops). Engine probes providers and
+  picks CPU automatically (`mt_onnx_provider: cuda` retries after toolchain
+  upgrades; needs ORT~1.22 + CUDA 12 — 1.30 wants CUDA 13).
+- A/B, same audio/targets: **local ONNX CPU 135 s vs HF FP8 CUDA 54 s**
+  (~1 s/token vs ~0.3 s/token). Local = no HF dependency; FP8 = 2.5x faster.
+  Switch back anytime: `MT_MODEL=tencent/Hy-MT2-1.8B-FP8` (weights still cached).
 
 - Weights load to `cuda:0` (fp16 after compressed-tensors decompress) and generate
   runs there too — verified: params on `cuda:0`, SM utilization 21–43% during
@@ -33,9 +46,9 @@ volume diarization, DeepFilterNet hook):
 | Module | Model (default) | Source |
 |---|---|---|
 | Denoise | `DeepFilterNet3` (auto-download, Python 3.11 runtime) | https://github.com/Rikorose/DeepFilterNet |
-| ASR | Zipformer zh-en-vi ONNX, `phaseB_s2a` (CPU int8 partials + ORT-CUDA finals) | `D:\DENSEV2 - reading\zipformer zh-en-vi onnx phaseB s2a` |
-| Translation | `tencent/Hy-MT2-1.8B-FP8` (compressed-tensors, CUDA, token-streamed) | https://huggingface.co/collections/tencent/hy-mt2 |
-| Diarization | pyannote embeddings on GPU (NeMo → volume fallback chain) | https://github.com/pyannote/pyannote-audio |
+| ASR | Zipformer zh-en-vi ONNX, `phaseB_s2a` (CPU int8 partials + ORT CPU finals) | `D:\DENSEV2 - reading\zipformer zh-en-vi onnx phaseB s2a` |
+| Translation | `tencent/Hy-MT2-1.8B-FP8` (compressed-tensors, CUDA) | https://huggingface.co/collections/tencent/hy-mt2 |
+| Diarization | NeMo Titanet direct-forward on CUDA (pyannote → volume fallback chain) | https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/asr/speaker_diarization/intro.html |
 
 UI is a native desktop window (neutral tones + AI-purple `#7C3AED`):
 sidebar controls + chat-style transcript feed with live partials, token-streamed
@@ -121,17 +134,25 @@ python run.py                        # API on http://127.0.0.1:8000, docs at /do
 In the window (React redesign: Live session / Library / Glossary / Translate + Settings):
 - Models load in the background (status line reports ASR / MT / denoise backends).
 - **● Record**: the streaming Zipformer recognizer stays open while you speak —
-  a live partial bubble grows in realtime; when a segment finalizes, its
-  translation **streams in token by token** (blinking caret) into the display
-  language, then the final bubble lands with **every requested target**.
-  Segments finalize on **pauses, not the clock**, so sentences are never cut
-  mid-word.
+  a live partial bubble grows in realtime, and the ASR text lands the instant
+  a segment endpoints — **MT never blocks it**. Same-language rows fill
+  instantly (LID copies); other translations **stream in token by token**
+  (blinking caret + `translating…`) into the same bubble, confirmed by a
+  second event with full timings. Segments finalize on **pauses, not the
+  clock**, so sentences are never cut mid-word.
 - **⇪ Upload**: any recording streams through the same endpointing pipeline.
-- **Translate view**: type any phrase, pick a target (vi/en/zh + more),
-  translate with glossary applied. Enter to submit.
-- Settings: mic picker, source language, **target chooser (vi/en/zh)** for what
-  gets translated, DeepFilterNet switch, diarizer switch (pyannote/nemo/volume),
-  model status + reload.
+- **Translate view**: Google-style dual cards with source/target language tabs,
+  swap button, Enter-to-translate and copy — same Hy-MT2 engine, glossary
+  applied. Glossary terms are injected original + UPPER + lower with a MUST
+  instruction, because our ASR emits UPPERCASE English while users type
+  lowercase (verified: `standup → 站会` lands on `STANDUP` input).
+- Settings: mic picker (hot-swappable mid-session), source language, **target
+  chooser (vi/en/zh)** for what gets translated, DeepFilterNet switch, diarizer
+  switch (pyannote/nemo/volume), dev latency readout (on by default), model
+  status + reload.
+- Mic hardening: autoplay-policy resume, track-ended auto-stop, resume-pop
+  guard, stall watchdog (one auto-recapture), WS auto-reconnect with fresh
+  server session, and a "Catching up…" indicator when the server lags.
 
 No weights / no GPU? The backend boots in clearly-labelled **demo mode**
 (mock ASR/MT) so the UI, diarizer and exports all still work.
@@ -186,31 +207,42 @@ pass-through (check `/api/health → denoise.backend`). Toggle per session with
 the **🔇 Denoise** checkbox, `denoise=true|false` on `/api/transcribe`, or
 `{"denoise": false}` on `/ws/live`.
 
-## 5. Speaker diarization — volume default, NeMo on demand
+## 5. Speaker diarization — NeMo Titanet direct-forward (default)
 
-Default `VolumeDiarizer` (`app/diarizer.py`): per-chunk RMS dBFS + pause-gap turn
-detection + running loudness centroids per speaker (+ stereo pan when present).
-Transparent, dependency-free, good for conference mics / per-seat level differences.
+`NeMoDiarizer` (`app/diarizer.py`, `diarizer: nemo`): each finalized segment is
+embedded with `nvidia/speakerverification_en_titanet_large` on CUDA and
+cosine-matched against running speaker centroids — new speaker below
+`nemo_cos_thresh` (0.55), capped at `max_speakers`. Stable global IDs, no
+cross-chunk permutation problem. Verified: same voice → one ID (cos 0.77
+across segments), noise → its own ID, every entry stamped
+`diar_backend: nemo-titanet`. Live partials use the instant volume guess; the
+neural verdict lands at finalize and overrides it.
 
-NeMo path (`diarizer: nemo`, `use_nemo: true`, needs `nemo_toolkit[asr]`):
-each finalized segment is embedded with `nvidia/speakerverification_en_titanet_large`
-(CUDA, ~0.05 s) and cosine-matched against running speaker centroids — new
-speaker below `nemo_cos_thresh` (0.55), capped at `max_speakers`. Stable global
-IDs, no cross-chunk permutation problem. Verified: same voice → one ID (cos
-0.77 across segments), noise → its own ID, every entry stamped
-`diar_backend: nemo-titanet`. Live partials always use the volume guess; the
-neural verdict lands at finalize and overrides it. Without NeMo installed
-everything degrades to volume with a one-line warning. Switch at runtime
-without restart: `POST /api/settings {"diarizer": "pyannote"|"nemo"|"volume"}` (Settings
-view does this; in-flight sessions keep theirs).
+Why this is the lightest NeMo setup that works: no smaller checkpoint exists
+(nvidia ships only titanet_large); fp16 autocast measured *slower* (1.16 s vs
+0.27 s first call); ONNX export is blocked (tracer chokes on the STFT); so the
+win is calling `forward()` directly on tensors — no temp wav files per segment
+(steady 41 ms vs 50 ms with file I/O). Chain on failure: pyannote (gated) →
+volume, always reported, never silent. Switch at runtime without restart:
+`POST /api/settings {"diarizer": "pyannote"|"nemo"|"volume"}` (Settings view
+does this; in-flight sessions keep theirs).
 
 ## 6. MT upgrades: token streaming, dialogue context, speculative decoding
 
-- **Token streaming** (`translate_stream`): finals generate into `tok` events
-  (`{id, tgt, seq, delta}`) over `/ws/live`, rendered live with a blinking caret
-  in Electron. Implemented with an id-collecting streamer because this custom
-  modeling echoes prompt tokens through `TextIteratorStreamer`; verified
-  `joined == one-shot` output exactly.
+- **Token streaming that actually streams**: finals generate with per-target
+  `tok` events into the UI live. (Was silently dead for weeks: the id-collector
+  indexed `value[0]`, which drops everything on 1-D streamer puts, and the bare
+  except hid it — every call took the one-shot fallback. Fixed + verified:
+  13 deltas in 2.2 s.)
+- **Batched multi-target generate**: implemented (`translate_targets_stream`,
+  demuxing streamer, `mt_batch` flag) — then MEASURED 0.09x on this modeling
+  (no early stop, runs all 256 steps), so it stays OFF with sequential
+  display-first as default. Kept for future modeling fixes.
+- **Quantized KV cache** (`mt_kvquant`, optimum-quanto): works, 9.2 → 8.9 tok/s
+  (neutral — per-step fixed costs dominate, not KV bandwidth). Kept ON: ~4x
+  smaller cache means much longer conversations fit in 8 GB VRAM.
+- **Longer conversations**: history 3 turns/600 chars → 5 turns/1000 chars
+  (prefill is ~104 ms/100 tokens, so this is nearly free).
 - **Dialogue context** (`mt_history_turns/chars`): recent finalized segments travel
   in the prompt as terminology/style reference, fenced with DO-NOT-translate.
   (Appending history after the instruction made the model translate the history
@@ -220,6 +252,13 @@ view does this; in-flight sessions keep theirs).
   same-language: no reliable win**, so OFF by default. It auto-fires for
   `src==tgt` or ASCII→English where drafts can only help. A dedicated drafter
   model would be needed for real speculative gains; none exists in Hy-MT2.
+- **LID skip** (`app/langid.py`, lingua EN/VI/ZH, 8/8 test, ms-level): targets
+  matching the detected source are copies, not generates — Vietnamese speech
+  with vi/en/zh targets went 3 MT calls → 2. Entry `src_lang` shows the real
+  code instead of `auto`.
+- **Background partial translation**: debounced re-translation runs on a
+  single-flight thread emitting follow-up partial events; the feed loop never
+  blocks (worst `feed()` 0.6 s on 0.5 s frames), so endpointing stays realtime.
 
 ## 7. Verify (engines need cached weights; fakes don't)
 

@@ -10,25 +10,49 @@ asr_model: D:/DENSEV2 - reading/zipformer zh-en-vi onnx phaseB s2a   # or set AS
 asr_provider: cpu      # sherpa-onnx wheels are CPU-only; cuda if you build with GPU
 asr_quant: auto        # auto | int8 | fp32  (auto = int8 on cpu, fp32 on cuda)
 asr_threads: 4
-asr_cuda_final: true       # re-decode finalized segments on GPU (ORT CUDA);
-                           # falls back to the live-stream result when unavailable
+asr_cuda_final: true       # kept for compat; finals now use asr_ort_provider
+asr_ort_provider: cpu      # cpu (verified: 15 s audio in ~1 s) | cuda (this
+                           # int8 export crashes mid-inference on CUDA EP)
 
 # ---- Translation (Tencent Hy-MT2: https://huggingface.co/collections/tencent/hy-mt2) ----
-mt_model: tencent/Hy-MT2-1.8B-FP8  # compressed-tensors FP8 on CUDA; CPU/mock fallback
-mt_max_new_tokens: 256     # short utterances only; lower = faster
+mt_model: tencent/Hy-MT2-1.8B-FP8  # compressed-tensors FP8 on CUDA. NOTE: the local
+                           # D:/DENSEV2 - reading/HY-MT INT8 ONNX export is prompt-length
+                           # broken (fails past a few dozen tokens) and falls to CPU EP
+                           # under VRAM contention — re-export with dynamic axes before use.
+                           # any HF id here selects the transformers engine instead
+mt_tokenizer: tencent/Hy-MT2-1.8B-FP8  # template+vocab source (local dir has none)
+mt_onnx_provider: cpu          # MEASURED: this int8 export crashes mid-inference
+                               # on CUDA EP (garbage Expand dims); CPU verified clean.
+                               # Set cuda to retry after an ORT/CUDA toolchain upgrade.
+mt_max_new_tokens: 128     # short utterances only; lower = faster (20 s speech ≈ 90 tgt toks)
 mt_do_sample: false        # false = greedy decode (fastest, deterministic)
 mt_use_cache: true         # KV-cache (repo default false = slow recompute)
+mt_kvquant: true           # KIVI/quanto quantized KV cache. MEASURED RTX 4060:
+                           # 9.2 -> 8.9 tok/s (neutral for speed — per-step fixed
+                           # costs dominate, not KV bandwidth). Kept ON because it
+                           # shrinks cache ~4x, so much longer conversations fit
+                           # in 8 GB VRAM. Needs optimum-quanto installed.
+mt_batch: false            # batched multi-target generate. MEASURED 0.09x on this
+                           # modeling (no early stop: runs all 256 steps). OFF.
 mt_speculative: false      # prompt-lookup speculative decoding (drafter-free, exact:
                            # output identical). MEASURED on RTX 4060, n=3-4 interleaved:
                            # 0.76-1.0x cross-lingual, ~1.0x same-language. No reliable win
                            # on this task, so OFF by default; auto-rule still fires for
                            # src==tgt or ASCII->English where it can only help.
 mt_lookup_tokens: 10       # max draft tokens per step
-mt_history_turns: 3        # past segments fed as translation context
-mt_history_chars: 600      # …capped at this many characters
+mt_history_turns: 2        # past segments fed as translation context (2 keeps
+mt_history_chars: 400      # …prefill short; history is context-only anyway)
 mt_temperature: 0.3
 supported_langs: [vi, en, zh]    # app focus languages
 default_targets: [en, zh]        # checked by default in UI
+
+# ---- Document OCR (PaddleOCR-VL: https://huggingface.co/PaddlePaddle/PaddleOCR-VL) ----
+ocr_model: PaddlePaddle/PaddleOCR-VL  # 0.9B ultra-compact = lightest available
+ocr_device: auto             # auto | cuda | cpu (CUDA bf16 ≈ 2 GB VRAM)
+ocr_task: ocr                # ocr | table | formula | chart (UI overrides per job)
+ocr_max_new_tokens: 1024     # page-level text budget per image
+ocr_dpi: 200                 # PDF rasterization resolution
+ocr_translate_chunk_chars: 800  # Hy-MT doc translation chunk width
 
 # ---- Voice suppression (DeepFilterNet: https://github.com/Rikorose/DeepFilterNet) ----
 noise_suppress: true       # master toggle; also flippable per-request from the UI
@@ -43,13 +67,13 @@ frame_seconds: 0.5               # mic frame size fed to the streaming recognize
 endpoint_silence: 1.0            # pause (s) that finalizes a segment — breaks at pauses, not mid-word
 endpoint_min_speech: 0.5         # ignore shorter blips
 max_segment: 20.0                # force-finalize run-on speech without pauses
-partial_translate_interval: 2.5  # min seconds between live re-translations
-partial_min_delta: 6             # …and min new characters since last one
-partial_min_chars: 10            # don't translate tiny fragments
+partial_translate_interval: 4.0  # min seconds between live re-translations (partials
+partial_min_delta: 12           # …share the MT lock with finals — rarer partials
+partial_min_chars: 14           # …let finals start sooner; finals carry full set)
 silence_turn_gap: 0.6            # pause (s) that marks a possible speaker turn
 max_speakers: 3
-diarizer: pyannote              # pyannote (GPU) | nemo | volume
-use_nemo: false
+diarizer: nemo                   # nemo Titanet (direct-forward, CUDA) | pyannote | volume
+use_nemo: true
 pyannote_model: pyannote/embedding   # gated: accept once at hf.co/pyannote/embedding
 pyannote_cos_thresh: 0.55            # below this cosine -> new speaker (to max_speakers)
 hf_token: null                       # or HF_TOKEN env / cached `huggingface login`

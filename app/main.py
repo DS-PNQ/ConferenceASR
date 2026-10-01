@@ -21,7 +21,8 @@ from .audio_io import chunk_stream, decode_b64_pcm16, decode_bytes
 from .device import device_report, resolve_device, resolve_dtype
 from .diarizer import make_diarizer
 from .enhancer import DeepFilterNetEnhancer
-from .mt_engine import HyMT2Engine
+from .engines import make_mt_engine
+from .ocr_engine import BlockOCR, PaddleOCRVLEngine
 from .pipeline import ConferencePipeline
 from .streaming import StreamingSession
 from .zipformer_engine import ZipformerEngine
@@ -43,9 +44,11 @@ DEVICE = resolve_device(os.getenv("DEVICE", CFG.get("device", "auto")))
 MT_DTYPE = resolve_dtype(DEVICE, os.getenv("MT_DTYPE", CFG.get("mt_dtype", "auto")))
 
 asr = ZipformerEngine(CFG)
-mt = HyMT2Engine(CFG, DEVICE, MT_DTYPE)
+mt = make_mt_engine(CFG, DEVICE, MT_DTYPE)
 diarizer = make_diarizer(CFG)
 enhancer = DeepFilterNetEnhancer(CFG)
+ocr = PaddleOCRVLEngine(CFG)  # lazy: loads on first /api/ocr, never in warmup
+blockocr = BlockOCR(CFG)  # PP-OCR boxes+scores (CPU); lazy like ocr
 pipe = ConferencePipeline(CFG, asr, mt, diarizer, enhancer)
 # Runtime-swappable diarizer (POST /api/settings). New streaming sessions and
 # the legacy pipeline resolve through here; in-flight sessions keep theirs.
@@ -99,6 +102,7 @@ def health():
         "diarizer": type(RUNTIME.get("diarizer", diarizer)).__name__,
         "diarizer_status": _diarizer_status(),
         "denoise": enhancer.status(),
+        "ocr": ocr.status(),
     }
 
 
@@ -208,6 +212,207 @@ async def translate(payload: dict):
     src = payload.get("src", "auto")
     return {"ok": True, "translations": mt.translate_multi(
         text, targets, src=src, terms=_parse_terms(payload.get("terms")))}
+
+
+def _enter_ocr_mode() -> dict:
+    """OCR owns the GPU: speaker diarization off + deloaded from VRAM.
+
+    The diarizer reloads lazily on the next stream (embed -> ensure_loaded),
+    so live sessions keep working after OCR without a restart.
+    """
+    d = RUNTIME.get("diarizer", diarizer)
+    unload = getattr(d, "unload", None)
+    if callable(unload):
+        try:
+            return unload()
+        except Exception as e:
+            log.warning("diarizer unload failed: %s", e)
+    return {"unloaded": False}
+
+
+def _ocr_pages(raw: bytes, filename: str, dpi: int) -> list:
+    """Decode an upload to PIL pages: images as-is, PDFs rasterized."""
+    import io
+
+    from PIL import Image
+
+    name = (filename or "").lower()
+    if name.endswith(".pdf"):
+        import fitz  # PyMuPDF
+
+        pages = []
+        with fitz.open(stream=raw, filetype="pdf") as doc:
+            for page in doc:
+                pix = page.get_pixmap(dpi=dpi)
+                pages.append(Image.open(io.BytesIO(pix.tobytes("png"))))
+        return pages
+    return [Image.open(io.BytesIO(raw))]
+
+
+def _preview_data_url(img, max_w: int = 900) -> str:
+    """Downscaled JPEG data URL so box overlays align with the transform."""
+    import base64
+    import io
+
+    im = img.convert("RGB")
+    if im.width > max_w:
+        im = im.resize((max_w, int(im.height * max_w / im.width)))
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=82)
+    return ("data:image/jpeg;base64,"
+            + base64.b64encode(buf.getvalue()).decode("ascii"))
+
+
+def _apply_transform(img, rotate: int, crop: list | None):
+    """Bake client toolbar state: rotate (deg CW) then relative crop."""
+    if crop:
+        try:
+            x0, y0, x1, y1 = (max(0.0, min(1.0, float(v))) for v in crop[:4])
+            if x1 > x0 and y1 > y0:
+                w, h = img.size
+                img = img.crop((int(x0 * w), int(y0 * h),
+                                int(x1 * w), int(y1 * h)))
+        except Exception as e:
+            log.warning("crop ignored (%s)", e)
+    rotate = int(rotate or 0) % 360
+    if rotate:
+        # PIL rotates CCW; toolbar degrees are CW
+        img = img.rotate(-rotate, expand=True)
+    return img
+
+
+def _translate_long(text: str, target: str, src: str, terms: dict) -> str:
+    """Hy-MT over long OCR text: chunk (live MT caps output length), join."""
+    import re
+
+    width = max(200, int(CFG.get("ocr_translate_chunk_chars", 800)))
+    parts = re.split(r"(?<=[.!?。！？\n])\s+", text)
+    chunks, cur = [], ""
+    for p in parts:
+        if len(cur) + len(p) + 1 > width and cur.strip():
+            chunks.append(cur.strip())
+            cur = p
+        else:
+            cur = (cur + " " + p).strip()
+    if cur.strip():
+        chunks.append(cur.strip())
+    if not chunks:
+        return ""
+    mt.ensure_loaded(demo_ok=True)
+    return "\n".join(
+        mt.translate(c, tgt=target, src=src, terms=terms or None) for c in chunks
+    ).strip()
+
+
+@app.post("/api/ocr")
+async def ocr_docs(
+    files: list[UploadFile] = File(...),
+    task: str = Form("ocr"),
+    translate_to: str = Form(""),
+    src: str = Form("auto"),
+    terms: str = Form("{}"),
+    rotate: int = Form(0),
+    crop: str = Form(""),
+):
+    """OCR images/PDFs, optionally Hy-MT-translated.
+
+    Form: files (1+, image/* or .pdf), task (ocr|table|formula|chart),
+    translate_to ("" = none, else e.g. "en"), src, terms (glossary JSON),
+    rotate (deg CW baked before OCR), crop ("[x0,y0,x1,y1]" relative).
+    task=ocr uses PP-OCR blocks (boxes+scores); table/formula/chart use the
+    PaddleOCR-VL reader (text only). Entering OCR mode deloads the diarizer.
+    """
+    import time
+
+    task = (task or "ocr").strip().lower()
+    target = (translate_to or "").strip().lower()
+    terms_d = _parse_terms(terms)
+    src_lang = None if (src or "auto") == "auto" else src
+    try:
+        crop_rect = (json.loads(crop) if crop else None) or None
+    except Exception:
+        crop_rect = None
+    dpi = max(72, min(400, int(CFG.get("ocr_dpi", 200))))
+    deloaded = _enter_ocr_mode()
+    use_blocks = (task == "ocr")
+    if use_blocks:
+        try:
+            await asyncio.to_thread(blockocr.ensure_loaded)
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": f"block ocr init failed: {e}"},
+                                status_code=500)
+        if not blockocr.available:
+            use_blocks = False  # fall through to VLM text-only
+    if not use_blocks:
+        try:
+            await asyncio.to_thread(ocr.ensure_loaded, True)
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": f"ocr load failed: {e}"},
+                                status_code=500)
+    mt.ensure_loaded(demo_ok=True)
+    pages_out: list[dict] = []
+    try:
+        for f in files:
+            raw = await f.read()
+            try:
+                pages = await asyncio.to_thread(
+                    _ocr_pages, raw, f.filename or "upload", dpi)
+            except Exception as e:
+                pages_out.append({"file": f.filename, "page": 0,
+                                  "error": f"decode failed: {e}"})
+                continue
+            for i, img in enumerate(pages):
+                t0 = time.time()
+                try:
+                    work = await asyncio.to_thread(
+                        _apply_transform, img, rotate, crop_rect)
+                    preview = _preview_data_url(work)
+                except Exception as e:
+                    pages_out.append({"file": f.filename, "page": i + 1,
+                                      "error": f"transform failed: {e}"})
+                    continue
+                entry: dict = {"file": f.filename, "page": i + 1,
+                               "preview": preview}
+                try:
+                    if use_blocks:
+                        res = await asyncio.to_thread(
+                            blockocr.read_blocks, work)
+                        entry.update(res)
+                        entry["backend"] = "pp-ocr"
+                    else:
+                        entry["text"] = await asyncio.to_thread(
+                            ocr.read, work, task)
+                        entry["blocks"] = []
+                        entry["overall_conf"] = 0.0
+                        entry["backend"] = "paddleocr-vl"
+                except Exception as e:
+                    entry["error"] = f"ocr failed: {e}"
+                    pages_out.append(entry)
+                    continue
+                entry["ocr_ms"] = int((time.time() - t0) * 1000)
+                if target and entry.get("text"):
+                    try:
+                        entry["translation"] = await asyncio.to_thread(
+                            _translate_long, entry["text"], target,
+                            src_lang or "auto", terms_d)
+                        for b in entry.get("blocks", []):
+                            if b.get("text"):
+                                try:
+                                    b["translation"] = mt.translate(
+                                        b["text"], tgt=target,
+                                        src=src_lang or "auto",
+                                        terms=terms_d or None)
+                                except Exception as e:
+                                    b["translation_error"] = str(e)
+                    except Exception as e:
+                        entry["translation_error"] = str(e)
+                pages_out.append(entry)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    return {"ok": True, "task": task, "pages": pages_out, "ocr": ocr.status(),
+            "block_ocr": {"ready": blockocr.loaded,
+                          "available": blockocr.available},
+            "diarizer": _diarizer_status(), "diarizer_deloaded": deloaded}
 
 
 @app.get("/api/export.txt")

@@ -6,11 +6,13 @@ are finalized on *silence* (endpointing) — utterances break at pauses::
 
     mic/file frames -> recognizer stream -> partial text (live on screen)
                      -> silence >= endpoint_silence -> finalize:
-                        diarize segment -> stream-translate finals
-                        (token events) -> utterance event
+                        diarize segment -> utterance event INSTANTLY (ASR text,
+                        LID copies filled) -> MT runs in a background FIFO
+                        worker (tok events stream in) -> utterance event again
+                        with full translations. ASR never waits for MT.
 
 Translation is context-aware: the last few finalized segments travel in the
-prompt as terminology/style history. Finals are generated token-streamed
+prompt as terminology/style history. Finals generate token-streamed
 ("tok" events) with prompt-lookup speculative decoding (drafter-free:
 candidate n-grams come from the prompt/history itself). Partials keep the
 cheaper debounced full-string re-translation.
@@ -25,6 +27,7 @@ from collections import deque
 import numpy as np
 
 from .diarizer import rms_dbfs
+from .langid import detect as detect_lang
 
 log = logging.getLogger("conf.stream")
 
@@ -60,6 +63,8 @@ class StreamingSession:
         self._rec = None
         self._reset_segment()
         self._n_final = 0
+        self._mt_queue = None  # lazy background FIFO worker, see _submit_mt
+        self._mt_thread = None
 
     # -- setup --------------------------------------------------------------
     def configure(self, targets=None, src_lang=None, denoise=None, terms=None,
@@ -88,6 +93,15 @@ class StreamingSession:
         if display_lang is not None:
             self.display_lang = display_lang or None
 
+    @property
+    def mt_backlog(self) -> int:
+        """Unfinished final-translation jobs. Partials yield to these."""
+        q = self._mt_queue
+        try:
+            return int(q.unfinished_tasks) if q is not None else 0
+        except Exception:
+            return 0
+
     def _ordered_targets(self) -> list[str]:
         """Display language first so its tokens stream earliest."""
         if self.display_lang and self.display_lang in self.targets:
@@ -106,6 +120,8 @@ class StreamingSession:
         self._last_partial = ""
         self._last_tr_text = ""
         self._last_tr_t = 0.0
+        self._tr_busy = False
+        self._tr_pending: tuple[str, list[str]] | None = None
 
     def _want_denoise(self) -> bool:
         if self.denoise is not None:
@@ -184,29 +200,76 @@ class StreamingSession:
         if not text or text == self._last_partial:
             return
         self._last_partial = text
-        translations = None
-        if (len(text) >= self.tr_min_chars
-                and len(text) - len(self._last_tr_text) >= self.tr_min_delta
-                and (t - self._last_tr_t) >= self.tr_interval):
-            try:
-                # Live re-translation covers the display language only: one
-                # MT call keeps the feed loop realtime; full targets land
-                # at finalize. Falls back to all targets when unset.
-                dl = self.display_lang
-                live_tgts = [dl] if dl and dl in self.targets else self.targets
-                translations = self.mt.translate_multi(
-                    text, live_tgts, src="auto", context=self._context(),
-                    terms=self.terms or None)
-                self._last_tr_text = text
-                self._last_tr_t = t
-            except Exception as e:
-                log.warning("partial translate failed: %s", e)
+        # Text goes out IMMEDIATELY (realtime ASR); translations follow async
+        # via _kick_partial_tr so slow MT never blocks frame ingestion.
         self.results.put(("partial", {
             "id": self._seg_id, "speaker": self._seg_speaker,
             "rms_db": round(rms_dbfs(np.concatenate(self._seg_audio[-4:])), 1)
             if self._seg_audio else -80.0,
-            "text": text, "translations": translations, "final": False,
+            "text": text, "translations": None, "final": False,
         }))
+        if (len(text) >= self.tr_min_chars
+                and len(text) - len(self._last_tr_text) >= self.tr_min_delta
+                and (t - self._last_tr_t) >= self.tr_interval):
+            if self.mt_backlog > 0:
+                return  # finals own the MT lock — don't queue partials behind them
+            self._last_tr_text = text  # claim now: dedupes while worker runs
+            self._last_tr_t = t
+            # Display language only (1 generate, not N): the full set lands
+            # with the finalize seconds later. Keeps partials ~3x cheaper so
+            # finals — the rows users keep — start sooner.
+            focus = ([self.display_lang] if self.display_lang
+                      and self.display_lang in list(self.targets)
+                      else list(self.targets)[:1])
+            self._kick_partial_tr(text, focus, self._seg_id)
+
+    def _kick_partial_tr(self, text: str, targets: list[str], seg_id: int | None):
+        """Single-flight background re-translation of the live partial."""
+        if self._tr_busy:
+            self._tr_pending = (text, targets)
+            return
+        self._tr_busy = True
+        self._tr_pending = (text, targets)
+        import threading
+
+        thread = threading.Thread(target=self._partial_tr_worker,
+                                  args=(seg_id,), daemon=True)
+        thread.start()
+
+    def _partial_tr_worker(self, seg_id: int | None):
+        """Translate latest pending partial; loop if text moved meanwhile."""
+        try:
+            while True:
+                pending = self._tr_pending
+                self._tr_pending = None
+                if pending is None:
+                    return
+                text, targets = pending
+                lid = detect_lang(text)
+                translations: dict[str, str] = {}
+                for tgt in targets:
+                    if lid and tgt.lower() == lid:
+                        translations[tgt] = text
+                        continue
+                    try:
+                        translations[tgt] = self.mt.translate(
+                            text, tgt=tgt, src=lid or "auto",
+                            context=self._context(), terms=self.terms or None)
+                    except Exception as e:
+                        translations[tgt] = f"[MT error: {e}]"
+                # stale (segment finalized meanwhile)? drop, don't resurrect.
+                if seg_id is not None and seg_id != self._seg_id:
+                    return
+                self._last_tr_text = text
+                self._last_tr_t = time.time()
+                if text == self._last_partial or self._tr_pending is not None:
+                    self.results.put(("partial", {
+                        "id": seg_id, "speaker": self._seg_speaker,
+                        "rms_db": -80.0, "text": text,
+                        "translations": translations, "final": False,
+                    }))
+        finally:
+            self._tr_busy = False
 
     # -- finalize ---------------------------------------------------------------
     def _finalize(self, t: float):
@@ -216,7 +279,7 @@ class StreamingSession:
         if self._want_denoise() and self.enhancer is not None and seg.size:
             seg = self.enhancer.enhance_array(seg, 16000)
             denoised = self.enhancer.active
-        # Final text: GPU one-shot re-decode when available (also lets the
+        # Final text: one-shot ORT re-decode when available (also lets the
         # denoised segment be heard fresh), else the live-stream result.
         # Either way seg is what the diarizer/translator see below.
         asr_backend = "stream"
@@ -224,12 +287,12 @@ class StreamingSession:
         rd = getattr(self.asr, "redecode_cuda", None)
         if callable(rd) and seg.size:
             try:
-                cuda_text = rd(seg, 16000)
+                cuda_text, cuda_backend = rd(seg, 16000)
             except Exception as e:
-                log.warning("CUDA redecode failed (%s).", e)
-                cuda_text = None
+                log.warning("ORT redecode failed (%s).", e)
+                cuda_text, cuda_backend = None, None
             if cuda_text:
-                text, asr_backend = cuda_text, "ort-cuda"
+                text, asr_backend = cuda_text, cuda_backend or "ort"
         if not text:
             if denoised:
                 # streaming ASR ran on raw audio — re-decode the enhanced
@@ -271,50 +334,153 @@ class StreamingSession:
         except Exception as e:
             log.warning("segment attribution failed: %s", e)
         t_diar = time.time()
+        # Skip MT where the target IS the detected source (a copy, not a
+        # ~3 s generate). detect() is ms-level; None = unsure = translate all.
+        lid = detect_lang(text)
+        src = lid or "auto"
         translations: dict[str, str] = {}
-        try:
-            # Token-stream each target so the UI fills in live ("tok" events),
-            # then confirm with the assembled strings in the utterance event.
-            # Display language streams first so visible progress starts ASAP.
-            for tgt in self._ordered_targets():
-                parts: list[str] = []
-                seq = 0
-                try:
-                    for delta in self.mt.translate_stream(text, tgt=tgt, src="auto",
-                                                          context=context, terms=terms):
-                        if delta:
-                            parts.append(delta)
-                            self.results.put(("tok", {"id": self._seg_id, "tgt": tgt,
-                                                      "seq": seq, "delta": delta}))
-                            seq += 1
-                except Exception as e:
-                    log.warning("streamed translate (%s) failed: %s", tgt, e)
-                chunk = "".join(parts).strip()
-                translations[tgt] = chunk or self.mt.translate(
-                    text, tgt=tgt, src="auto", context=context, terms=terms)
-        except Exception as e:
-            translations = {tgt: f"[MT error: {e}]" for tgt in self.targets}
-        t_mt = time.time()
+        for tgt in self.targets:
+            if lid and tgt.lower() == lid:
+                translations[tgt] = text
+        to_translate = [t for t in self._ordered_targets()
+                        if not (lid and t.lower() == lid)]
         self.history.append(text)
-        entry = {
+        pending = {
             "id": self._seg_id, "type": "utterance", "speaker": speaker,
             "rms_db": round(rms_dbfs(seg), 1) if seg.size else -80.0,
-            "denoised": denoised, "src_lang": "auto", "text": text,
-            "translations": translations, "start": round(self._seg_start or t, 2),
-            "asr_backend": asr_backend,
+            "denoised": denoised, "src_lang": lid or "auto", "text": text,
+            "translations": dict(translations), "start": round(self._seg_start or t, 2),
+            "asr_backend": asr_backend, "pending": True,
             "timings": {
                 "asr_ms": int((t_asr - t_start) * 1000),
                 "diar_ms": int((t_diar - t_asr) * 1000),
-                "mt_ms": int((t_mt - t_diar) * 1000),
-                "total_ms": int((t_mt - t_start) * 1000),
+                "mt_ms": 0,
+                "total_ms": int((t_diar - t_start) * 1000),
             },
         }
         if diar_backend:
-            entry["diar_backend"] = diar_backend
-        self.results.put(("utterance", entry))
+            pending["diar_backend"] = diar_backend
+        # ASR text leaves NOW; MT catches up in the background worker below.
+        self.results.put(("utterance", pending))
+        self._submit_mt(
+            seg_id=self._seg_id, text=text, targets=to_translate, src=src,
+            context=context, terms=terms, t_mt_start=t_diar,
+            base=dict(pending),
+        )
         self._n_final += 1
         self._fresh_stream()
         self._reset_segment()
+
+    # -- background MT --------------------------------------------------------
+    def _submit_mt(self, seg_id, text, targets, src, context, terms,
+                   t_mt_start, base: dict):
+        """Queue a translation job; one FIFO daemon thread runs them in order.
+
+        Emits tok events live, then re-emits the utterance with full
+        translations (same id → UI upserts). Feed/ASR never block on MT.
+        """
+        import queue as _queue
+        import threading
+
+        if self._mt_queue is None:
+            self._mt_queue = _queue.Queue()
+            self._mt_thread = threading.Thread(target=self._mt_loop, daemon=True)
+            self._mt_thread.start()
+        if not targets:
+            base["pending"] = False
+            base["translations"] = dict(base.get("translations", {}))
+            self.results.put(("utterance", base))
+            return
+        self._mt_queue.put({
+            "seg_id": seg_id, "text": text, "targets": list(targets),
+            "src": src, "context": list(context or []),
+            "terms": dict(terms) if terms else None,
+            "t_mt_start": t_mt_start, "base": base,
+        })
+
+    def _mt_loop(self):
+        while True:
+            job = self._mt_queue.get()
+            try:
+                if job is None:  # poison pill (see stop())
+                    return
+                self._run_mt_job(job)
+            except Exception as e:
+                log.warning("MT job failed: %s", e)
+                try:
+                    base = job.get("base", {}) if isinstance(job, dict) else {}
+                    base["pending"] = False
+                    self.results.put(("utterance", base))
+                except Exception:
+                    pass
+            finally:
+                try:
+                    self._mt_queue.task_done()
+                except Exception:
+                    pass
+
+    def _run_mt_job(self, job: dict):
+        seg_id = job["seg_id"]
+        text, src = job["text"], job["src"]
+        context, terms = job["context"], job["terms"]
+        translations: dict[str, str] = {}
+        try:
+            # Batched (one generate for all targets) is ~10x SLOWER on this
+            # modeling (no early stop: runs all 256 steps) — sequential with
+            # display-language-first stays default. mt_batch=true re-enables
+            # the batched path if the modeling ever gets fixed.
+            if bool(self.cfg.get("mt_batch", False)):
+                parts: dict[str, list[str]] = {}
+                seqs: dict[str, int] = {}
+                for tgt, delta in self.mt.translate_targets_stream(
+                        text, job["targets"], src=src,
+                        context=context, terms=terms):
+                    if delta:
+                        parts.setdefault(tgt, []).append(delta)
+                        seq = seqs.get(tgt, 0)
+                        self.results.put(("tok", {"id": seg_id, "tgt": tgt,
+                                                  "seq": seq, "delta": delta}))
+                        seqs[tgt] = seq + 1
+                for tgt in job["targets"]:
+                    chunk = "".join(parts.get(tgt, [])).strip()
+                    translations[tgt] = chunk or self.mt.translate(
+                        text, tgt=tgt, src=src, context=context, terms=terms)
+            else:
+                # Token-stream each target so the UI fills in live ("tok"
+                # events), then confirm with the assembled strings in the
+                # utterance event. Display language first for visible progress.
+                for tgt in job["targets"]:
+                    parts: list[str] = []
+                    seq = 0
+                    try:
+                        for delta in self.mt.translate_stream(
+                                text, tgt=tgt, src=src,
+                                context=context, terms=terms):
+                            if delta:
+                                parts.append(delta)
+                                self.results.put(("tok", {"id": seg_id,
+                                                          "tgt": tgt, "seq": seq,
+                                                          "delta": delta}))
+                                seq += 1
+                    except Exception as e:
+                        log.warning("streamed translate (%s) failed: %s", tgt, e)
+                    chunk = "".join(parts).strip()
+                    translations[tgt] = chunk or self.mt.translate(
+                        text, tgt=tgt, src=src, context=context, terms=terms)
+        except Exception as e:
+            for tgt in job["targets"]:
+                translations[tgt] = f"[MT error: {e}]"
+        t_mt = time.time()
+        base = job["base"]
+        merged = dict(base.get("translations", {}))
+        merged.update(translations)
+        base["translations"] = merged
+        base["pending"] = False
+        timings = dict(base.get("timings", {}))
+        timings["mt_ms"] = int((t_mt - job["t_mt_start"]) * 1000)
+        timings["total_ms"] = timings.get("total_ms", 0) + timings["mt_ms"]
+        base["timings"] = timings
+        self.results.put(("utterance", base))
 
     def _fresh_stream(self):
         try:
@@ -323,7 +489,9 @@ class StreamingSession:
             log.warning("stream reset failed: %s", e)
 
     def stop(self) -> int:
-        """Finalize any pending speech. Returns number of finalized segments."""
+        """Finalize any pending speech, then wait for background MT to catch
+        up so file_done implies complete translations. Returns number of
+        finalized segments."""
         if self._seg_start is not None and self._voice_dur >= 0.2:
             try:
                 text = self._rec.get_result(self._stream).strip() or self._last_partial
@@ -336,4 +504,12 @@ class StreamingSession:
                 self._reset_segment()
         n = self._n_final
         self._n_final = 0
+        if self._mt_queue is not None:
+            deadline = time.time() + 300
+            while time.time() < deadline:
+                if self._mt_queue.unfinished_tasks == 0:
+                    break
+                time.sleep(0.2)
+            else:
+                log.warning("MT backlog not drained in 300 s — translations may land late")
         return n

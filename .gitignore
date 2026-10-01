@@ -53,3 +53,10 @@ release/
 [Bb]in/
 [Oo]bj/
 .cache/
+
+# --- Electron / Python build outputs ---
+node_modules/
+electron/dist/
+electron/ui/dist/
+*.pyc
+

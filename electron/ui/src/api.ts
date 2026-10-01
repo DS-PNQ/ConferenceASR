@@ -84,19 +84,67 @@ export async function apiTranscribe(
   return j.utterances as Utterance[];
 }
 
-export async function apiTranslateText(
-  text: string,
+export async function apiTranslateText(  text: string,
   target: string,
   terms: Record<string, string> = {},
+  src = "auto",
 ): Promise<string> {
   const r = await fetch(`${BASE}/api/translate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text, targets: [target], src: "auto", terms }),
+    body: JSON.stringify({ text, targets: [target], src, terms }),
   });
   const j = await r.json();
   if (!j.ok) throw new Error("translate failed");
   return (j.translations as Record<string, string>)[target] ?? "";
+}
+
+// ---------- document OCR (PP-OCR blocks / PaddleOCR-VL + Hy-MT) ----------
+export interface OcrBlock {
+  id: number;
+  text: string;
+  conf: number;
+  box: [number, number, number, number]; // relative x0,y0,x1,y1
+  translation?: string;
+  translation_error?: string;
+}
+
+export interface OcrPage {
+  file: string;
+  page: number;
+  text?: string;
+  blocks?: OcrBlock[];
+  overall_conf?: number;
+  backend?: string;
+  preview?: string; // data-URL of the transformed page (overlay aligns to this)
+  translation?: string;
+  error?: string;
+  translation_error?: string;
+  ocr_ms?: number;
+}
+
+export interface OcrResult {
+  ok: boolean;
+  task: string;
+  pages: OcrPage[];
+}
+
+export async function apiOcr(
+  files: File[],
+  opts: { task: string; translateTo: string; src: string; terms: Record<string, string>; rotate?: number; crop?: [number, number, number, number] | null },
+): Promise<OcrResult> {
+  const fd = new FormData();
+  for (const f of files) fd.append("files", f);
+  fd.append("task", opts.task);
+  fd.append("translate_to", opts.translateTo);
+  fd.append("src", opts.src);
+  fd.append("terms", JSON.stringify(opts.terms));
+  fd.append("rotate", String(opts.rotate ?? 0));
+  fd.append("crop", opts.crop ? JSON.stringify(opts.crop) : "");
+  const r = await fetch(`${BASE}/api/ocr`, { method: "POST", body: fd });
+  const j = await r.json();
+  if (!j.ok) throw new Error(j.error || "ocr failed");
+  return j as OcrResult;
 }
 
 export type WSEvents = {
@@ -105,15 +153,20 @@ export type WSEvents = {
   onUtterance: (u: Utterance) => void;
   onStatus: (s: string) => void;
   onError: (e: string) => void;
+  onClose?: () => void;
 };
 
 export class LiveSocket {
   private ws: WebSocket | null = null;
+  private ev: WSEvents | null = null;
+  private intentionalClose = false;
 
   async connect(ev: WSEvents): Promise<void> {
     this.close();
     const ws = new WebSocket(WS_URL);
     this.ws = ws;
+    this.ev = ev;
+    this.intentionalClose = false;
     await new Promise<void>((res, rej) => {
       ws.onopen = () => res();
       ws.onerror = () => rej(new Error("websocket failed — is the backend running?"));
@@ -140,6 +193,16 @@ export class LiveSocket {
     };
     ws.onclose = () => {
       if (this.ws === ws) this.ws = null;
+      const cb = this.ev?.onClose;
+      this.ev = null;
+      if (!this.intentionalClose) {
+        try {
+          cb?.();
+        } catch {
+          /* noop */
+        }
+      }
+      this.intentionalClose = false;
     };
   }
 
@@ -168,13 +231,24 @@ export class LiveSocket {
     this.send({ type: "stream_stop" });
   }
 
+  /** Bytes queued but unsent — grows when the server can't keep up. */
+  pending(): number {
+    try {
+      return this.ws ? this.ws.bufferedAmount : 0;
+    } catch {
+      return 0;
+    }
+  }
+
   close(): void {
+    this.intentionalClose = true;
     try {
       this.ws?.close();
     } catch {
       /* noop */
     }
     this.ws = null;
+    this.ev = null;
   }
 }
 
@@ -182,6 +256,10 @@ export class LiveSocket {
 export interface MicHandle {
   stop: () => void;
   setPaused: (p: boolean) => void;
+  /** Drop the next `seconds` of audio (resume pops, device switches). */
+  dropNext: (seconds: number) => void;
+  /** Seconds since the last emitted frame (watchdog input). */
+  idleFor: () => number;
   level: () => number;
   label: string;
 }
@@ -211,13 +289,24 @@ export async function openMic(
   deviceId: string | undefined,
   onFrame: (b64: string) => void,
   frameSeconds = 0.5,
+  onTrackEnded?: () => void,
 ): Promise<MicHandle> {
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: deviceId ? { deviceId: { exact: deviceId }, echoCancellation: true } : { echoCancellation: true },
   });
   const track = stream.getAudioTracks()[0];
   const label = track?.label || "Microphone";
+  if (track) {
+    track.onended = () => {
+      try {
+        onTrackEnded?.();
+      } catch {
+        /* noop */
+      }
+    };
+  }
   const ctx = new AudioContext();
+  await ctx.resume().catch(() => undefined); // autoplay policy: unlock on gesture
   const src = ctx.createMediaStreamSource(stream);
   const analyser = ctx.createAnalyser();
   analyser.fftSize = 1024;
@@ -226,6 +315,8 @@ export async function openMic(
   let paused = false;
   let chunk: Float32Array[] = [];
   let chunkLen = 0;
+  let dropUntil = 0;
+  let lastEmit = performance.now();
   let peak = 0;
   proc.onaudioprocess = (e) => {
     analyser.getFloatTimeDomainData(peakBuf);
@@ -233,6 +324,7 @@ export async function openMic(
     for (let i = 0; i < peakBuf.length; i += 4) p = Math.max(p, Math.abs(peakBuf[i]));
     peak = p;
     if (paused) return;
+    if (performance.now() < dropUntil) return; // resume/device pop guard
     const r16 = resample16k(e.inputBuffer.getChannelData(0), ctx.sampleRate);
     chunk.push(r16);
     chunkLen += r16.length;
@@ -245,6 +337,7 @@ export async function openMic(
         o += b.length;
       }
       onFrame(b64pcm16(floatTo16(flat.slice(0, need))));
+      lastEmit = performance.now();
       const rest = flat.slice(need);
       chunk = rest.length ? [rest] : [];
       chunkLen = rest.length;
@@ -260,8 +353,14 @@ export async function openMic(
       if (p) {
         chunk = [];
         chunkLen = 0;
+      } else {
+        dropUntil = performance.now() + 250; // swallow the resume pop
       }
     },
+    dropNext: (seconds: number) => {
+      dropUntil = performance.now() + seconds * 1000;
+    },
+    idleFor: () => (performance.now() - lastEmit) / 1000,
     level: () => peak,
     stop: () => {
       try {

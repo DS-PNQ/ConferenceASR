@@ -28,6 +28,9 @@ onnxruntime-gpu~=1.22
 # MT: Hy-MT2 FP8 needs compressed-tensors (CUDA). Falls back gracefully if missing.
 compressed-tensors>=0.18
 
+# Quantized KV cache for long conversations (mt_kvquant). Optional; off = plain cache.
+optimum-quanto>=0.2
+
 # Voice suppression before ASR (DeepFilterNet3 full-band denoiser).
 # Needs torchaudio alongside torch, e.g.:
 #   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu126
@@ -43,3 +46,6 @@ compressed-tensors>=0.18
 # accept once at https://hf.co/pyannote/embedding (uses cached HF login).
 pyannote.audio>=4.0
 nemo_toolkit[asr]>=3.0
+
+# Fast language ID (vi/en/zh, ms-level) to skip same-language MT calls.
+lingua-language-detector>=2.0

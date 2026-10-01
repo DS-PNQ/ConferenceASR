@@ -45,12 +45,14 @@ def _torch_dll_dirs() -> list[str]:
 
 
 class CudaZipformer:
-    def __init__(self, model_dir: str, quant: str = "fp32"):
+    def __init__(self, model_dir: str, quant: str = "fp32", prefer_cuda: bool = False):
         self.model_dir = str(model_dir)
         self.quant = quant  # fp32 only on CUDA (int8 lacks CUDA EP kernels)
+        self.prefer_cuda = prefer_cuda
         self._lock = threading.Lock()
         self._sessions = None
         self._tokens: list[str] | None = None
+        self.provider = "?"
 
     def _paths(self) -> dict:
         import pathlib
@@ -88,18 +90,57 @@ class CudaZipformer:
                 raise CudaUnavailable(f"model files missing: {missing}")
             opts = ort.SessionOptions()
             opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            try:
-                make = lambda m: ort.InferenceSession(
-                    m, sess_options=opts, providers=["CUDAExecutionProvider"])
-                sessions = {"enc": make(p["encoder"]), "dec": make(p["decoder"]),
-                            "joi": make(p["joiner"])}
-            except Exception as e:
-                raise CudaUnavailable(f"CUDA EP unavailable: {e}")
-            if sessions["enc"].get_providers()[0] != "CUDAExecutionProvider":
-                raise CudaUnavailable("CUDA EP fell back to CPU")
-            self._sessions = sessions
+            # MEASURED: CUDA EP on these builds either crashes mid-inference
+            # (garbage Expand dims) or falls back per-op with memcpy shuttling
+            # that turns a segment into 30-40 s. CPU int8/fp32 does 15 s audio
+            # in ~1 s. So CPU unless explicitly asked (and probe-validated).
+            cands = ([["CUDAExecutionProvider", "CPUExecutionProvider"],
+                      ["CPUExecutionProvider"]] if self.prefer_cuda
+                     else [["CPUExecutionProvider"]])
+            last_err: Exception | None = None
+            for providers in cands:
+                try:
+                    sessions = {
+                        "enc": ort.InferenceSession(
+                            p["encoder"], sess_options=opts, providers=providers),
+                        "dec": ort.InferenceSession(
+                            p["decoder"], sess_options=opts, providers=providers),
+                        "joi": ort.InferenceSession(
+                            p["joiner"], sess_options=opts, providers=providers),
+                    }
+                    self._probe(sessions)
+                    self._sessions = sessions
+                    self.provider = sessions["enc"].get_providers()[0]
+                    break
+                except Exception as e:
+                    last_err = e
+                    log.warning("ORT providers %s rejected (%s)", providers, e)
+            if self._sessions is None:
+                raise CudaUnavailable(f"no working provider: {last_err}")
             self._tokens = self._load_tokens(p["tokens"])
-            log.info("CUDA Zipformer ready (ORT %s)", ort.__version__)
+            log.info("ORT Zipformer ready on %s (ORT %s)",
+                     self.provider, ort.__version__)
+
+    @staticmethod
+    def _probe(sessions: dict) -> None:
+        """Throw unless encoder + one decode step actually execute."""
+        import numpy as np
+
+        enc = sessions["enc"]
+        feed = {"x": np.zeros((1, 39, 80), dtype=np.float32)}
+        for i in enc.get_inputs():
+            if i.name not in feed:
+                shp = [1 if isinstance(x, str) else x for x in i.shape]
+                feed[i.name] = np.zeros(
+                    shp, dtype=np.int64 if "int64" in i.type else np.float32)
+        outs = enc.run(None, feed)
+        out = dict(zip([o.name for o in enc.get_outputs()], outs))
+        enc_frame = out["encoder_out"][0, 0]
+        dec = sessions["dec"]
+        d_out = dec.run(None, {"y": np.zeros((1, 2), dtype=np.int64)})[0]
+        sessions["joi"].run(None, {
+            "encoder_out": enc_frame[None, :].astype(np.float32),
+            "decoder_out": d_out.astype(np.float32)})
 
     @staticmethod
     def _load_tokens(path: str) -> list[str]:

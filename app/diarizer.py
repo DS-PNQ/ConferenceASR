@@ -69,6 +69,10 @@ class VolumeDiarizer:
         self.last_voice_t: float | None = None
         self.turn_id = 0
 
+    def unload(self) -> dict:
+        """Volume mode holds no GPU state — nothing to free."""
+        return {"unloaded": True, "was": {"backend": "volume"}} 
+
     def _match(self, db: float, pan: float) -> int:
         if not self.centroids:
             self.centroids.append(db)
@@ -196,7 +200,11 @@ class NeMoDiarizer:
 
     # -- authoritative path: embedding attribution for finalized segments ----
     def embed(self, pcm: np.ndarray, sr: int = 16000):
-        """L2-normalized 192-d embedding (CPU tensor) or None."""
+        """L2-normalized 192-d embedding (CPU tensor) or None.
+
+        Direct tensor forward — no temp wav files (the file path costs more
+        in I/O than the 0.05 s inference itself).
+        """
         import torch
 
         self.ensure_loaded()
@@ -205,28 +213,20 @@ class NeMoDiarizer:
         x = np.asarray(pcm, dtype=np.float32).ravel()
         if x.size < int(sr * 0.4):  # too short to embed reliably
             return None
-        import os
-        import soundfile as sf
-        import tempfile
-
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            path = f.name
         try:
-            sf.write(path, np.clip(x, -1.0, 1.0).astype(np.float32), int(sr))
             with self._lock, torch.no_grad():
-                e = self._model.get_embedding(path)
+                dev = next(self._model.parameters()).device
+                wav = torch.from_numpy(
+                    np.clip(x, -1.0, 1.0).astype(np.float32)
+                )[None, :].to(dev)
+                ln = torch.tensor([wav.shape[1]], device=dev)
+                _, emb = self._model(input_signal=wav, input_signal_length=ln)
         except Exception as e:
             log.warning("NeMo embed failed (%s)", e)
             return None
-        finally:
-            try:
-                os.unlink(path)
-            except Exception:
-                pass
-        import torch
-
         e = torch.as_tensor(
-            e.detach().cpu() if torch.is_tensor(e) else e, dtype=torch.float32).ravel()
+            emb.detach().cpu() if torch.is_tensor(emb) else emb,
+            dtype=torch.float32).ravel()
         n = float(e.norm())
         return e / max(n, 1e-9) if n > 1e-9 else None
 
@@ -280,6 +280,22 @@ class NeMoDiarizer:
             "n_speakers": len(self.centroids),
             "ready": self._ready,
         }
+
+    def unload(self) -> dict:
+        """Drop Titanet from VRAM. Next embed() reloads via ensure_loaded."""
+        was = self.status()
+        self._model = None
+        self._available = False
+        self._ready = False
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        log.info("NeMo diarizer unloaded (OCR mode)")
+        return {"unloaded": True, "was": was}
 
 
 class PyannoteDiarizer:
@@ -473,6 +489,26 @@ class PyannoteDiarizer:
             "n_speakers": len(self.centroids),
             "ready": self._ready,
         }
+
+    def unload(self) -> dict:
+        """Drop pyannote (+ NeMo rung) from VRAM. Reloads on next embed()."""
+        was = self.status()
+        self._infer = None
+        self._available = False
+        self._ready = False
+        try:
+            self._nemo.unload()
+        except Exception:
+            pass
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        log.info("pyannote diarizer unloaded (OCR mode)")
+        return {"unloaded": True, "was": was}
 
 
 def _cuda() -> bool:

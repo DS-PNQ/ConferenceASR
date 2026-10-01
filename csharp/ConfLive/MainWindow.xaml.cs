@@ -23,6 +23,7 @@ public partial class MainWindow : Window
     private readonly MicCapture _mic = new();
     private readonly List<UtteranceEvent> _history = new();
     private readonly Dictionary<long, PartialBubble> _partials = new();
+    private readonly Dictionary<long, PartialBubble> _finals = new();
     private readonly SemaphoreSlim _sendLock = new(1, 1);
     private int _count;
     private bool _recording;
@@ -32,6 +33,7 @@ public partial class MainWindow : Window
     {
         public Border Frame; public TextBlock Who; public TextBlock Orig;
         public StackPanel Body; public readonly List<TextBlock> Trs = new();
+        public TextBlock Note; // "translating…" marker, finals only
     }
 
     public MainWindow()
@@ -212,6 +214,7 @@ public partial class MainWindow : Window
     private void OnClear(object s, RoutedEventArgs e)
     {
         _partials.Clear();
+        _finals.Clear();
         Feed.Children.Clear();
         _history.Clear();
         _count = 0;
@@ -323,19 +326,53 @@ public partial class MainWindow : Window
 
     private void AddFinal(UtteranceEvent u)
     {
-        if (_partials.TryGetValue(u.Id, out var b))
+        // Same id arrives twice (instant ASR text, then full translations):
+        // upsert in place instead of duplicating.
+        if (_partials.TryGetValue(u.Id, out var p))
         {
-            Feed.Children.Remove(b.Frame);
+            Feed.Children.Remove(p.Frame);
             _partials.Remove(u.Id);
         }
-        string badge = u.Denoised ? " · 🔇" : "";
-        var frame = MakeBubble(u.Speaker, $"{u.Speaker} · {u.SrcLang} · {u.RmsDb} dB{badge}",
-            out var body, out var orig, out _, animate: true);
-        orig.Text = u.Text;
-        foreach (var kv in u.Translations) MakeTr(body, $"[{kv.Key}] {kv.Value}");
-        _history.Add(u);
-        _count++;
-        CountText.Text = $"{_count} utterances";
+        if (!_finals.TryGetValue(u.Id, out var b))
+        {
+            string badge0 = u.Denoised ? " · 🔇" : "";
+            var frame = MakeBubble(u.Speaker, $"{u.Speaker} · {u.SrcLang} · {u.RmsDb} dB{badge0}",
+                out var body, out var orig, out _, animate: true);
+            b = new PartialBubble { Frame = frame, Body = body, Orig = orig };
+            _finals[u.Id] = b;
+            _history.Add(u);
+            _count++;
+            CountText.Text = $"{_count} utterances";
+        }
+        b.Orig.Text = u.Text;
+        int i = 0;
+        foreach (var kv in u.Translations)
+        {
+            string line = $"[{kv.Key}] {kv.Value}";
+            if (i < b.Trs.Count) b.Trs[i].Text = line;
+            else b.Trs.Add(MakeTr(b.Body, line));
+            i++;
+        }
+        while (b.Trs.Count > i)
+        {
+            var extra = b.Trs[b.Trs.Count - 1];
+            b.Body.Children.Remove(extra);
+            b.Trs.RemoveAt(b.Trs.Count - 1);
+        }
+        if (u.Pending && b.Note == null)
+        {
+            b.Note = new TextBlock
+            {
+                Text = "translating…", FontSize = 11, FontStyle = FontStyles.Italic,
+                Foreground = new SolidColorBrush(Hex("#7773cb")), Margin = new Thickness(0, 6, 0, 0),
+            };
+            b.Body.Children.Add(b.Note);
+        }
+        else if (!u.Pending && b.Note != null)
+        {
+            b.Body.Children.Remove(b.Note);
+            b.Note = null;
+        }
         FeedScroll.ScrollToBottom();
     }
 

@@ -43,15 +43,31 @@ class _IdCollector:
         self.saw_any = False
 
     def put(self, value):
+        # generate() calls put() with 1-D tensors ([prompt_len] once, then
+        # [batch] per step). Flatten defensively: an earlier version indexed
+        # value[0], which silently dropped EVERYTHING on 1-D input (and the
+        # bare except hid it — streaming never fired). Never swallow blindly.
         try:
             import torch
 
             if torch.is_tensor(value):
-                value = value[0].tolist()
-            self._ids.extend(int(x) for x in value)
+                value = value.detach().cpu().tolist()
+            if isinstance(value, int):
+                value = [value]
+            flat: list[int] = []
+
+            def _walk(v):
+                if isinstance(v, (list, tuple)):
+                    for x in v:
+                        _walk(x)
+                else:
+                    flat.append(int(v))
+
+            _walk(value)
+            self._ids.extend(flat)
             self.saw_any = True
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("streamer put failed (%s) — deltas for this call lost", e)
         finally:
             self._ev.set()
 
@@ -65,6 +81,81 @@ class _IdCollector:
             if self._ids:
                 out = self._ids
                 self._ids = []
+                if not self._done:
+                    self._ev.clear()
+                return out
+            if self._done:
+                return None
+            if not self._ev.wait(timeout):
+                return None
+
+
+class _RowDemux:
+    """Demuxes batched generate() put() calls into per-row id streams.
+
+    First put() is the (padded) prompt batch and is skipped; afterwards each
+    put() is [B] (or [B, 1]) generated ids. A row is closed at its first EOS
+    so padding/repeat ids after finish never leak into its text.
+    """
+
+    def __init__(self, n_rows: int, eos_id: int | None):
+        import threading
+
+        self.n = n_rows
+        self.eos = eos_id
+        self.rows: list[list[int]] = [[] for _ in range(n_rows)]
+        self.pending: list[list[int]] = [[] for _ in range(n_rows)]
+        self.done_rows: list[bool] = [False] * n_rows
+        self._primed = False
+        self._done = False
+        self._ev = threading.Event()
+        self.saw_any = False
+
+    def put(self, value):
+        try:
+            import torch
+
+            if torch.is_tensor(value):
+                value = value.detach().cpu().tolist()
+            if isinstance(value, int):
+                value = [value]
+            if (isinstance(value, list) and value
+                    and all(isinstance(x, list) for x in value)):
+                rows_in = [x[0] if x else None for x in value]
+            else:
+                rows_in = list(value) if isinstance(value, list) else [value]
+            if not self._primed:
+                # full prompt batch (padded): skip, start streaming after it
+                self._primed = True
+            else:
+                for i in range(min(self.n, len(rows_in))):
+                    if self.done_rows[i]:
+                        continue
+                    v = rows_in[i]
+                    if v is None:
+                        continue
+                    v = int(v)
+                    if self.eos is not None and v == self.eos:
+                        self.done_rows[i] = True
+                        continue
+                    self.pending[i].append(v)
+                    self.rows[i].append(v)
+                    self.saw_any = True
+        except Exception as e:
+            log.warning("demux put failed (%s)", e)
+        finally:
+            self._ev.set()
+
+    def end(self):
+        self._done = True
+        self._ev.set()
+
+    def take_any(self, timeout: float = 60.0) -> list[tuple[int, list[int]]] | None:
+        """Drain newly arrived ids per row; None when done and drained."""
+        while True:
+            out = [(i, self.pending[i]) for i in range(self.n) if self.pending[i]]
+            if out:
+                self.pending = [[] for _ in range(self.n)]
                 if not self._done:
                     self._ev.clear()
                 return out
@@ -90,12 +181,16 @@ class MockMT:
 
 
 class HyMT2Engine:
+    _supports_batch = True  # subclass may disable (e.g. batch-1 ONNX export)
+
     def __init__(self, cfg: dict, device: str, dtype):
         self.cfg = cfg
         self.device = device
         self.dtype = dtype
         self.model_id: str = os.getenv("MT_MODEL", cfg.get("mt_model", "tencent/Hy-MT2-1.8B"))
-        self._lock = threading.Lock()
+        # RLock: translate_targets_stream holds it across a fallback into
+        # translate_stream (same thread) — a plain Lock would deadlock there.
+        self._lock = threading.RLock()
         self._tok = None
         self._model = None
         self._mock = False
@@ -168,11 +263,23 @@ class HyMT2Engine:
         # history too and ramble.)
         parts: list[str] = []
         hist = "\n".join(f"- {c}" for c in (context or []) if (c or "").strip())
-        term_lines = "\n".join(f"`{s}` translates to `{t}`"
-                               for s, t in (terms or {}).items() if s and t)
+        # Glossary: emit original + UPPER + lower variants — our ASR outputs
+        # UPPERCASE English, users type lowercase, and the model otherwise
+        # treats them as different words and ignores the term.
+        seen: set[str] = set()
+        term_lines = []
+        for s, t in (terms or {}).items():
+            if not s or not t:
+                continue
+            for variant in (s, s.upper(), s.lower()):
+                if variant and variant not in seen:
+                    seen.add(variant)
+                    term_lines.append(f"`{variant}` translates to `{t}`")
         if term_lines:
             parts.append(
-                "Reference the following translations:\n" + term_lines
+                "You MUST use exactly the following translations for the "
+                "matching words (match regardless of letter case):\n"
+                + "\n".join(term_lines)
             )
         if hist:
             parts.append(
@@ -214,6 +321,10 @@ class HyMT2Engine:
         # transformers generate honors it when the modeling supports cache.
         if bool(self.cfg.get("mt_use_cache", True)):
             kw["use_cache"] = True
+        # Quantized KV cache (KIVI-style, quanto backend): shrinks cache
+        # memory, not per-step fixed costs — measured below; default off.
+        if bool(self.cfg.get("mt_kvquant", False)):
+            kw["cache_implementation"] = "quantized"
         if not greedy:  # sampling hyperparams only matter off-greedy
             kw.update(temperature=float(self.cfg.get("mt_temperature", 0.3)),
                       top_p=0.6, top_k=20)
@@ -332,6 +443,100 @@ class HyMT2Engine:
                 # Modeling never streamed (or streamed nothing usable):
                 # one-shot fallback WITHOUT re-locking (lock already held).
                 yield self._translate_locked(text, tgt, context, terms, speculate)
+
+    def _prepare_batched(self, text: str, tgts: list[str],
+                         context: list[str] | None = None,
+                         terms: dict[str, str] | None = None):
+        """Tokenize one prompt per target, left-pad to a batch. Caller holds _lock."""
+        import torch
+
+        encs = []
+        for tgt in tgts:
+            messages = [{"role": "user",
+                         "content": self._prompt(text, to_full(tgt), context, terms)}]
+            enc = self._tok.apply_chat_template(
+                messages, add_generation_prompt=True, return_tensors="pt")
+            ids = enc["input_ids"] if not torch.is_tensor(enc) else enc
+            encs.append(ids[0])
+        pad = self._tok.eos_token_id
+        max_len = max(e.shape[0] for e in encs)
+        batch = torch.stack([
+            torch.cat([torch.full((max_len - e.shape[0],), pad, dtype=e.dtype), e])
+            for e in encs])
+        mask = torch.stack([
+            torch.cat([torch.zeros(max_len - e.shape[0], dtype=torch.long),
+                       torch.ones(e.shape[0], dtype=torch.long)])
+            for e in encs])
+        return batch.to(self._model.device), mask.to(self._model.device)
+
+    def translate_targets_stream(self, text: str, targets: list[str],
+                                 src: str = "auto",
+                                 context: list[str] | None = None,
+                                 terms: dict[str, str] | None = None):
+        """Translate to every target in ONE generate call, yielding (tgt, delta).
+
+        Shared prefill + parallel decode beats sequential per-target calls
+        (~2-3x on 3 targets); per-row token streams demux into the same (tgt,
+        delta) events the UI already renders. Falls back to sequential
+        per-target streaming when batching is unsupported. Holds _lock.
+        """
+        text = (text or "").strip()
+        tgts = [t for t in (targets or []) if t]
+        if not text or not tgts:
+            return
+            yield  # generator in all paths
+        self.ensure_loaded()
+        if self._mock:
+            for t in tgts:
+                yield t, self._model.translate(text, src=src, tgt=t)
+            return
+        if not self._supports_batch:
+            yield from self._sequential_stream(text, tgts, src, context, terms)
+            return
+        import threading
+
+        with self._lock:
+            try:
+                input_ids, attn_mask = self._prepare_batched(text, tgts, context, terms)
+            except Exception as e:
+                log.warning("batched prepare failed (%s) — sequential fallback", e)
+                yield from self._sequential_stream(text, tgts, src, context, terms)
+                return
+            demux = _RowDemux(len(tgts), self._tok.eos_token_id)
+            speculate = all(self._should_speculate(src, t, text) for t in tgts)
+            gen_kwargs = self._gen_kwargs(streamer=demux, speculate=speculate)
+            thread = threading.Thread(
+                target=self._generate, args=(input_ids, attn_mask, gen_kwargs),
+                daemon=True)
+            thread.start()
+            shown = ["" for _ in tgts]
+            gen_all: list[list[int]] = [[] for _ in tgts]
+            try:
+                while True:
+                    got = demux.take_any(timeout=2.0) or []
+                    for row, ids in got:
+                        gen_all[row] += ids
+                        new_text = self._tok.decode(gen_all[row], skip_special_tokens=True)
+                        if len(new_text) > len(shown[row]):
+                            yield tgts[row], new_text[len(shown[row]):]
+                            shown[row] = new_text
+                    if not thread.is_alive():
+                        break
+            finally:
+                thread.join(timeout=10)
+            if not any(s.strip() for s in shown):
+                yield from self._sequential_stream(text, tgts, src, context, terms)
+
+    def _sequential_stream(self, text, tgts, src, context, terms):
+        """Old path, kept as the batched fallback. Yields (tgt, delta)."""
+        for tgt in tgts:
+            try:
+                for delta in self.translate_stream(text, tgt=tgt, src=src,
+                                                   context=context, terms=terms):
+                    if delta:
+                        yield tgt, delta
+            except Exception as e:
+                log.warning("streamed translate (%s) failed: %s", tgt, e)
 
     def translate_multi(self, text: str, targets: list[str], src: str = "auto",
                         context: list[str] | None = None,

@@ -12,6 +12,7 @@ from app.device import device_report, resolve_device, resolve_dtype
 from app.diarizer import make_diarizer
 from app.enhancer import DeepFilterNetEnhancer
 from app.mt_engine import HyMT2Engine
+from app.onnx_mt import OnnxMTEngine
 from app.pipeline import ConferencePipeline
 from app.zipformer_engine import ZipformerEngine
 
@@ -25,6 +26,19 @@ def load_cfg() -> dict:
         return yaml.safe_load(f) or {}
 
 
+def make_mt_engine(cfg: dict, device: str, mt_dtype):
+    """Local .onnx dir -> OnnxMTEngine, else HF transformers engine."""
+    import os
+
+    model_id = os.getenv("MT_MODEL", cfg.get("mt_model", ""))
+    if model_id and os.path.isdir(str(model_id)):
+        from pathlib import Path as _P
+
+        if list(_P(str(model_id)).glob("*.onnx")):
+            return OnnxMTEngine(cfg)
+    return HyMT2Engine(cfg, device, mt_dtype)
+
+
 def build_app() -> dict:
     """Create engines + pipeline. Models stay lazy until warmup."""
     cfg = load_cfg()
@@ -32,7 +46,7 @@ def build_app() -> dict:
     mt_dtype = resolve_dtype(device, os.getenv("MT_DTYPE", cfg.get("mt_dtype", "auto")))
 
     asr = ZipformerEngine(cfg)
-    mt = HyMT2Engine(cfg, device, mt_dtype)
+    mt = make_mt_engine(cfg, device, mt_dtype)
     diarizer = make_diarizer(cfg)
     enhancer = DeepFilterNetEnhancer(cfg)
     pipe = ConferencePipeline(cfg, asr, mt, diarizer, enhancer)

@@ -117,55 +117,63 @@ class ZipformerEngine:
             a = a.mean(axis=-1).astype(np.float32)
         return self.transcribe_array(a, sr, language=language)
 
-    def transcribe_final(self, pcm: np.ndarray, sr: int = 16000) -> tuple[str, str]:
-        """Final-segment decode, GPU preferred (legacy CPU path preserved).
+    def _ort(self):
+        """Shared direct-ORT driver (CPU default; CUDA opt-in + probed)."""
+        from .cuda_zipformer import CudaZipformer
 
-        Tries the direct ORT-CUDA driver first (see app/cuda_zipformer.py);
-        falls back to the CPU streaming recognizer. Returns (text, backend)
-        where backend is "ort-cuda" or "sherpa-cpu".
+        if not hasattr(self, "_cuda") or self._cuda is None:
+            prefer = str(self.cfg.get("asr_ort_provider", "cpu")).lower() == "cuda"
+            self._cuda = CudaZipformer(str(self.model_dir), prefer_cuda=prefer)
+        return self._cuda
+
+    def transcribe_final(self, pcm: np.ndarray, sr: int = 16000) -> tuple[str, str]:
+        """Final-segment decode via direct ORT (legacy CPU path preserved).
+
+        Tries the ORT driver first (see app/cuda_zipformer.py); falls back
+        to the CPU streaming recognizer. Returns (text, backend).
         """
         x = np.asarray(pcm, dtype=np.float32).ravel()
         if x.size == 0:
             return "", "none"
-        if bool(self.cfg.get("asr_cuda_final", True)):
-            try:
-                from .cuda_zipformer import CudaZipformer
-
-                if not hasattr(self, "_cuda") or self._cuda is None:
-                    self._cuda = CudaZipformer(str(self.model_dir))
-                with self._lock:
-                    text = self._cuda.transcribe_array(x, sr)
-                return text.strip(), "ort-cuda"
-            except Exception as e:
-                log.warning("CUDA final decode unavailable (%s) — CPU fallback.", e)
-                self._cuda = False
+        try:
+            with self._lock:
+                text = self._ort().transcribe_array(x, sr)
+            prov = self._ort().provider
+            return text.strip(), ("ort-cuda" if "CUDA" in prov else "ort-cpu")
+        except Exception as e:
+            log.warning("ORT final decode unavailable (%s) — CPU fallback.", e)
+            self._cuda = False
         _, text = self.transcribe_array(x, sr)
         return text, "sherpa-cpu"
 
-    def redecode_cuda(self, pcm: np.ndarray, sr: int = 16000) -> str | None:
-        """One-shot GPU decode; None when CUDA is unavailable.
+    def redecode_cuda(self, pcm: np.ndarray, sr: int = 16000,
+                      ) -> tuple[str | None, str | None]:
+        """One-shot ORT re-decode; (None, None) when unavailable.
 
-        Streaming finalize prefers this (GPU text, zero CPU cost); on None
-        the caller keeps the live-stream result. Never raises for missing
-        CUDA — only for real errors after a successful load.
+        Returns (text, backend) with backend like "ort-cpu"/"ort-cuda".
+        Streaming finalize prefers this; on None the caller keeps the
+        live-stream result. Never raises for missing providers.
         """
+        from .cuda_zipformer import CudaUnavailable
+
         x = np.asarray(pcm, dtype=np.float32).ravel()
-        if x.size == 0 or not bool(self.cfg.get("asr_cuda_final", True)):
-            return None
+        if x.size == 0:
+            return None, None
         try:
-            from .cuda_zipformer import CudaZipformer, CudaUnavailable
-        except Exception as e:
-            log.warning("CUDA redecode unavailable (%s).", e)
-            return None
-        try:
-            if not hasattr(self, "_cuda") or self._cuda is None:
-                self._cuda = CudaZipformer(str(self.model_dir))
             with self._lock:
-                return self._cuda.transcribe_array(x, sr).strip() or None
+                driver = self._ort()
+                text = driver.transcribe_array(x, sr).strip() or None
+                prov = driver.provider
+                backend = ("ort-cuda" if "CUDA" in prov else "ort-cpu"
+                           if text else None)
+                return text, backend
         except CudaUnavailable as e:
-            log.warning("CUDA redecode unavailable (%s) — live result kept.", e)
+            log.warning("ORT redecode unavailable (%s) — live result kept.", e)
             self._cuda = False
-            return None
+            return None, None
+        except Exception as e:
+            log.warning("ORT redecode failed (%s) — live result kept.", e)
+            return None, None
 
     def status(self) -> dict:
         return {

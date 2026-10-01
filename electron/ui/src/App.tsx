@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, Component, type ReactNode } from "react";
 import {
   apiHealth,
+  apiOcr,
   apiSetDiarizer,
   apiTranscribe,
   apiTranslateText,
@@ -14,6 +15,7 @@ import {
   type ArchivedSession,
   type Health,
   type MicHandle,
+  type OcrPage,
   type PartialMsg,
   type Utterance,
   LiveSocket,
@@ -39,7 +41,8 @@ type IconName =
   | "arrow"
   | "check"
   | "wave"
-  | "upload";
+  | "upload"
+  | "scan";
 
 function Icon({ name, size = 18, stroke = 1.8 }: { name: IconName; size?: number; stroke?: number }) {
   const common = {
@@ -75,6 +78,7 @@ function Icon({ name, size = 18, stroke = 1.8 }: { name: IconName; size?: number
     arrow: <><path d="M5 12h14" /><path d="m13 6 6 6-6 6" /></>,
     check: <path d="m5 12 4.3 4.3L19 6.8" />,
     wave: <><path d="M3 12h2l1.5-5 3 10 2.4-14L14.5 21l2.5-9H21" /></>,
+    scan: <><path d="M4 8V5.5A1.5 1.5 0 0 1 5.5 4H8M16 4h2.5A1.5 1.5 0 0 1 20 5.5V8M20 16v2.5a1.5 1.5 0 0 1-1.5 1.5H16M8 20H5.5A1.5 1.5 0 0 1 4 18.5V16" /><path d="M4 12h16" /></>,
   };
 
   return <svg {...common}>{paths[name]}</svg>;
@@ -88,6 +92,7 @@ interface Row {
   text: string;
   translations: Record<string, string>;
   timings?: { asr_ms: number; diar_ms: number; mt_ms: number; total_ms: number };
+  pending?: boolean; // true while MT still catching up in background
 }
 
 function fmtLatency(t?: Row["timings"]): string | null {
@@ -127,6 +132,21 @@ function orderedTranslations(entry: { translations: Record<string, string> }, di
   return pairs;
 }
 
+// Row translation rows = stored translations, with live token-stream text
+// overlaid on the display language (present even before stored rows exist).
+// Returns [code, text, streaming].
+function rowTranslations(
+  entry: { translations: Record<string, string> },
+  displayLang: string,
+  tokText: string | null,
+): [string, string, boolean][] {
+  const base: Record<string, string> = { ...(entry.translations || {}) };
+  if (tokText) base[displayLang] = tokText;
+  return orderedTranslations({ translations: base }, displayLang).map(
+    ([code, text]) => [code, text, !!tokText && code === displayLang] as [string, string, boolean],
+  );
+}
+
 // Archives from older builds stored a single `translation` string; normalize
 // any shape here so opening them can never blank the view.
 function archivedDict(u: { translations?: Record<string, string>; translation?: string }): Record<string, string> {
@@ -148,6 +168,7 @@ const navigation = [
   { label: "Library", icon: "clock" as IconName },
   { label: "Glossary", icon: "book" as IconName },
   { label: "Translate", icon: "translate" as IconName },
+  { label: "OCR", icon: "scan" as IconName },
 ];
 
 // Last-resort guard: a crashing view shows a recovery card, never a white screen.
@@ -221,6 +242,18 @@ export default function App() {
   // is race-free from timeouts, uploads and unload handlers alike.
   const rowsRef = useRef<Row[]>([]);
   const savedCountRef = useRef(0);
+  // latest settings mirrored for async callbacks (reconnect, watchdog)
+  const targetsRef = useRef(targets);
+  const srcChoiceRef = useRef(srcChoice);
+  const denoiseRef = useRef(denoise);
+  const termsRef = useRef(terms);
+  const micIdRef = useRef(micId);
+  const reconnectingRef = useRef(false);
+  targetsRef.current = targets;
+  srcChoiceRef.current = srcChoice;
+  denoiseRef.current = denoise;
+  termsRef.current = terms;
+  micIdRef.current = micId;
   liveRef.current = live;
   pausedRef.current = paused;
   elapsedRef.current = elapsed;
@@ -239,16 +272,34 @@ export default function App() {
     return () => window.clearInterval(t);
   }, [live, paused]);
 
-  // mic level meter pump
+  // mic level meter pump + capture watchdog + backpressure indicator
   useEffect(() => {
     if (!live) {
       setMicLevel(0);
       return;
     }
+    let restarts = 0;
     const t = window.setInterval(() => {
       const h = micRef.current;
       setMicLevel(h ? h.level() : 0);
-    }, 120);
+      if (!h || pausedRef.current) return;
+      // capture stall: frames stopped arriving -> rebuild the chain once
+      if (h.idleFor() > 3 && restarts < 2) {
+        restarts++;
+        setStatus("Mic stalled — restarting capture…");
+        void restartMic().then((ok) => {
+          if (ok) setStatus("● Listening — streaming ASR + translation.");
+        });
+        return;
+      }
+      // server can't keep up: say so instead of silently lagging
+      try {
+        const pending = socketRef.current?.pending() ?? 0;
+        if (pending > 512 * 1024) setStatus("Catching up… (server busy)");
+      } catch {
+        /* noop */
+      }
+    }, 500);
     return () => window.clearInterval(t);
   }, [live]);
 
@@ -323,10 +374,114 @@ export default function App() {
       text: u.text,
       translations: u.translations,
       timings: u.timings,
+      pending: (u as { pending?: boolean }).pending,
     };
-    rowsRef.current = [...rowsRef.current, row];
-    setRows((prev) => [...prev, row]);
+    rowsRef.current = [...rowsRef.current.filter((r) => r.id !== u.id), row];
+    // upsert by id: the server emits each segment twice (instant ASR text,
+    // then full translations) — merge, never duplicate.
+    setRows((prev) => {
+      const i = prev.findIndex((r) => r.id === u.id);
+      if (i < 0) return [...prev, row];
+      const next = prev.slice();
+      next[i] = { ...next[i], ...row };
+      return next;
+    });
     setSelectedSegment(u.id);
+  }
+
+  // (Re)open the mic for the current session. Returns false on failure.
+  // Used by start, the stall watchdog, and mid-session device switches —
+  // the WS session survives all of them (only a socket drop re-opens it).
+  async function startMicCapture(device: string | undefined): Promise<boolean> {
+    try {
+      micRef.current?.stop();
+    } catch {
+      /* noop */
+    }
+    micRef.current = null;
+    try {
+      const socket = socketRef.current;
+      const mic = await openMic(
+        device,
+        (b64) => socket?.audio(b64),
+        0.5,
+        () => {
+          // OS yanked the device mid-session: end cleanly, keep the transcript.
+          if (liveRef.current) {
+            setStatus("Microphone unplugged — session stopped, transcript kept.");
+            stopSession();
+          }
+        },
+      );
+      mic.dropNext(0.4); // swallow the open/device pop
+      micRef.current = mic;
+      return true;
+    } catch (e) {
+      setStatus("Microphone failed: " + (e as Error).message);
+      return false;
+    }
+  }
+
+  async function restartMic(): Promise<boolean> {
+    if (!liveRef.current) return false;
+    const ok = await startMicCapture(micIdRef.current);
+    if (ok) micRef.current?.dropNext(0.5);
+    return ok;
+  }
+
+  async function reconnectSocket(): Promise<void> {
+    // Unexpected socket drop mid-session: re-open against a fresh server
+    // session and keep the mic flowing (a few seconds of audio may land in
+    // the new segment — continuity beats perfection here).
+    if (!liveRef.current || reconnectingRef.current) return;
+    reconnectingRef.current = true;
+    setStatus("Connection lost — reconnecting…");
+    try {
+      const socket = new LiveSocket();
+      socketRef.current = socket;
+      await socket.connect({
+        onPartial: (p) => setPartial(p),
+        onTok: onTokHandler,
+        onUtterance: onUtteranceHandler,
+        onStatus: (s) => {
+          if (s === "listening") setStatus("● Reconnected — listening.");
+          else setStatus(s);
+        },
+        onError: (e) => setStatus("Error: " + e),
+        onClose: () => void reconnectSocket(),
+      });
+      socket.start({
+        targets: targetsRef.current,
+        srcLang: srcChoiceRef.current === "auto" ? null : srcChoiceRef.current,
+        denoise: denoiseRef.current,
+        terms: termsRef.current,
+        displayLang: displayLangRef.current,
+      });
+    } catch {
+      window.setTimeout(() => {
+        reconnectingRef.current = false;
+        if (liveRef.current) void reconnectSocket();
+      }, 3000);
+      return;
+    }
+    reconnectingRef.current = false;
+  }
+
+  function onTokHandler(t: { id: number; tgt: string; delta: string }) {
+    // live token stream for the display language only; the full
+    // translations land with the utterance event right after.
+    const want = displayLangRef.current;
+    if (t.tgt !== want) return;
+    tokAcc.current[t.id] = (tokAcc.current[t.id] ?? "") + t.delta;
+    const text = tokAcc.current[t.id];
+    setTok((cur) => (cur && cur.id === t.id ? { id: t.id, text } : { id: t.id, text }));
+  }
+
+  function onUtteranceHandler(u: Utterance) {
+    setPartial((cur) => (cur && cur.id === u.id ? null : cur));
+    delete tokAcc.current[u.id];
+    setTok((cur) => (cur && cur.id === u.id ? null : cur));
+    appendUtterance(u);
   }
 
   async function startRecording() {
@@ -337,26 +492,14 @@ export default function App() {
     try {
       await socket.connect({
         onPartial: (p) => setPartial(p),
-        onTok: (t) => {
-          // live token stream for the display language only; the full
-          // translations land with the utterance event right after.
-          const want = displayLangRef.current;
-          if (t.tgt !== want) return;
-          tokAcc.current[t.id] = (tokAcc.current[t.id] ?? "") + t.delta;
-          const text = tokAcc.current[t.id];
-          setTok((cur) => (cur && cur.id === t.id ? { id: t.id, text } : { id: t.id, text }));
-        },
-        onUtterance: (u) => {
-          setPartial((cur) => (cur && cur.id === u.id ? null : cur));
-          delete tokAcc.current[u.id];
-          setTok((cur) => (cur && cur.id === u.id ? null : cur));
-          appendUtterance(u);
-        },
+        onTok: onTokHandler,
+        onUtterance: onUtteranceHandler,
         onStatus: (s) => {
           if (s === "listening") setStatus("● Listening — streaming ASR + translation.");
           else setStatus(s);
         },
         onError: (e) => setStatus("Error: " + e),
+        onClose: () => void reconnectSocket(),
       });
     } catch (e) {
       setStatus("Could not reach backend: " + (e as Error).message);
@@ -370,16 +513,12 @@ export default function App() {
       displayLang: displayLangRef.current,
     });
     anchorRef.current = Date.now() / 1000;
-    try {
-      const mic = await openMic(micId, (b64) => socket.audio(b64));
-      micRef.current = mic;
-      setStatus(`● Recording via ${mic.label} — speak in vi / en / zh.`);
-    } catch (e) {
-      setStatus("Microphone blocked: " + (e as Error).message);
+    if (!(await startMicCapture(micId))) {
       socket.close();
       socketRef.current = null;
       return;
     }
+    setStatus(`● Recording — speak in vi / en / zh.`);
     setPartial(null);
     setPaused(false);
     setLive(true);
@@ -573,9 +712,20 @@ export default function App() {
           <GlossaryView terms={terms} onChange={setTerms} onNavigate={() => setActiveView("Live session")} />
         ) : activeView === "Translate" ? (
           <TranslateView displayLang={displayLang} terms={terms} status={status} setStatus={setStatus} />
+        ) : activeView === "OCR" ? (
+          <OcrView displayLang={displayLang} terms={terms} setStatus={setStatus} />
         ) : (
           <SettingsView
-            health={health} mics={mics} micId={micId} onMic={setMicId}
+            health={health} mics={mics} micId={micId} onMic={(id) => {
+              setMicId(id);
+              // hot-swap input mid-session: session + transcript survive
+              if (liveRef.current) {
+                setStatus("Switching microphone…");
+                void restartMic().then((ok) => {
+                  if (ok) setStatus("● Listening — streaming ASR + translation.");
+                });
+              }
+            }}
             srcChoice={srcChoice} onSrc={setSrcChoice} targets={targets} onTargets={setTargets}
             denoise={denoise} onDenoise={setDenoise} dev={dev} onDev={setDev} status={status}
             onRefresh={async () => {
@@ -618,7 +768,63 @@ function LiveSession(props: {
 }) {
   const active = props.live && !props.paused;
   const fileRef = useRef<HTMLInputElement>(null);
+  // auto-follow: stick to the newest row/partial while live; user scrolling
+  // up pauses it (jump pill re-engages). `stuck` shows the mini control bar.
+  const [follow, setFollow] = useState(true);
+  const [stuck, setStuck] = useState(false);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const ws = document.querySelector(".workspace");
+    if (!ws) return;
+    const onScroll = () => {
+      const el = ws as HTMLElement;
+      setStuck(el.scrollTop > 380);
+      if (el.scrollHeight - el.scrollTop - el.clientHeight > 160) setFollow(false);
+    };
+    ws.addEventListener("scroll", onScroll, { passive: true });
+    return () => ws.removeEventListener("scroll", onScroll);
+  }, []);
+
+  // jump on new rows / newly selected segment / partial id — not on every
+  // token delta (position is already correct then; re-scrolling janks).
+  const liveId = props.partial?.id ?? null;
+  useEffect(() => {
+    if (!follow) return;
+    bottomRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
+  }, [props.visibleRows.length, props.selectedSegment, liveId, follow]);
+
+  function jumpToLive() {
+    setFollow(true);
+    requestAnimationFrame(() => bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" }));
+  }
+
+  function pickSegment(id: number) {
+    setFollow(false); // reading history — stop pulling them back down
+    props.onSelectSegment(id);
+  }
+
+  // (re)starting a session re-engages follow — they pressed Start to watch live
+  const wasLive = useRef(props.live);
+  useEffect(() => {
+    if (props.live && !wasLive.current) jumpToLive();
+    wasLive.current = props.live;
+  }, [props.live]);
+
   return <>
+    {stuck && (
+      <div className="mini-stage" aria-label="Recording controls (compact)">
+        <i className={active ? "recording-dot" : "idle-dot"} />
+        <span className="mini-timer">{formatTime(props.elapsed)}</span>
+        <span className="mini-status">{props.status}</span>
+        <button className="mini-btn" onClick={props.onTogglePause} aria-label={active ? "Pause" : "Resume"}>
+          <Icon name={active ? "pause" : "mic"} size={14} />
+        </button>
+        <button className="mini-btn" onClick={props.onStop} aria-label="Stop recording">
+          <Icon name="stop" size={13} />
+        </button>
+      </div>
+    )}
     <section className="session-heading">
       <div>
         <div className="live-status"><i className={active ? "recording-dot" : "idle-dot"} />{active ? "Recording live" : props.live ? "Session paused" : "Session idle"}</div>
@@ -654,19 +860,29 @@ function LiveSession(props: {
     <section className="transcript-area">
       <div className="transcript-list">
         {props.visibleRows.map((entry) => (
-          <button className={`transcript-row ${props.selectedSegment === entry.id ? "selected" : ""}`} onClick={() => props.onSelectSegment(entry.id)} key={entry.id}>
+          <button className={`transcript-row ${props.selectedSegment === entry.id ? "selected" : ""}`} onClick={() => pickSegment(entry.id)} key={entry.id} data-row-id={entry.id}>
             <time>{formatTime(entry.at)}</time>
             <span className={`speaker-avatar ${AVATAR_COLORS[speakerIdx(entry.speaker) % AVATAR_COLORS.length]}`}>{speakerInitials(entry.speaker)}</span>
             <span className="entry-copy">
               <span className="speaker-line"><b>{speakerName(entry.speaker)}</b></span>
               <span className="original-text">{entry.text}</span>
-              {props.showTranslation && orderedTranslations(entry, props.displayLang).map(([code, text]) => (
-                <span className="translated-text" key={code}>
-                  <b className="tr-lang">{code}</b>
-                  {text}
-                </span>
-              ))}
-              {props.dev && fmtLatency(entry.timings) ? (
+              {props.showTranslation && rowTranslations(
+                entry, props.displayLang,
+                props.tok && props.tok.id === entry.id ? props.tok.text : null,
+              ).map(([code, text, streaming]) => {
+                if (!text && !entry.pending) return null;
+                return (
+                  <span className="translated-text" key={code}>
+                    <b className="tr-lang">{code}</b>
+                    {text}
+                    {streaming ? <span className="typing-caret inline" /> : null}
+                  </span>
+                );
+              })}
+              {entry.pending ? (
+                <span className="translating">translating…</span>
+              ) : null}
+              {props.dev && !entry.pending && fmtLatency(entry.timings) ? (
                 <span className="latency">{fmtLatency(entry.timings)}</span>
               ) : null}
             </span>
@@ -678,16 +894,16 @@ function LiveSession(props: {
             <span className="caption-pulse" />
             <div className="caption-body">
               <p>{props.partial.text}</p>
-              {props.showTranslation && props.partial.translations && orderedTranslations(
-                { translations: props.partial.translations }, props.displayLang,
-              ).map(([code, text]) => {
-                const streaming = props.tok && props.tok.id === props.partial!.id && code === props.displayLang;
-                const shown = streaming ? props.tok!.text : text;
-                if (!shown) return null;
+              {props.showTranslation && rowTranslations(
+                { translations: props.partial.translations || {} },
+                props.displayLang,
+                props.tok && props.tok.id === props.partial.id ? props.tok.text : null,
+              ).map(([code, text, streaming]) => {
+                if (!text) return null;
                 return (
                   <p className="translated-text live-tr" key={code}>
                     <b className="tr-lang">{code}</b>
-                    {shown}
+                    {text}
                     {streaming ? <span className="typing-caret inline" /> : null}
                   </p>
                 );
@@ -697,6 +913,10 @@ function LiveSession(props: {
           </div>
         )}
         {props.visibleRows.length === 0 && !props.partial && <div className="empty-search">No moments yet — press Start recording or Upload audio.</div>}
+        <div ref={bottomRef} aria-hidden="true" />
+        {!follow && props.live && (
+          <button className="jump-live" onClick={jumpToLive}>↓ Jump to live</button>
+        )}
       </div>
       <aside className="insight-panel">
         <div className="insight-heading"><span>Session</span></div>
@@ -824,20 +1044,29 @@ function GlossaryView(props: {
   </section>;
 }
 
+const EXTRA_LANGS = ["fr", "de", "ja", "ko", "es", "pt", "ru", "th", "ar", "it"];
+
 function TranslateView(props: {
   displayLang: string; terms: Record<string, string>;
   status: string; setStatus: (s: string) => void;
 }) {
   const [text, setText] = useState("");
+  const [src, setSrc] = useState("auto");
   const [tgt, setTgt] = useState(props.displayLang);
   const [out, setOut] = useState("");
   const [busy, setBusy] = useState(false);
-  async function go() {
-    if (!text.trim() || busy) return;
+  const [copiedOut, setCopiedOut] = useState(false);
+  const termCount = Object.keys(props.terms).length;
+
+  async function go(override?: { text?: string; src?: string; tgt?: string }) {
+    const t = (override?.text ?? text).trim();
+    const s = override?.src ?? src;
+    const g = override?.tgt ?? tgt;
+    if (!t || busy) return;
     setBusy(true);
     props.setStatus("Translating phrase…");
     try {
-      const r = await apiTranslateText(text.trim(), tgt, props.terms);
+      const r = await apiTranslateText(t, g, props.terms, s);
       setOut(r);
       props.setStatus("Ready.");
     } catch (e) {
@@ -846,34 +1075,348 @@ function TranslateView(props: {
       setBusy(false);
     }
   }
+
+  function swap() {
+    if (src === "auto" || !out) return;
+    const oldSrc = src;
+    setSrc(tgt);
+    setTgt(oldSrc);
+    setText(out);
+    setOut("");
+    void go({ text: out, src: tgt, tgt: oldSrc });
+  }
+
+  function copyOut() {
+    if (!out) return;
+    void navigator.clipboard?.writeText(out);
+    setCopiedOut(true);
+    window.setTimeout(() => setCopiedOut(false), 1500);
+  }
+
+  const mainLangs = ["en", "zh", "vi"];
   return <section className="secondary-view wide">
     <p className="secondary-label">Phrasebook</p>
     <h1>Type it, get it back translated.</h1>
-    <p>Same Hy-MT2 engine as the live session, with your glossary applied. Enter to translate.</p>
-    <div className="phrase-grid">
-      <textarea
-        placeholder="Type a phrase in any language…"
-        value={text}
-        rows={4}
-        onChange={(e) => setText(e.target.value)}
-        onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void go(); } }}
-      />
-      <div className="phrase-row">
-        <select value={tgt} onChange={(e) => setTgt(e.target.value)} aria-label="Target language">
-          {DISPLAY_LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
-          {["fr", "de", "ja", "ko", "es", "pt", "ru", "th", "ar", "it"].map((c) => (
-            <option key={c} value={c}>{c.toUpperCase()}</option>
-          ))}
-        </select>
-        <button onClick={() => void go()} disabled={busy || !text.trim()}>
-          {busy ? "Translating…" : "Translate"} <Icon name="arrow" size={17} />
-        </button>
+    <p>Same Hy-MT2 engine as the live session{termCount ? `, with ${termCount} glossary term${termCount === 1 ? "" : "s"} applied` : ""}. Enter to translate.</p>
+    <div className="gt-bar">
+      <div className="gt-tabs">
+        {[["auto", "Detect language"], ...mainLangs.map((c) => [c, DISPLAY_LANGS.find((l) => l.code === c)?.label ?? c])].map(([code, label]) => (
+          <button key={code} className={src === code ? "active" : ""} onClick={() => setSrc(code)}>{label}</button>
+        ))}
       </div>
-      {out ? (
-        <div className="translated-text phrase-out"><b className="tr-lang">{tgt}</b>{out}</div>
-      ) : null}
+      <button className="gt-swap" onClick={swap} disabled={src === "auto" || !out} aria-label="Swap languages" title="Swap languages">
+        <Icon name="arrow" size={16} />
+      </button>
+      <div className="gt-tabs">
+        {mainLangs.map((c) => (
+          <button key={c} className={tgt === c ? "active" : ""} onClick={() => setTgt(c)}>
+            {DISPLAY_LANGS.find((l) => l.code === c)?.label ?? c}
+          </button>
+        ))}
+        <select value={EXTRA_LANGS.includes(tgt) ? tgt : ""} onChange={(e) => { if (e.target.value) setTgt(e.target.value); }} aria-label="More languages">
+          <option value="">{EXTRA_LANGS.includes(tgt) ? tgt.toUpperCase() : "More ▾"}</option>
+          {EXTRA_LANGS.map((c) => <option key={c} value={c}>{c.toUpperCase()}</option>)}
+        </select>
+      </div>
+    </div>
+    <div className="gt-grid">
+      <div className="gt-card">
+        <textarea
+          placeholder="Type a phrase in any language…"
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void go(); } }}
+        />
+        <div className="gt-card-foot">
+          <span>{text.trim() ? `${text.trim().length} chars` : ""}</span>
+          {text ? <button className="gt-clear" onClick={() => { setText(""); setOut(""); }}>✕</button> : null}
+        </div>
+      </div>
+      <div className="gt-card result">
+        {busy ? <span className="gt-thinking">Translating…</span>
+          : out ? <p>{out}</p>
+          : <span className="gt-placeholder">Translation</span>}
+        {out && !busy ? (
+          <div className="gt-card-foot">
+            <span className="gt-terms-note">{termCount ? `glossary: ${termCount} terms` : ""}</span>
+            <button className="gt-copy" onClick={copyOut} aria-label="Copy translation">
+              {copiedOut ? <Icon name="check" size={16} /> : <Icon name="copy" size={16} />}
+            </button>
+          </div>
+        ) : null}
+      </div>
     </div>
     <div className="secondary-wave"><Icon name="wave" size={46} stroke={1.25} /></div>
+  </section>;
+}
+
+function OcrView(props: {
+  displayLang: string; terms: Record<string, string>;
+  setStatus: (s: string) => void;
+}) {
+  const [files, setFiles] = useState<File[]>([]);
+  const [task, setTask] = useState("ocr");
+  const [wantTr, setWantTr] = useState(true);
+  const [tgt, setTgt] = useState(props.displayLang);
+  const [srcLang, setSrcLang] = useState("auto");
+  const [rotate, setRotate] = useState(0);
+  const [zoom, setZoom] = useState(1);
+  const [cropMode, setCropMode] = useState(false);
+  const [crop, setCrop] = useState<[number, number, number, number] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [pages, setPages] = useState<OcrPage[]>([]);
+  const [sel, setSel] = useState(0);
+  const [selBlock, setSelBlock] = useState<number | null>(null);
+  const [tab, setTab] = useState<"text" | "regions" | "quality" | "export">("text");
+  const [trace, setTrace] = useState<string[]>([]);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const previewRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<{ x0: number; y0: number } | null>(null);
+
+  const page = pages[sel] ?? null;
+  const blocks = page?.blocks ?? [];
+  const lowConf = blocks.filter((b) => b.conf < 0.85);
+  const review = blocks.filter((b) => b.conf < 0.6);
+  const overall = pages.length
+    ? pages.reduce((a, p) => a + (p.overall_conf ?? 0), 0) / pages.length : 0;
+
+  function stamp(msg: string) {
+    const t = new Date().toTimeString().slice(0, 8);
+    setTrace((prev) => [...prev.slice(-60), `${t}  ${msg}`]);
+  }
+
+  function pick(fs: File[]) {
+    setFiles(fs);
+    setPages([]);
+    setSel(0);
+    setSelBlock(null);
+    setCrop(null);
+    if (fs.length) stamp(`Document loaded — ${fs.map((f) => f.name).join(", ")}`);
+  }
+
+  function turn(deg: number) {
+    setRotate((r) => (r + deg + 360) % 360);
+    if (crop) { setCrop(null); stamp("Crop cleared (rotation resets the crop area)"); }
+  }
+
+  async function run() {
+    if (!files.length || busy) return;
+    setBusy(true);
+    const t0 = performance.now();
+    stamp(`Run OCR — task=${task}, rotate=${rotate}°, crop=${crop ? "yes" : "no"}, translate=${wantTr ? tgt : "off"}`);
+    props.setStatus("OCR reading pages (diarizer deloaded)…");
+    try {
+      const r = await apiOcr(files, {
+        task, translateTo: wantTr ? tgt : "", src: srcLang, terms: props.terms,
+        rotate, crop,
+      });
+      setPages(r.pages);
+      setSel(0);
+      setSelBlock(null);
+      const n = r.pages.reduce((a, p) => a + (p.blocks?.length ?? 0), 0);
+      const c = r.pages.length ? r.pages.reduce((a, p) => a + (p.overall_conf ?? 0), 0) / r.pages.length : 0;
+      stamp(`OCR completed — ${r.pages.length} page(s), ${n} blocks, ${Math.round(c * 100)}% overall confidence`);
+      props.setStatus(`OCR done — ${r.pages.length} page(s), ${n} blocks.`);
+    } catch (e) {
+      stamp(`OCR failed — ${(e as Error).message}`);
+      props.setStatus("OCR failed: " + (e as Error).message);
+    } finally {
+      stamp(`Job finished in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+      setBusy(false);
+    }
+  }
+
+  function focusBlock(id: number) {
+    setSelBlock(id);
+    document.querySelector(`[data-ocrblock="${id}"]`)?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
+  // crop drag on the preview (only when unrotated, so coords stay honest)
+  function relOf(e: React.MouseEvent): [number, number] {
+    const el = previewRef.current!.getBoundingClientRect();
+    return [
+      Math.max(0, Math.min(1, (e.clientX - el.left) / el.width)),
+      Math.max(0, Math.min(1, (e.clientY - el.top) / el.height)),
+    ];
+  }
+
+  function download(name: string, text: string, mime: string) {
+    const url = URL.createObjectURL(new Blob([text], { type: mime }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(url);
+    stamp(`Exported ${name}`);
+  }
+
+  function exportTxt(): string {
+    return pages.map((p) => `=== ${p.file} · page ${p.page} ===\n${p.text ?? ""}`).join("\n\n");
+  }
+
+  return <section className="secondary-view wide ocr-scope">
+    <p className="secondary-label">Quick OCR · PP-OCR blocks + PaddleOCR-VL</p>
+    <h1>Drop a scan, get the text back.</h1>
+    <p>Images and PDFs. OCR mode switches speaker diarization off and frees its VRAM; optionally runs every block through Hy-MT2{Object.keys(props.terms).length ? " with your glossary applied" : ""}.</p>
+
+    <div className="ocr-toolbar">
+      <button className="ocr-tool" onClick={() => fileRef.current?.click()}><Icon name="plus" size={15} />Add document</button>
+      <input ref={fileRef} type="file" accept="image/*,.pdf" multiple hidden onChange={(e) => { pick(Array.from(e.target.files ?? [])); e.target.value = ""; }} />
+      <span className="ocr-sep" />
+      <button className="ocr-tool" onClick={() => turn(-90)} title="Rotate left">⟲ Rotate left</button>
+      <button className="ocr-tool" onClick={() => turn(90)} title="Rotate right">⟳ Rotate right</button>
+      <button className={`ocr-tool ${cropMode ? "on" : ""}`} disabled={rotate !== 0} title={rotate !== 0 ? "Reset rotation to 0° to crop" : "Drag a region on the preview"} onClick={() => { setCropMode((v) => !v); setCrop(null); }}>⛶ Crop</button>
+      <label className="ocr-lang"><span className="globe">🌐</span><select value={srcLang} onChange={(e) => setSrcLang(e.target.value)} aria-label="Document language">
+        <option value="auto">Auto (detect)</option>
+        <option value="en">English</option>
+        <option value="zh">Chinese</option>
+        <option value="vi">Vietnamese</option>
+      </select></label>
+      <span className="ocr-sep" />
+      <button className="ocr-tool" onClick={() => setZoom((z) => Math.max(0.5, +(z - 0.25).toFixed(2)))}>−</button>
+      <span className="ocr-zoom">{Math.round(zoom * 100)}%</span>
+      <button className="ocr-tool" onClick={() => setZoom((z) => Math.min(2.5, +(z + 0.25).toFixed(2)))}>+</button>
+      <button className="ocr-run" onClick={() => void run()} disabled={!files.length || busy}>▶ {busy ? "Reading…" : "Run OCR"}</button>
+    </div>
+
+    <div className="gt-bar">
+      <div className="gt-tabs">
+        {[["ocr", "Text"], ["table", "Table"], ["formula", "Formula"], ["chart", "Chart"]].map(([code, label]) => (
+          <button key={code} className={task === code ? "active" : ""} onClick={() => setTask(code)} title={code === "ocr" ? "Block OCR with regions + confidence" : "VLM read (text only, no regions)"}>{label}</button>
+        ))}
+      </div>
+      <label className="check inline" style={{ display: "flex", alignItems: "center", gap: 7, color: "#343d54", fontSize: 12, fontWeight: 600 }}>
+        <input type="checkbox" checked={wantTr} onChange={(e) => setWantTr(e.target.checked)} />
+        Translate with Hy-MT2
+      </label>
+      {wantTr && (
+        <div className="gt-tabs">
+          {["en", "zh", "vi"].map((c) => (
+            <button key={c} className={tgt === c ? "active" : ""} onClick={() => setTgt(c)}>
+              {DISPLAY_LANGS.find((l) => l.code === c)?.label ?? c}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+
+    <div className="ocr-grid">
+      <aside className="ocr-thumbs" aria-label="Pages">
+        {pages.length === 0 && <p className="archive-empty">Pages appear here after Run OCR.</p>}
+        {pages.map((p, i) => (
+          <button key={i} className={`ocr-thumb ${i === sel ? "on" : ""}`} onClick={() => { setSel(i); setSelBlock(null); }}>
+            {p.preview && <img src={p.preview} alt={`${p.file} p${p.page}`} />}
+            <span className="ocr-thumb-n">{p.page}</span>
+          </button>
+        ))}
+      </aside>
+
+      <div className="ocr-preview" style={{ width: `${Math.round(zoom * 100)}%` }}>
+        {!page?.preview && <div className="ocr-empty">Pick a document and Run OCR — the page renders here with region boxes.</div>}
+        {page?.preview && (
+          <div ref={previewRef} className="ocr-canvas"
+            style={{ cursor: cropMode ? "crosshair" : "default" }}
+            onMouseDown={(e) => { if (!cropMode || !previewRef.current) return; dragRef.current = { x0: relOf(e)[0], y0: relOf(e)[1] }; setCrop(null); }}
+            onMouseMove={(e) => {
+              const d = dragRef.current;
+              if (!d) return;
+              const [x, y] = relOf(e);
+              setCrop([Math.min(d.x0, x), Math.min(d.y0, y), Math.max(d.x0, x), Math.max(d.y0, y)]);
+            }}
+            onMouseUp={() => {
+              dragRef.current = null;
+              setCrop((c) => {
+                if (!c || c[2] - c[0] < 0.02 || c[3] - c[1] < 0.02) return null;
+                stamp(`Crop set — ${Math.round((c[2] - c[0]) * 100)}% × ${Math.round((c[3] - c[1]) * 100)}% of page`);
+                return c;
+              });
+            }}>
+            <img src={page.preview} alt="OCR page" style={{ transform: `rotate(${rotate}deg)` }} draggable={false} />
+            {blocks.map((b, i) => (
+              <button key={b.id} className={`ocr-box ob-${i % 5} ${selBlock === b.id ? "on" : ""}`}
+                style={{ left: `${b.box[0] * 100}%`, top: `${b.box[1] * 100}%`, width: `${(b.box[2] - b.box[0]) * 100}%`, height: `${(b.box[3] - b.box[1]) * 100}%` }}
+                onClick={() => focusBlock(b.id)} title={`Block ${b.id} · ${Math.round(b.conf * 100)}%`} />
+            ))}
+            {crop && (
+              <div className="ocr-crop" style={{ left: `${crop[0] * 100}%`, top: `${crop[1] * 100}%`, width: `${(crop[2] - crop[0]) * 100}%`, height: `${(crop[3] - crop[1]) * 100}%` }} />
+            )}
+          </div>
+        )}
+      </div>
+
+      <aside className="ocr-side">
+        <div className="ocr-tabs">
+          {(["text", "regions", "quality", "export"] as const).map((t) => (
+            <button key={t} className={tab === t ? "on" : ""} onClick={() => setTab(t)}>{t[0].toUpperCase() + t.slice(1)}</button>
+          ))}
+        </div>
+        {tab === "text" && (
+          <>
+            <div className="ocr-detected"><div><span>Detected text</span><p>Backend: {page?.backend ?? "—"}{page?.ocr_ms ? ` · ${(page.ocr_ms / 1000).toFixed(1)}s` : ""}</p></div>
+              <div className="ocr-conf">Overall confidence: <b>{pages.length ? `${Math.round(overall * 100)}%` : "—"}</b></div></div>
+            {blocks.map((b, i) => (
+              <div key={b.id} data-ocrblock={b.id} className={`ocr-block ob-bg-${i % 5} ${selBlock === b.id ? "on" : ""}`} onClick={() => setSelBlock(b.id)}>
+                <div className="ocr-block-head"><b>{b.id}</b><span className="ocr-block-conf">{Math.round(b.conf * 100)}%</span></div>
+                <p>{b.text}</p>
+                {wantTr && b.translation && <p className="ocr-block-tr"><b className="tr-lang">{tgt}</b>{b.translation}</p>}
+              </div>
+            ))}
+            {task !== "ocr" && page?.text && <div className="ocr-block"><p style={{ whiteSpace: "pre-wrap" }}>{page.text}</p></div>}
+            {!page && <p className="archive-empty">No text yet.</p>}
+            {page?.translation && <div className="ocr-block"><div className="ocr-block-head"><b>Full translation</b></div><p style={{ whiteSpace: "pre-wrap" }}>{page.translation}</p></div>}
+          </>
+        )}
+        {tab === "regions" && (
+          <>
+            <p className="archive-meta">{blocks.length} regions {task !== "ocr" ? "(VLM tasks carry no regions — switch to Text task)" : ""}</p>
+            {blocks.map((b) => (
+              <button key={b.id} className={`ocr-region ${selBlock === b.id ? "on" : ""}`} onClick={() => focusBlock(b.id)}>
+                <b>#{b.id}</b><span>[{b.box.map((v) => v.toFixed(2)).join(", ")}]</span><i>{Math.round(b.conf * 100)}%</i>
+              </button>
+            ))}
+          </>
+        )}
+        {tab === "quality" && (
+          <>
+            <div className="ocr-detected"><div><span>Quality</span><p>{blocks.length} blocks · {review.length} need review</p></div>
+              <div className="ocr-conf"><b>{pages.length ? `${Math.round(overall * 100)}%` : "—"}</b></div></div>
+            {review.length > 0 && <p className="ocr-warn">⚠ Low-confidence blocks (possible handwriting — review):</p>}
+            {lowConf.map((b) => (
+              <button key={b.id} className="ocr-region" onClick={() => focusBlock(b.id)}>
+                <b>#{b.id}</b><span className="ocr-low-text">{b.text.slice(0, 42)}</span><i>{Math.round(b.conf * 100)}%</i>
+              </button>
+            ))}
+            {lowConf.length === 0 && pages.length > 0 && <p className="archive-empty">All blocks above 85% — nothing to review.</p>}
+            {!pages.length && <p className="archive-empty">Quality stats appear after Run OCR.</p>}
+          </>
+        )}
+        {tab === "export" && (
+          <>
+            <p className="archive-meta">Downloads include all pages{wantTr ? " + translations" : ""}.</p>
+            <div className="ocr-exports">
+              <button onClick={() => download("ocr.txt", exportTxt(), "text/plain")}>Export text (.txt)</button>
+              <button onClick={() => download("ocr.json", JSON.stringify(pages.map((p) => ({ file: p.file, page: p.page, text: p.text, blocks: p.blocks, overall_conf: p.overall_conf, translation: p.translation })), null, 2), "application/json")}>Export as JSON</button>
+              <button onClick={() => download("ocr.csv", "file,page,id,text,conf\n" + pages.flatMap((p) => (p.blocks ?? []).map((b) => `${p.file},${p.page},${b.id},"${(b.text ?? "").replace(/"/g, "'")}",${b.conf}`)).join("\n"), "text/csv")}>Export as CSV</button>
+              <button onClick={() => download("ocr.md", pages.map((p) => `## ${p.file} · page ${p.page}\n\n${p.text ?? ""}${p.translation ? `\n\n> [${tgt}] ${p.translation}` : ""}`).join("\n\n"), "text/markdown")}>Export Markdown</button>
+            </div>
+          </>
+        )}
+      </aside>
+    </div>
+
+    <div className="ocr-bottom">
+      <div className="ocr-trace">
+        <div className="ocr-trace-tabs"><span className="on">OCR trace</span></div>
+        {trace.length === 0 && <p className="archive-empty">Trace appears here.</p>}
+        {trace.map((t, i) => <p key={i}>{t}</p>)}
+      </div>
+      <div className="ocr-actions">
+        <span>Action panel</span>
+        <button className="ocr-run" onClick={() => void run()} disabled={!files.length || busy}>▶ {busy ? "Reading…" : "Run OCR"}</button>
+        <button disabled={!pages.length} onClick={() => download("ocr.txt", exportTxt(), "text/plain")}>Export text</button>
+        <button disabled={!pages.length} onClick={() => { setPages([]); setFiles([]); setTrace([]); setSelBlock(null); stamp("Cleared"); }}>Clear</button>
+      </div>
+    </div>
   </section>;
 }
 

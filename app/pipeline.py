@@ -10,6 +10,7 @@ import numpy as np
 
 from .audio_io import chunk_stream
 from .diarizer import rms_dbfs
+from .langid import detect as detect_lang
 
 log = logging.getLogger("conf.pipe")
 
@@ -78,8 +79,17 @@ class ConferencePipeline:
         dia = self.diarizer.assign(pcm, t)
         if dia.get("silent"):
             return {"type": "silence", "rms_db": dia["rms_db"], "speaker": dia["speaker"]}
+        # Prefer the one-shot ORT re-decode (same text, reports backend);
+        # fall back to the streaming recognizer.
+        lang_name, text, asr_backend = None, "", "sherpa-cpu"
         try:
-            lang_name, text = self.asr.transcribe_array(pcm, sr, language=src_lang)
+            rd = getattr(self.asr, "redecode_cuda", None)
+            if callable(rd):
+                r_text, r_back = rd(pcm, sr)
+                if r_text:
+                    text, asr_backend = r_text, r_back or "ort"
+            if not text:
+                lang_name, text = self.asr.transcribe_array(pcm, sr, language=src_lang)
         except Exception as e:
             log.warning("ASR chunk failed: %s", e)
             return {"type": "error", "error": str(e), "speaker": dia["speaker"]}
@@ -87,6 +97,10 @@ class ConferencePipeline:
             return {"type": "empty", "speaker": dia["speaker"], "rms_db": dia["rms_db"]}
         detected = norm_lang_code(lang_name)
         targets = targets or list(self.cfg.get("default_targets", ["en", "zh"]))
+        # Skip MT where the target IS the detected source (a copy, not a
+        # ~3 s generate). None = unsure = translate everything.
+        lid = detect_lang(text)
+        src = lid or detected
         # Neural speaker verdict overrides the volume guess (no-op otherwise).
         speaker, diar_backend = dia["speaker"], dia.get("backend")
         try:
@@ -101,11 +115,11 @@ class ConferencePipeline:
         translations = {}
         context = self._mt_context()
         for tgt in targets:
-            if tgt == detected:
+            if tgt == detected or (lid and tgt.lower() == lid):
                 translations[tgt] = text
                 continue
             try:
-                translations[tgt] = self.mt.translate(text, tgt=tgt, src=detected,
+                translations[tgt] = self.mt.translate(text, tgt=tgt, src=src,
                                                       context=context, terms=terms)
             except Exception as e:
                 translations[tgt] = f"[MT error: {e}]"
@@ -115,10 +129,11 @@ class ConferencePipeline:
             "speaker": speaker,
             "rms_db": dia["rms_db"],
             "denoised": denoised,
-            "src_lang": detected,
+            "src_lang": src,
             "text": text,
             "translations": translations,
             "start": round(t, 2),
+            "asr_backend": asr_backend,
         }
         if diar_backend:
             entry["diar_backend"] = diar_backend

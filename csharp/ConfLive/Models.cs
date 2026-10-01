@@ -49,4 +49,5 @@ public sealed class UtteranceEvent
     public string Text { get; set; } = "";
     public System.Collections.Generic.Dictionary<string, string> Translations { get; set; } = new();
     public double Start { get; set; }
+    public bool Pending { get; set; }
 }
