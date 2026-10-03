@@ -1,0 +1,7 @@
+# Rebuilt by export_vietocr_onnx.py / downloaded (see README) — too big for git
+models/
+# Reports embed the test photos
+out/
+out_samples/
+# Real test photos stay local
+photos/
