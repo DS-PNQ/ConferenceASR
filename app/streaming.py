@@ -34,12 +34,13 @@ log = logging.getLogger("conf.stream")
 
 class StreamingSession:
     def __init__(self, cfg, asr_engine, mt_engine, diarizer, enhancer,
-                 results_queue, id_start: int = 1_000_000):
+                 results_queue, id_start: int = 1_000_000, vad=None):
         self.cfg = cfg or {}
         self.asr = asr_engine
         self.mt = mt_engine
         self.diarizer = diarizer
         self.enhancer = enhancer
+        self.vad = vad  # SileroVAD or None (None = energy-only, old behavior)
         self.results = results_queue
         self._ids = itertools.count(id_start)
 
@@ -55,6 +56,7 @@ class StreamingSession:
         self.denoise: bool | None = None
         self.terms: dict[str, str] = {}
         self.display_lang: str | None = None  # streamed + translated first
+        self.vad_min_frac = float(cfg.get("vad_min_speech_frac", 0.3))
 
         self.history: deque[str] = deque(maxlen=max(1, int(cfg.get("mt_history_turns", 3))))
         self.history_chars = int(cfg.get("mt_history_chars", 600))
@@ -65,6 +67,9 @@ class StreamingSession:
         self._n_final = 0
         self._mt_queue = None  # lazy background FIFO worker, see _submit_mt
         self._mt_thread = None
+        # SSBD drafts: (seg_id, tgt) -> last translation text. Partial_{t+1}
+        # drafts off partial_t; the final drafts off its last partial.
+        self._ssbd_drafts: dict = {}
 
     # -- setup --------------------------------------------------------------
     def configure(self, targets=None, src_lang=None, denoise=None, terms=None,
@@ -80,6 +85,12 @@ class StreamingSession:
         if self._rec is False or self._rec is None:
             raise RuntimeError("ASR unavailable for streaming")
         self._stream = self._rec.create_stream()
+        if self.vad is not None:
+            try:
+                self.vad.ensure_loaded()
+                self.vad.reset()  # fresh RNN state for the new stream
+            except Exception as e:
+                log.warning("VAD init failed (%s) — energy-only.", e)
 
     def live_update(self, targets=None, denoise=None, terms=None,
                     display_lang=None):
@@ -114,6 +125,9 @@ class StreamingSession:
         self._seg_dur = 0.0
         self._voice_dur = 0.0
         self._trailing_sil = 0.0
+        self._seg_vad_sum = 0.0  # neural speech probs (VAD-OR + junk gate)
+        self._seg_vad_n = 0
+        self._last_vad = True  # fail-open until the first VAD frame scores
         self._seg_start: float | None = None
         self._seg_speaker = "SPEAKER_01"
         self._seg_id: int | None = None
@@ -159,7 +173,20 @@ class StreamingSession:
         dur = len(x) / 16000.0
 
         dia = self.diarizer.assign(x, t)
-        silent = bool(dia.get("silent"))
+        energy_silent = bool(dia.get("silent"))
+        # Neural gate: one batched Silero forward per frame. silent when
+        # EITHER detector says silence — loud non-speech opens no segment,
+        # quiet speech holds one open. Fail-open (no VAD) = old behavior.
+        vad_speech = True
+        if self.vad is not None:
+            try:
+                vad_speech, vad_p = self.vad.frame_speech(x)
+                self._seg_vad_sum += vad_p
+                self._seg_vad_n += 1
+            except Exception:
+                vad_speech = True
+        self._last_vad = vad_speech
+        silent = energy_silent or not vad_speech
 
         if self._seg_start is None and not silent:
             self._seg_start = t
@@ -213,6 +240,8 @@ class StreamingSession:
                 and (t - self._last_tr_t) >= self.tr_interval):
             if self.mt_backlog > 0:
                 return  # finals own the MT lock — don't queue partials behind them
+            if not self._last_vad:
+                return  # current frame is non-speech — nothing worth translating
             self._last_tr_text = text  # claim now: dedupes while worker runs
             self._last_tr_t = t
             # Display language only (1 generate, not N): the full set lands
@@ -252,9 +281,23 @@ class StreamingSession:
                         translations[tgt] = text
                         continue
                     try:
-                        translations[tgt] = self.mt.translate(
-                            text, tgt=tgt, src=lid or "auto",
-                            context=self._context(), terms=self.terms or None)
+                        draft = self._ssbd_drafts.get((seg_id, tgt))
+                        ssbd = getattr(self.mt, "translate_ssbd", None)
+                        if (draft and callable(ssbd)
+                                and bool(self.cfg.get("mt_ssbd_enable", False))):
+                            with self.mt._lock:
+                                r = self.mt.translate_ssbd(
+                                    text, draft, tgt=tgt, src=lid or "auto",
+                                    context=self._context(),
+                                    terms=self.terms or None)
+                            translations[tgt] = r["text"]
+                            log.info("SSBD partial %s A/D=%d/%d path=%s",
+                                     tgt, r["accepted"], r["draft_len"], r["path"])
+                        else:
+                            translations[tgt] = self.mt.translate(
+                                text, tgt=tgt, src=lid or "auto",
+                                context=self._context(), terms=self.terms or None)
+                        self._ssbd_drafts[(seg_id, tgt)] = translations[tgt]
                     except Exception as e:
                         translations[tgt] = f"[MT error: {e}]"
                 # stale (segment finalized meanwhile)? drop, don't resurrect.
@@ -274,9 +317,14 @@ class StreamingSession:
     # -- finalize ---------------------------------------------------------------
     def _finalize(self, t: float):
         seg = np.concatenate(self._seg_audio) if self._seg_audio else np.zeros(0, np.float32)
+        vad_frac = (self._seg_vad_sum / self._seg_vad_n
+                    if self._seg_vad_n else 1.0)
         t_start = time.time()
         denoised = False
-        if self._want_denoise() and self.enhancer is not None and seg.size:
+        skip_denoise = (bool(self.cfg.get("vad_skip_denoise", False))
+                        and vad_frac >= 0.9)
+        if self._want_denoise() and self.enhancer is not None and seg.size \
+                and not skip_denoise:
             seg = self.enhancer.enhance_array(seg, 16000)
             denoised = self.enhancer.active
         # Final text: one-shot ORT re-decode when available (also lets the
@@ -344,6 +392,13 @@ class StreamingSession:
                 translations[tgt] = text
         to_translate = [t for t in self._ordered_targets()
                         if not (lid and t.lower() == lid)]
+        if self.vad is not None and vad_frac < self.vad_min_frac:
+            # Junk segment (cough, keyboard, HVAC): keep the transcript row,
+            # skip every GPU generate. VAD-OR already keeps most of these
+            # from opening segments at all; this catches the rest.
+            log.info("VAD junk skip (frac=%.2f): MT skipped for %d chars",
+                     vad_frac, len(text))
+            to_translate = []
         self.history.append(text)
         pending = {
             "id": self._seg_id, "type": "utterance", "speaker": speaker,
@@ -419,6 +474,70 @@ class StreamingSession:
                 except Exception:
                     pass
 
+    def _emit_mt_update(self, job: dict, translations: dict[str, str],
+                          pending: bool):
+        """Re-emit the utterance with translations merged so far.
+
+        Builds a fresh snapshot each time — the queue may hold several
+        emits per job and they must not alias each other.
+        """
+        t_mt = time.time()
+        base = job["base"]
+        if "base_total" not in job:
+            job["base_total"] = base.get("timings", {}).get("total_ms", 0)
+        merged = dict(base.get("translations", {}))  # LID copies, fixed
+        merged.update(translations)
+        timings = dict(base.get("timings", {}))
+        timings["mt_ms"] = int((t_mt - job["t_mt_start"]) * 1000)
+        timings["total_ms"] = job["base_total"] + timings["mt_ms"]
+        ev = dict(base)
+        ev["translations"] = merged
+        ev["pending"] = pending
+        ev["timings"] = timings
+        self.results.put(("utterance", ev))
+
+    def _stream_one_target(self, seg_id: int, text: str, tgt: str, src: str,
+                           context, terms) -> str:
+        """Token-stream a single target (tok events); return assembled text.
+
+        When SSBD is enabled and a draft exists (the segment's last partial
+        translation), the accepted prefix lands as one instant delta and only
+        the divergent suffix decodes step-by-step.
+        """
+        parts: list[str] = []
+        seq = 0
+        draft = self._ssbd_drafts.get((seg_id, tgt))
+        ssbd = getattr(self.mt, "translate_ssbd_stream", None)
+        stream = None
+        if (draft and callable(ssbd)
+                and bool(self.cfg.get("mt_ssbd_enable", False))):
+            stream = self.mt.translate_ssbd_stream(
+                text, draft, tgt=tgt, src=src, context=context, terms=terms)
+        try:
+            it = stream if stream is not None else self.mt.translate_stream(
+                text, tgt=tgt, src=src, context=context, terms=terms)
+            for delta in it:
+                if delta:
+                    parts.append(delta)
+                    self.results.put(("tok", {"id": seg_id,
+                                              "tgt": tgt, "seq": seq,
+                                              "delta": delta}))
+                    seq += 1
+        except Exception as e:
+            log.warning("streamed translate (%s) failed: %s", tgt, e)
+        if stream is not None:
+            info = getattr(self.mt, "_last_ssbd", {}) or {}
+            log.info("SSBD final %s A/D=%s/%s path=%s", tgt,
+                     info.get("accepted"), info.get("draft_len"),
+                     info.get("path"))
+        chunk = "".join(parts).strip()
+        out = chunk or self.mt.translate(
+            text, tgt=tgt, src=src, context=context, terms=terms)
+        self._ssbd_drafts.pop((seg_id, tgt), None)  # draft consumed
+        if len(self._ssbd_drafts) > 200:  # stale segments (never finalized)
+            self._ssbd_drafts.clear()
+        return out
+
     def _run_mt_job(self, job: dict):
         seg_id = job["seg_id"]
         text, src = job["text"], job["src"]
@@ -445,42 +564,28 @@ class StreamingSession:
                     chunk = "".join(parts.get(tgt, [])).strip()
                     translations[tgt] = chunk or self.mt.translate(
                         text, tgt=tgt, src=src, context=context, terms=terms)
-            else:
-                # Token-stream each target so the UI fills in live ("tok"
-                # events), then confirm with the assembled strings in the
-                # utterance event. Display language first for visible progress.
-                for tgt in job["targets"]:
-                    parts: list[str] = []
-                    seq = 0
-                    try:
-                        for delta in self.mt.translate_stream(
-                                text, tgt=tgt, src=src,
-                                context=context, terms=terms):
-                            if delta:
-                                parts.append(delta)
-                                self.results.put(("tok", {"id": seg_id,
-                                                          "tgt": tgt, "seq": seq,
-                                                          "delta": delta}))
-                                seq += 1
-                    except Exception as e:
-                        log.warning("streamed translate (%s) failed: %s", tgt, e)
-                    chunk = "".join(parts).strip()
-                    translations[tgt] = chunk or self.mt.translate(
-                        text, tgt=tgt, src=src, context=context, terms=terms)
+                self._emit_mt_update(job, translations, pending=False)
+                return
+            # Two-phase: display language streams + lands FIRST (the row users
+            # read), remaining targets follow in the same job and re-emit the
+            # utterance when done. Live latency = 1 generate, not N.
+            ordered = list(job["targets"])  # already display-first
+            phase1, phase2 = ordered[:1], ordered[1:]
+            for tgt in phase1:
+                translations[tgt] = self._stream_one_target(
+                    seg_id, text, tgt, src, context, terms)
+            self._emit_mt_update(job, translations, pending=bool(phase2))
+            for tgt in phase2:
+                translations[tgt] = self._stream_one_target(
+                    seg_id, text, tgt, src, context, terms)
+                # progressive update per deferred target (cheap put, same id)
+                self._emit_mt_update(job, translations, pending=True)
+            if phase2:
+                self._emit_mt_update(job, translations, pending=False)
         except Exception as e:
             for tgt in job["targets"]:
                 translations[tgt] = f"[MT error: {e}]"
-        t_mt = time.time()
-        base = job["base"]
-        merged = dict(base.get("translations", {}))
-        merged.update(translations)
-        base["translations"] = merged
-        base["pending"] = False
-        timings = dict(base.get("timings", {}))
-        timings["mt_ms"] = int((t_mt - job["t_mt_start"]) * 1000)
-        timings["total_ms"] = timings.get("total_ms", 0) + timings["mt_ms"]
-        base["timings"] = timings
-        self.results.put(("utterance", base))
+            self._emit_mt_update(job, translations, pending=False)
 
     def _fresh_stream(self):
         try:
@@ -504,6 +609,12 @@ class StreamingSession:
                 self._reset_segment()
         n = self._n_final
         self._n_final = 0
+        try:
+            if self.vad is not None:
+                self.vad.reset()
+        except Exception:
+            pass
+        self._ssbd_drafts.clear()
         if self._mt_queue is not None:
             deadline = time.time() + 300
             while time.time() < deadline:

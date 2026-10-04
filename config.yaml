@@ -40,6 +40,10 @@ mt_speculative: false      # prompt-lookup speculative decoding (drafter-free, e
                            # on this task, so OFF by default; auto-rule still fires for
                            # src==tgt or ASCII->English where it can only help.
 mt_lookup_tokens: 10       # max draft tokens per step
+mt_ssbd_enable: true       # Self-Speculative Biased Decoding (COLM 2026):
+                           # draft finals off the last partial translation.
+                           # Measured RTX 4060: 1.35-1.48x vs from-scratch.
+mt_ssbd_beta: 0.2          # draft bias (paper sweet spot; >=0.5 degrades quality)
 mt_history_turns: 2        # past segments fed as translation context (2 keeps
 mt_history_chars: 400      # …prefill short; history is context-only anyway)
 mt_temperature: 0.3
@@ -53,6 +57,16 @@ ocr_task: ocr                # ocr | table | formula | chart (UI overrides per j
 ocr_max_new_tokens: 1024     # page-level text budget per image
 ocr_dpi: 200                 # PDF rasterization resolution
 ocr_translate_chunk_chars: 800  # Hy-MT doc translation chunk width
+
+# ---- Voice activity (Silero VAD: https://github.com/snakers4/silero-vad) ----
+vad_enable: true             # neural speech gate in front of the diarizer;
+                             # fail-open (energy-only) when unloadable
+vad_device: auto             # auto | cuda | cpu (model is ~2 MB; either is ms-level)
+vad_threshold: 0.5           # frame mean-prob >= this = speech
+vad_min_speech_frac: 0.3     # finalized segment below this VAD fraction skips
+                             # MT entirely (cough/keyboard/HVAC rows stay untranslated)
+vad_skip_denoise: false      # also skip DeepFilterNet when VAD frac >= 0.9
+                             # (extra ms; off — denoise quality first)
 
 # ---- Voice suppression (DeepFilterNet: https://github.com/Rikorose/DeepFilterNet) ----
 noise_suppress: true       # master toggle; also flippable per-request from the UI

@@ -49,3 +49,7 @@ nemo_toolkit[asr]>=3.0
 
 # Fast language ID (vi/en/zh, ms-level) to skip same-language MT calls.
 lingua-language-detector>=2.0
+
+# Neural voice activity gate (Silero VAD, CUDA/CPU, ~2 MB). Fail-open
+# (energy-only endpointing) when missing.
+silero-vad>=5.0

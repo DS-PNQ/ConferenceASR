@@ -25,6 +25,7 @@ from .engines import make_mt_engine
 from .ocr_engine import BlockOCR, PaddleOCRVLEngine
 from .pipeline import ConferencePipeline
 from .streaming import StreamingSession
+from .vad import SileroVAD
 from .zipformer_engine import ZipformerEngine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
@@ -49,6 +50,7 @@ diarizer = make_diarizer(CFG)
 enhancer = DeepFilterNetEnhancer(CFG)
 ocr = PaddleOCRVLEngine(CFG)  # lazy: loads on first /api/ocr, never in warmup
 blockocr = BlockOCR(CFG)  # PP-OCR boxes+scores (CPU); lazy like ocr
+vad = SileroVAD(CFG)  # neural speech gate; fail-open when unavailable
 pipe = ConferencePipeline(CFG, asr, mt, diarizer, enhancer)
 # Runtime-swappable diarizer (POST /api/settings). New streaming sessions and
 # the legacy pipeline resolve through here; in-flight sessions keep theirs.
@@ -103,6 +105,7 @@ def health():
         "diarizer_status": _diarizer_status(),
         "denoise": enhancer.status(),
         "ocr": ocr.status(),
+        "vad": vad.status(),
     }
 
 
@@ -143,6 +146,10 @@ def warmup():
     asr.ensure_loaded(demo_ok=demo_ok)
     mt.ensure_loaded(demo_ok=demo_ok)
     enhancer.ensure_loaded(demo_ok=demo_ok)
+    try:
+        vad.ensure_loaded(demo_ok=demo_ok)  # preloaded: no first-frame stall
+    except Exception as e:
+        log.warning("vad warmup failed: %s", e)
     d = RUNTIME.get("diarizer", diarizer)
     ensure = getattr(d, "ensure_loaded", None)
     if callable(ensure):
@@ -438,7 +445,7 @@ async def _ws_stream_msg(ws: WebSocket, data: dict, holder: dict):
                 pass
         q: _queue.Queue = _queue.Queue()
         session = StreamingSession(CFG, asr, mt, RUNTIME.get("diarizer", diarizer),
-                                   enhancer, q)
+                                   enhancer, q, vad=vad)
         try:
             # configure() may download/load the ASR model: keep it off the
             # event loop so WS pings and other clients stay responsive.
