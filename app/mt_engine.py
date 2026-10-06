@@ -586,7 +586,7 @@ class HyMT2Engine:
                     # slice against the previous FULL decode (stable), never
                     # against a separately decoded prefix (BPE merges shift).
                     shown = self._tok.decode(prefix_ids,
-                                             skip_special_tokens=True)
+                                             skip_special_tokens=True).rstrip("\ufffd")
                     if d:
                         yield shown
                     shown_ids: list[int] = []
@@ -607,7 +607,7 @@ class HyMT2Engine:
                         shown_ids.append(nxt)
                         cur = torch.tensor([[nxt]], device=dev)
                         new_text = self._tok.decode(
-                            prefix_ids + shown_ids, skip_special_tokens=True)
+                            prefix_ids + shown_ids, skip_special_tokens=True).rstrip("\ufffd")
                         if len(new_text) > len(shown):
                             yield new_text[len(shown):]
                             shown = new_text
@@ -657,15 +657,19 @@ class HyMT2Engine:
                 gen_all: list[int] = []  # decoded cumulatively: BPE merges
                 consumed = 0  # total ids seen (prompt_len skipped once overall)
                 while True:
-                    ids = collector.take(timeout=2.0) or []
+                    ids = collector.take(timeout=2.0)
                     if ids:
                         gen_all += ids[max(0, prompt_len - consumed):]
                         consumed += len(ids)
-                        new_text = self._tok.decode(gen_all, skip_special_tokens=True)
+                        # held back: a split UTF-8 char decodes as U+FFFD until its
+                        # next byte-token lands; emitting it would skip the real char
+                        new_text = self._tok.decode(gen_all, skip_special_tokens=True).rstrip("\ufffd")
                         if len(new_text) > len(shown):
                             yield new_text[len(shown):]
                             shown = new_text
-                    if not thread.is_alive():
+                    # break only on an EMPTY take: checking is_alive() after a
+                    # non-empty one dropped ids put between take and the check
+                    elif collector._done or not thread.is_alive():
                         break
             finally:
                 thread.join(timeout=10)
@@ -746,7 +750,7 @@ class HyMT2Engine:
                     got = demux.take_any(timeout=2.0) or []
                     for row, ids in got:
                         gen_all[row] += ids
-                        new_text = self._tok.decode(gen_all[row], skip_special_tokens=True)
+                        new_text = self._tok.decode(gen_all[row], skip_special_tokens=True).rstrip("\ufffd")
                         if len(new_text) > len(shown[row]):
                             yield tgts[row], new_text[len(shown[row]):]
                             shown[row] = new_text

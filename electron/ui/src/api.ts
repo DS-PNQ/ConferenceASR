@@ -160,8 +160,14 @@ export class LiveSocket {
   private ws: WebSocket | null = null;
   private ev: WSEvents | null = null;
   private intentionalClose = false;
+  private ready = false;
+  private readyWaiters: Array<() => void> = [];
+  private stopDone: (() => void) | null = null;
 
   async connect(ev: WSEvents): Promise<void> {
+    this.close();
+    this.ready = false;
+    this.readyWaiters = [];
     this.close();
     const ws = new WebSocket(WS_URL);
     this.ws = ws;
@@ -188,10 +194,16 @@ export class LiveSocket {
       else if (t === "tok")
         ev.onTok({ id: Number(m.id), tgt: String(m.tgt), seq: Number(m.seq), delta: String(m.delta ?? "") });
       else if (t === "utterance") ev.onUtterance(m as unknown as Utterance);
-      else if (t === "stream_started") ev.onStatus("listening");
-      else if (t === "stream_stopped") ev.onStatus(`stopped (${String(m.finalized)} segments)`);
+      else if (t === "stream_started") {
+        this.markReady();
+        ev.onStatus("listening");
+      } else if (t === "stream_stopped") {
+        ev.onStatus(`stopped (${String(m.finalized)} segments)`);
+        this.stopDone?.();
+      }
     };
     ws.onclose = () => {
+      this.stopDone?.();
       if (this.ws === ws) this.ws = null;
       const cb = this.ev?.onClose;
       this.ev = null;
@@ -211,6 +223,7 @@ export class LiveSocket {
   }
 
   start(opts: { targets: string[]; srcLang: string | null; denoise: boolean; terms: Record<string, string>; displayLang: string }): void {
+    this.ready = false;
     this.send({ type: "stream_start", targets: opts.targets, src_lang: opts.srcLang, denoise: opts.denoise, terms: opts.terms, display_lang: opts.displayLang });
   }
 
@@ -224,11 +237,57 @@ export class LiveSocket {
   }
 
   audio(b64: string, sr = 16000): void {
+    // Drop frames until the server confirms stream_started: it loads the ASR
+    // model during stream_start, and anything sent earlier used to come back
+    // as "no stream open (send stream_start first)".
+    if (!this.ready) return;
     this.send({ type: "stream_audio", audio_b64: b64, sr });
   }
 
-  stop(): void {
+  /** Resolves when the server confirms stream_started (false on timeout). */
+  waitForReady(timeoutMs = 120000): Promise<boolean> {
+    if (this.ready) return Promise.resolve(true);
+    return new Promise((res) => {
+      const done = (ok: boolean) => {
+        clearTimeout(timer);
+        this.readyWaiters = this.readyWaiters.filter((w) => w !== fire);
+        res(ok);
+      };
+      const fire = () => done(true);
+      this.readyWaiters.push(fire);
+      const timer = setTimeout(() => done(this.ready), timeoutMs);
+    });
+  }
+
+  private markReady(): void {
+    this.ready = true;
+    const waiters = this.readyWaiters.splice(0);
+    for (const w of waiters) {
+      try {
+        w();
+      } catch {
+        /* noop */
+      }
+    }
+  }
+
+  /** Finalize the open segment now (pause): no frames = no endpoint. */
+  flush(): void {
+    this.send({ type: "stream_flush" });
+  }
+
+  /** Resolves on stream_stopped: the server finalizes the open segment and
+   *  drains its translations first (can take tens of seconds). */
+  stop(timeoutMs = 310000): Promise<void> { // server drains MT for up to 300 s
     this.send({ type: "stream_stop" });
+    return new Promise((res) => {
+      const timer = setTimeout(() => this.stopDone?.(), timeoutMs);
+      this.stopDone = () => {
+        clearTimeout(timer);
+        this.stopDone = null;
+        res();
+      };
+    });
   }
 
   /** Bytes queued but unsent — grows when the server can't keep up. */
@@ -428,10 +487,15 @@ export function loadArchive(): ArchivedSession[] {
 }
 
 export function saveArchive(sessions: ArchivedSession[]): void {
-  try {
-    localStorage.setItem(ARCHIVE_KEY, JSON.stringify(sessions.slice(0, 50)));
-  } catch {
-    /* quota — drop silently */
+  // Quota (~5 MB) is hit by a few hour-long sessions; the old silent drop
+  // lost the NEWEST one. Shed the oldest sessions (list is newest-first).
+  for (let n = Math.min(50, sessions.length); n > 0; n--) {
+    try {
+      localStorage.setItem(ARCHIVE_KEY, JSON.stringify(sessions.slice(0, n)));
+      return;
+    } catch {
+      /* quota — try with one fewer */
+    }
   }
 }
 

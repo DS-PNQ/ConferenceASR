@@ -162,3 +162,5 @@ button { cursor: pointer; }
 .mini-btn { width: 28px; height: 28px; display: grid; place-items: center; border: 1px solid #e1e4eb; border-radius: 6px; color: #59647a; background: #fff; }
 .mini-btn:hover { border-color: #bfc5d5; color: #262f45; }
 .jump-live { position: sticky; bottom: 16px; float: right; margin: 8px 4px 4px auto; padding: 8px 14px; border: 0; border-radius: 20px; color: #fff; background: #625fbd; font-size: 12px; font-weight: 700; box-shadow: 0 6px 16px rgba(98,95,189,.35); }
+/* hour-long sessions: skip layout/paint for off-screen transcript rows */
+.transcript-row { content-visibility: auto; contain-intrinsic-size: auto 96px; }

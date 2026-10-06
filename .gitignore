@@ -47,6 +47,8 @@ build/
 
 # --- ConfLive desktop branch (C# + Python) ---
 .venv/
+node_modules/
+**/dist/
 __pycache__/
 installer/stage/
 release/

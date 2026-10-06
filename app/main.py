@@ -144,6 +144,10 @@ def warmup():
     """Load models now (else they lazy-load on first request)."""
     demo_ok = DEMO != "false"
     asr.ensure_loaded(demo_ok=demo_ok)
+    try:
+        asr._ort().ensure_loaded()  # final re-decoder: else ~10 s on the first segment
+    except Exception as e:
+        log.warning("ORT re-decoder warmup failed: %s", e)
     mt.ensure_loaded(demo_ok=demo_ok)
     enhancer.ensure_loaded(demo_ok=demo_ok)
     try:
@@ -433,19 +437,19 @@ def export_srt():
 
 
 async def _ws_stream_msg(ws: WebSocket, data: dict, holder: dict):
-    """Streaming protocol for the C# client. holder['session'] persists."""
-    import queue as _queue
-
+    """Streaming protocol. holder['session'] persists; its events go to
+    holder['q'], which _pump_events sends on its own (not per message)."""
     kind = data.get("type")
     if kind == "stream_start":
+        holder["starting"] = True
         if holder["session"] is not None:
             try:
-                holder["session"].stop()
+                await asyncio.to_thread(holder["session"].stop)  # drains MT: off the loop
             except Exception:
                 pass
-        q: _queue.Queue = _queue.Queue()
+            holder["session"] = None
         session = StreamingSession(CFG, asr, mt, RUNTIME.get("diarizer", diarizer),
-                                   enhancer, q, vad=vad)
+                                   enhancer, holder["q"], vad=vad)
         try:
             # configure() may download/load the ASR model: keep it off the
             # event loop so WS pings and other clients stay responsive.
@@ -458,15 +462,23 @@ async def _ws_stream_msg(ws: WebSocket, data: dict, holder: dict):
                 display_lang=data.get("display_lang") or None,
             )
         except Exception as e:
+            holder["starting"] = False
             await ws.send_json({"ok": False, "error": f"stream start failed: {e}"})
             return
         holder["session"] = session
+        holder["starting"] = False
         await ws.send_json({"ok": True, "type": "stream_started",
                             "asr": asr.status(), "mt": mt.status(),
                             "diarizer": _diarizer_status()})
         return
     session = holder.get("session")
     if session is None:
+        if holder.get("starting"):
+            # stream_start is still loading models (configure runs off the
+            # event loop and can take seconds on first run). Tell the client
+            # to hold audio instead of surfacing a false "no stream open".
+            await ws.send_json({"ok": True, "type": "starting"})
+            return
         await ws.send_json({"ok": False, "error": "no stream open (send stream_start first)"})
         return
     if kind == "stream_config":
@@ -496,6 +508,8 @@ async def _ws_stream_msg(ws: WebSocket, data: dict, holder: dict):
         except Exception as e:
             await ws.send_json({"ok": False, "error": f"decode failed: {e}"})
             return
+    elif kind == "stream_flush":
+        await asyncio.to_thread(session.flush)
     elif kind == "stream_stop":
         try:
             n = await asyncio.to_thread(session.stop)
@@ -503,20 +517,33 @@ async def _ws_stream_msg(ws: WebSocket, data: dict, holder: dict):
             await ws.send_json({"ok": False, "error": f"stop failed: {e}"})
             return
         holder["session"] = None
-    # drain session events (partial / tok / utterance) without blocking
-    try:
-        while True:
-            ev_kind, payload = session.results.get_nowait()
-            if ev_kind == "partial":
-                await ws.send_json({"ok": True, "type": "partial", **payload})
-            elif ev_kind == "tok":
-                await ws.send_json({"ok": True, "type": "tok", **payload})
-            elif ev_kind == "utterance":
-                await ws.send_json({"ok": True, "type": "utterance", **payload})
-    except _queue.Empty:
-        pass
-    if kind == "stream_stop":
-        await ws.send_json({"ok": True, "type": "stream_stopped", "finalized": n})
+        # queued behind the session's last events, so it arrives after them
+        holder["q"].put(("stream_stopped", {"finalized": n}))
+
+
+async def _stream_worker(ws: WebSocket, inbox: asyncio.Queue, holder: dict):
+    """Run stream_* messages in arrival order, off the socket read loop."""
+    while True:
+        data = await inbox.get()
+        try:
+            await _ws_stream_msg(ws, data, holder)
+        except Exception as e:
+            log.warning("stream message %s failed: %s", data.get("type"), e)
+
+
+async def _pump_events(ws: WebSocket, q):
+    """Send session events as they happen. Draining only when a client
+    message arrived stalled every result while the mic was paused, and
+    held all stop-time translations until stop() returned."""
+    import queue as _queue
+
+    while True:
+        try:
+            kind, payload = q.get_nowait()
+        except _queue.Empty:
+            await asyncio.sleep(0.05)
+            continue
+        await ws.send_json({"ok": True, "type": kind, **payload})
 
 
 @app.websocket("/ws/live")
@@ -533,7 +560,15 @@ async def ws_live(ws: WebSocket):
     final translation, and ("utterance", ...) finals from the session queue.
     """
     await ws.accept()
-    holder: dict = {"session": None}
+    import queue as _queue
+
+    holder: dict = {"session": None, "starting": False, "q": _queue.Queue()}
+    pump = asyncio.create_task(_pump_events(ws, holder["q"]))
+    # The read loop must never wait on processing: a finalize blocks feed()
+    # for seconds, uvicorn's 32-message inbox fills, the client's pong sits
+    # unread and the socket dies with 1011 keepalive ping timeout (~1 min in).
+    inbox: asyncio.Queue = asyncio.Queue()
+    worker = asyncio.create_task(_stream_worker(ws, inbox, holder))
     try:
         while True:
             msg = await ws.receive_text()
@@ -546,8 +581,8 @@ async def ws_live(ws: WebSocket):
                 await ws.send_json({"ok": True, "type": "pong", "asr": asr.status()})
                 continue
             if data.get("type") in ("stream_start", "stream_audio", "stream_stop",
-                                      "stream_config"):
-                await _ws_stream_msg(ws, data, holder)
+                                      "stream_config", "stream_flush"):
+                inbox.put_nowait(data)  # ponytail: unbounded; lag shows as late rows, not a dead socket
                 continue
             try:
                 pcm, sr = decode_b64_pcm16(data.get("audio_b64", ""), data.get("sr", 16000))
@@ -581,3 +616,8 @@ async def ws_live(ws: WebSocket):
             await ws.close()
         except Exception:
             pass
+    finally:
+        pump.cancel()
+        worker.cancel()
+        if holder["session"] is not None:
+            holder["session"].close()

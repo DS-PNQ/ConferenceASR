@@ -27,7 +27,7 @@ import numpy as np
 
 log = logging.getLogger("conf.asr")
 
-DEFAULT_DIR = "D:/DENSEV2 - reading/zipformer zh-en-vi onnx phaseB s2a"
+DEFAULT_DIR = "D:/CONFERENCE ASR/zipformer zh-en-vi onnx phaseB s2a"
 TAIL_SECONDS = 0.4  # zero-pad flushes trailing words out of the streaming model
 
 

@@ -6,7 +6,7 @@ cuda_fallback_on_oom: true
 
 # ---- ASR: local Zipformer zh-en-vi ONNX (sherpa-onnx, CPU) ----
 # Folder holds encoder/decoder/joiner .onnx (fp32 + int8) + tokens.txt.
-asr_model: D:/DENSEV2 - reading/zipformer zh-en-vi onnx phaseB s2a   # or set ASR_MODEL
+asr_model: D:/CONFERENCE ASR/zipformer zh-en-vi onnx phaseB s2a   # or set ASR_MODEL
 asr_provider: cpu      # sherpa-onnx wheels are CPU-only; cuda if you build with GPU
 asr_quant: auto        # auto | int8 | fp32  (auto = int8 on cpu, fp32 on cuda)
 asr_threads: 4
@@ -46,6 +46,8 @@ mt_ssbd_enable: true       # Self-Speculative Biased Decoding (COLM 2026):
 mt_ssbd_beta: 0.2          # draft bias (paper sweet spot; >=0.5 degrades quality)
 mt_history_turns: 2        # past segments fed as translation context (2 keeps
 mt_history_chars: 400      # …prefill short; history is context-only anyway)
+mt_max_backlog: 4          # queued finals before shedding: >=4 display lang only,
+                           # >=8 skip MT (keeps hour-long sessions live, not 30 min late)
 mt_temperature: 0.3
 supported_langs: [vi, en, zh]    # app focus languages
 default_targets: [en, zh]        # checked by default in UI

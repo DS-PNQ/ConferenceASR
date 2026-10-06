@@ -31,10 +31,14 @@ from .langid import detect as detect_lang
 
 log = logging.getLogger("conf.stream")
 
+# Process-wide segment ids: clients upsert rows by id, so a second session
+# restarting at the same number would overwrite the first session's rows.
+_SEG_IDS = itertools.count(1_000_000)
+
 
 class StreamingSession:
     def __init__(self, cfg, asr_engine, mt_engine, diarizer, enhancer,
-                 results_queue, id_start: int = 1_000_000, vad=None):
+                 results_queue, vad=None):
         self.cfg = cfg or {}
         self.asr = asr_engine
         self.mt = mt_engine
@@ -42,7 +46,7 @@ class StreamingSession:
         self.enhancer = enhancer
         self.vad = vad  # SileroVAD or None (None = energy-only, old behavior)
         self.results = results_queue
-        self._ids = itertools.count(id_start)
+        self._ids = _SEG_IDS
 
         self.endpoint_silence = float(cfg.get("endpoint_silence", 1.0))
         self.min_speech = float(cfg.get("endpoint_min_speech", 0.5))
@@ -50,6 +54,10 @@ class StreamingSession:
         self.tr_interval = float(cfg.get("partial_translate_interval", 2.5))
         self.tr_min_delta = int(cfg.get("partial_min_delta", 6))
         self.tr_min_chars = int(cfg.get("partial_min_chars", 10))
+        # MT slower than speech = unbounded lag over a long meeting. Past this
+        # many queued finals: display language only; past 2x: skip MT.
+        self.max_backlog = int(cfg.get("mt_max_backlog", 4))
+        self._idle = 0.0  # silence (s) with no segment open
 
         self.targets: list[str] = list(cfg.get("default_targets", ["en", "zh"]))
         self.src_lang = None
@@ -172,6 +180,7 @@ class StreamingSession:
         t = time.time() if t is None else t
         dur = len(x) / 16000.0
 
+        t0 = time.perf_counter()
         dia = self.diarizer.assign(x, t)
         energy_silent = bool(dia.get("silent"))
         # Neural gate: one batched Silero forward per frame. silent when
@@ -186,13 +195,16 @@ class StreamingSession:
             except Exception:
                 vad_speech = True
         self._last_vad = vad_speech
+        t_vad = time.perf_counter()
         silent = energy_silent or not vad_speech
 
         if self._seg_start is None and not silent:
             self._seg_start = t
             self._seg_speaker = dia.get("speaker", "SPEAKER_01")
             self._seg_id = next(self._ids)
-        if self._seg_start is not None:
+        if self._seg_start is None:
+            self._idle = self._idle + dur if silent else 0.0
+        else:
             self._seg_audio.append(x.copy())
             self._seg_dur += dur
             if silent:
@@ -209,6 +221,7 @@ class StreamingSession:
         except Exception as e:
             log.warning("stream decode failed: %s", e)
             return
+        t_dec = time.perf_counter()
 
         if self._seg_start is not None:
             self._maybe_emit_partial(t)
@@ -217,6 +230,28 @@ class StreamingSession:
                 self._finalize(t)
             elif self._seg_dur >= self.max_segment and self._voice_dur >= self.min_speech:
                 self._finalize(t)
+            elif silent and self._trailing_sil >= self.endpoint_silence:
+                # blip shorter than min_speech, then quiet: drop it. Kept open,
+                # _seg_audio grew for as long as the room stayed silent and the
+                # next utterance re-decoded all of it.
+                self._discard_segment()
+        elif self._idle >= self.endpoint_silence:
+            # idle stream: reset so noise decoded during silence never prefixes
+            # the next segment and the recognizer state stays short.
+            self._fresh_stream()
+            self._idle = 0.0
+        t_end = time.perf_counter()
+        if t_end - t0 > 2 * dur:  # slower than realtime: say which stage
+            log.warning("slow frame %.2fs: diar+vad %.2f decode %.2f finalize/partial %.2f",
+                        t_end - t0, t_vad - t0, t_dec - t_vad, t_end - t_dec)
+
+    def _discard_segment(self):
+        if self._last_partial:  # clear the live caption in the UI
+            self.results.put(("partial", {
+                "id": self._seg_id, "speaker": self._seg_speaker, "rms_db": -80.0,
+                "text": "", "translations": None, "final": False}))
+        self._fresh_stream()
+        self._reset_segment()
 
     # -- partials ---------------------------------------------------------------
     def _maybe_emit_partial(self, t: float):
@@ -362,10 +397,11 @@ class StreamingSession:
                 except Exception:
                     text = self._last_partial
         if not text:
-            self._fresh_stream()
-            self._reset_segment()
+            self._discard_segment()
             return
         t_asr = time.time()
+        if t_asr - t_start > 3:
+            log.warning("slow finalize ASR: %.1fs for %.1fs audio", t_asr - t_start, seg.size / 16000)
         context = self._context()
         terms = self.terms or None
         # Neural speaker verdict: NeMo embedding attribution overrides the
@@ -441,6 +477,13 @@ class StreamingSession:
             self._mt_queue = _queue.Queue()
             self._mt_thread = threading.Thread(target=self._mt_loop, daemon=True)
             self._mt_thread.start()
+        backlog = self.mt_backlog
+        if targets and backlog >= 2 * self.max_backlog:
+            log.warning("MT backlog %d: skipping MT for segment %s", backlog, seg_id)
+            targets = []
+        elif len(targets) > 1 and backlog >= self.max_backlog:
+            log.warning("MT backlog %d: display language only for %s", backlog, seg_id)
+            targets = targets[:1]  # display-first order (_ordered_targets)
         if not targets:
             base["pending"] = False
             base["translations"] = dict(base.get("translations", {}))
@@ -593,10 +636,8 @@ class StreamingSession:
         except Exception as e:
             log.warning("stream reset failed: %s", e)
 
-    def stop(self) -> int:
-        """Finalize any pending speech, then wait for background MT to catch
-        up so file_done implies complete translations. Returns number of
-        finalized segments."""
+    def flush(self):
+        """Finalize the open segment now (mic paused / stopping)."""
         if self._seg_start is not None and self._voice_dur >= 0.2:
             try:
                 text = self._rec.get_result(self._stream).strip() or self._last_partial
@@ -607,6 +648,12 @@ class StreamingSession:
                 self._finalize(time.time())
             else:
                 self._reset_segment()
+
+    def stop(self) -> int:
+        """Finalize any pending speech, then wait for background MT to catch
+        up so file_done implies complete translations. Returns number of
+        finalized segments."""
+        self.flush()
         n = self._n_final
         self._n_final = 0
         try:
@@ -623,4 +670,21 @@ class StreamingSession:
                 time.sleep(0.2)
             else:
                 log.warning("MT backlog not drained in 300 s — translations may land late")
+            self._mt_queue.put(None)  # end the worker thread (one per session)
         return n
+
+    def close(self):
+        """Client gone: drop queued MT jobs and end the worker thread, so a
+        dead session never holds the MT lock against the next one."""
+        import queue as _queue
+
+        q = self._mt_queue
+        if q is None:
+            return
+        try:
+            while True:
+                q.get_nowait()
+                q.task_done()
+        except _queue.Empty:
+            pass
+        q.put(None)

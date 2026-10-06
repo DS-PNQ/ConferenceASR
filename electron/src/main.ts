@@ -1,8 +1,9 @@
 // Main process: window + Python backend lifecycle (find, CUDA-detect, spawn, reap).
-import { app, BrowserWindow, Menu } from "electron";
+import { app, BrowserWindow, Menu, powerSaveBlocker } from "electron";
 import { spawn, execFile, ChildProcess } from "child_process";
 import * as path from "path";
 import * as fs from "fs";
+import * as os from "os";
 
 const PORT = 8000;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -91,6 +92,8 @@ async function ensureBackend(): Promise<void> {
   backend.stdout?.on("data", (d) => log("[backend]", d.toString().trimEnd()));
   backend.stderr?.on("data", (d) => log("[backend:err]", d.toString().trimEnd().slice(0, 500)));
   backend.on("exit", (code) => log("backend exited:", code));
+  // live audio pipeline: don't let other foreground work starve the CPU-bound finalize
+  try { if (backend.pid) os.setPriority(backend.pid, os.constants.priority.PRIORITY_ABOVE_NORMAL); } catch { /* noop */ }
   const deadline = Date.now() + 3 * 60 * 1000;
   for (;;) {
     if (backend.exitCode !== null && backend.exitCode !== undefined) {
@@ -117,7 +120,8 @@ async function createWindow(): Promise<void> {
     title: "ConfLive",
     backgroundColor: "#F2F2F7",
     autoHideMenuBar: true,
-    webPreferences: { preload: path.join(__dirname, "preload.js") },
+    // minimized during an hour-long meeting must not throttle the mic/WS loop
+    webPreferences: { preload: path.join(__dirname, "preload.js"), backgroundThrottling: false },
   });
   win.setMenu(null);
   await win.loadFile(path.join(__dirname, "..", "ui", "dist", "index.html"));
@@ -125,6 +129,8 @@ async function createWindow(): Promise<void> {
 }
 
 app.whenReady().then(async () => {
+  // ponytail: blocks system sleep while the app is open; scope to live sessions via IPC if battery matters
+  powerSaveBlocker.start("prevent-app-suspension");
   try {
     await ensureBackend();
   } catch (e) {

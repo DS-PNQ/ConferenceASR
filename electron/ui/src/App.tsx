@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, Component, type ReactNode } from "react";
+import { memo, useEffect, useMemo, useRef, useState, Component, type ReactNode } from "react";
 import {
   apiHealth,
   apiOcr,
@@ -268,7 +268,14 @@ export default function App() {
   // session clock
   useEffect(() => {
     if (!live || paused) return;
-    const t = window.setInterval(() => setElapsed((v) => v + 1), 1000);
+    // add real elapsed time, not +1 per tick: a minimized window throttles
+    // timers and a +1 counter fell minutes behind over an hour
+    let last = Date.now();
+    const t = window.setInterval(() => {
+      const now = Date.now();
+      setElapsed((v) => v + (now - last) / 1000);
+      last = now;
+    }, 1000);
     return () => window.clearInterval(t);
   }, [live, paused]);
 
@@ -313,9 +320,10 @@ export default function App() {
         setStatus("Loading models (first run downloads weights)…");
         await apiWarmup();
         setHealth(await apiHealth());
-        setStatus("Ready — press the mic core or New session to record.");
+        // warmup can finish after Start was pressed: don't clobber "Recording"
+        if (!liveRef.current) setStatus("Ready — press the mic core or New session to record.");
       } catch {
-        setStatus("Backend unreachable — launch run.py, then reload.");
+        if (!liveRef.current) setStatus("Backend unreachable — launch run.py, then reload.");
       }
     })();
   }, []);
@@ -376,16 +384,18 @@ export default function App() {
       timings: u.timings,
       pending: (u as { pending?: boolean }).pending,
     };
-    rowsRef.current = [...rowsRef.current.filter((r) => r.id !== u.id), row];
     // upsert by id: the server emits each segment twice (instant ASR text,
-    // then full translations) — merge, never duplicate.
-    setRows((prev) => {
-      const i = prev.findIndex((r) => r.id === u.id);
-      if (i < 0) return [...prev, row];
-      const next = prev.slice();
+    // then full translations) — merge in place, never duplicate or reorder.
+    const prev = rowsRef.current;
+    const i = prev.findIndex((r) => r.id === u.id);
+    let next: Row[];
+    if (i < 0) next = [...prev, row];
+    else {
+      next = prev.slice();
       next[i] = { ...next[i], ...row };
-      return next;
-    });
+    }
+    rowsRef.current = next;
+    setRows(next);
     setSelectedSegment(u.id);
   }
 
@@ -400,16 +410,15 @@ export default function App() {
     }
     micRef.current = null;
     try {
-      const socket = socketRef.current;
       const mic = await openMic(
         device,
-        (b64) => socket?.audio(b64),
+        (b64) => socketRef.current?.audio(b64),
         0.5,
         () => {
           // OS yanked the device mid-session: end cleanly, keep the transcript.
           if (liveRef.current) {
             setStatus("Microphone unplugged — session stopped, transcript kept.");
-            stopSession();
+            void stopSession();
           }
         },
       );
@@ -512,6 +521,16 @@ export default function App() {
       terms,
       displayLang: displayLangRef.current,
     });
+    // The server loads the ASR model during stream_start (seconds on first
+    // run). Wait for stream_started before opening the mic so early audio is
+    // held back, not rejected with "no stream open".
+    setStatus("Starting models — warming up…");
+    if (!(await socket.waitForReady())) {
+      setStatus("Backend did not answer stream_start — is it still loading models? Try again.");
+      socket.close();
+      socketRef.current = null;
+      return;
+    }
     anchorRef.current = Date.now() / 1000;
     if (!(await startMicCapture(micId))) {
       socket.close();
@@ -531,6 +550,7 @@ export default function App() {
     }
     const next = !pausedRef.current;
     micRef.current?.setPaused(next);
+    if (next) socketRef.current?.flush();
     setPaused(next);
     setStatus(next ? "Paused — resume to continue the same session." : "● Listening — streaming ASR + translation.");
   }
@@ -563,32 +583,31 @@ export default function App() {
     return s;
   }
 
-  function stopSession() {
+  async function stopSession() {
     if (!liveRef.current) return;
+    liveRef.current = false; // no reconnect while the socket winds down
     try {
       micRef.current?.stop();
     } catch {
       /* noop */
     }
     micRef.current = null;
-    try {
-      socketRef.current?.stop();
-    } catch {
-      /* noop */
-    }
-    window.setTimeout(() => {
-      socketRef.current?.close();
-      socketRef.current = null;
-    }, 4000);
-    archiveDelta("Live session");
     setLive(false);
     setPaused(false);
+    setStatus("Finishing last segment and translations…");
+    // The server finalizes the open segment and drains MT before
+    // stream_stopped; closing earlier lost the tail and its translations.
+    const socket = socketRef.current;
+    await socket?.stop();
+    socket?.close();
+    if (socketRef.current === socket) socketRef.current = null;
+    archiveDelta("Live session");
     setPartial(null);
     setStatus("Stopped — session archived to Library.");
   }
 
-  function newSession() {
-    if (liveRef.current) stopSession();
+  async function newSession() {
+    if (liveRef.current) await stopSession();
     else archiveDelta("Live session");
     setRows([]);
     rowsRef.current = [];
@@ -860,34 +879,9 @@ function LiveSession(props: {
     <section className="transcript-area">
       <div className="transcript-list">
         {props.visibleRows.map((entry) => (
-          <button className={`transcript-row ${props.selectedSegment === entry.id ? "selected" : ""}`} onClick={() => pickSegment(entry.id)} key={entry.id} data-row-id={entry.id}>
-            <time>{formatTime(entry.at)}</time>
-            <span className={`speaker-avatar ${AVATAR_COLORS[speakerIdx(entry.speaker) % AVATAR_COLORS.length]}`}>{speakerInitials(entry.speaker)}</span>
-            <span className="entry-copy">
-              <span className="speaker-line"><b>{speakerName(entry.speaker)}</b></span>
-              <span className="original-text">{entry.text}</span>
-              {props.showTranslation && rowTranslations(
-                entry, props.displayLang,
-                props.tok && props.tok.id === entry.id ? props.tok.text : null,
-              ).map(([code, text, streaming]) => {
-                if (!text && !entry.pending) return null;
-                return (
-                  <span className="translated-text" key={code}>
-                    <b className="tr-lang">{code}</b>
-                    {text}
-                    {streaming ? <span className="typing-caret inline" /> : null}
-                  </span>
-                );
-              })}
-              {entry.pending ? (
-                <span className="translating">translating…</span>
-              ) : null}
-              {props.dev && !entry.pending && fmtLatency(entry.timings) ? (
-                <span className="latency">{fmtLatency(entry.timings)}</span>
-              ) : null}
-            </span>
-            <span className="row-more"><Icon name="more" size={18} /></span>
-          </button>
+          <TranscriptRow key={entry.id} entry={entry} selected={props.selectedSegment === entry.id}
+            onPick={pickSegment} showTranslation={props.showTranslation} displayLang={props.displayLang}
+            tokText={props.tok && props.tok.id === entry.id ? props.tok.text : null} dev={props.dev} />
         ))}
         {props.partial && props.partial.text && (
           <div className="live-caption">
@@ -933,6 +927,36 @@ function LiveSession(props: {
     </section>
   </>;
 }
+
+const TranscriptRow = memo(function TranscriptRow({ entry, selected, onPick, showTranslation, displayLang, tokText, dev }: {
+  entry: Row; selected: boolean; onPick: (id: number) => void; showTranslation: boolean;
+  displayLang: string; tokText: string | null; dev: boolean;
+}) {
+  return (
+    <button className={`transcript-row ${selected ? "selected" : ""}`} onClick={() => onPick(entry.id)} data-row-id={entry.id}>
+      <time>{formatTime(entry.at)}</time>
+      <span className={`speaker-avatar ${AVATAR_COLORS[speakerIdx(entry.speaker) % AVATAR_COLORS.length]}`}>{speakerInitials(entry.speaker)}</span>
+      <span className="entry-copy">
+        <span className="speaker-line"><b>{speakerName(entry.speaker)}</b></span>
+        <span className="original-text">{entry.text}</span>
+        {showTranslation && rowTranslations(entry, displayLang, tokText).map(([code, text, streaming]) => {
+          if (!text && !entry.pending) return null;
+          return (
+            <span className="translated-text" key={code}>
+              <b className="tr-lang">{code}</b>
+              {text}
+              {streaming ? <span className="typing-caret inline" /> : null}
+            </span>
+          );
+        })}
+        {entry.pending ? <span className="translating">translating…</span> : null}
+        {dev && !entry.pending && fmtLatency(entry.timings) ? <span className="latency">{fmtLatency(entry.timings)}</span> : null}
+      </span>
+      <span className="row-more"><Icon name="more" size={18} /></span>
+    </button>
+  );
+}, (a, b) => a.entry === b.entry && a.selected === b.selected && a.showTranslation === b.showTranslation
+  && a.displayLang === b.displayLang && a.tokText === b.tokText && a.dev === b.dev); // onPick: stable behavior, new identity each render
 
 function backendLabel(d: Health["diarizer_status"]): string {
   if (!d) return "volume";
