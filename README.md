@@ -26,7 +26,9 @@ volume diarization, DeepFilterNet hook):
   (~1 s/token vs ~0.3 s/token). Local = no HF dependency; FP8 = 2.5x faster.
   Switch back anytime: `MT_MODEL=tencent/Hy-MT2-1.8B-FP8` (weights still cached).
 
-- Weights load to `cuda:0` (fp16 after compressed-tensors decompress) and generate
+- Weights load to `cuda:0` as FP8, then `_dequantize_fp8` bakes them into plain fp16
+  Linears once (compressed-tensors otherwise re-dequantizes every forward: 3000 vs
+  1900 kernel launches/token, 72 vs 43 ms GPU/token; +1.4 GB VRAM). Generate
   runs there too — verified: params on `cuda:0`, SM utilization 21–43% during
   decode, ~4 tok/s batch-1 greedy. If `nvidia-smi` shows ~0% between utterances,
   that is normal: single-stream decode of a 1.8B model is latency-bound with
@@ -40,6 +42,12 @@ volume diarization, DeepFilterNet hook):
   `onnxruntime-gpu~=1.22` (1.30 wants CUDA 13; torch vendors CUDA 12) and
   **import torch before onnxruntime** so its bundled CUDA DLLs preload —
   without that ordering even a good install silently falls back to CPU.
+- Compiled MT decode (`mt_compile`): install triton-windows next to the repo, not on C:
+  `py -m pip install --target "..\pydeps" --no-deps triton-windows==3.8.0.post29`.
+  `app/__init__.py` finds `../pydeps`, points `CC` at its bundled TinyCC (an MSYS
+  gcc on PATH breaks it) and keeps compile caches in `../.triton-cache`. MEASURED:
+  9.6 -> 31.2 tok/s, first token ~65 ms; warmup compiles ~50 s cold, ~30 s cached.
+  Without triton the engine logs it and decodes eager.
 - `mt_use_cache: true` is set, though this custom modeling largely ignores it;
   per-token latency is a property of the checkpoint, not a device bug.
 

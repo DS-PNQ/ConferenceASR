@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 
 import torch
 
@@ -25,6 +26,46 @@ FULL = {
     "ar": "Arabic", "it": "Italian",
 }
 CODE_FROM_NAME = {v.lower(): k for k, v in FULL.items()}
+
+
+def _dequantize_fp8(model) -> int:
+    """Bake compressed-tensors FP8 Linears into plain fp16 nn.Linear, once.
+
+    Left as-is, every forward re-dequantizes each weight and fake-quantizes
+    its input (~3000 kernel launches per token): decode was CPU launch-bound
+    at ~3 tok/s with the GPU mostly idle. Costs ~2x weight VRAM (3.6 GB).
+    """
+    import torch.nn as nn
+
+    swaps = [(name, mod) for name, mod in model.named_modules()
+             if isinstance(mod, nn.Linear) and hasattr(mod, "weight_scale")
+             and mod.weight.dtype == torch.float8_e4m3fn]  # still-compressed only
+    for name, mod in swaps:
+        w = mod.weight.to(torch.float16) * mod.weight_scale.to(torch.float16)
+        lin = nn.Linear(mod.in_features, mod.out_features, bias=mod.bias is not None,
+                        device=w.device, dtype=torch.float16)
+        lin.weight.data.copy_(w)
+        if mod.bias is not None:
+            lin.bias.data.copy_(mod.bias.to(torch.float16))
+        parent, _, child = name.rpartition(".")
+        setattr(model.get_submodule(parent) if parent else model, child, lin)
+    if swaps:
+        log.info("FP8 -> fp16: %d Linear layers baked", len(swaps))
+        # compressed-tensors also wraps EVERY module's forward to re-send its
+        # args to the device (~1100 .to() per token, and a graph break per
+        # module under torch.compile). Weights are plain + on-device now.
+        try:
+            from compressed_tensors.offload.dispatch import remove_dispatch
+
+            remove_dispatch(model, onload_tensors=True)
+        except ImportError:
+            pass
+        # ...and its first-forward ct_decompress_hook would re-wrap all of them
+        for k, h in list(model._forward_pre_hooks.items()):
+            if getattr(getattr(h, "func", h), "__name__", "") == "ct_decompress_hook":
+                del model._forward_pre_hooks[k]
+        model.hf_quantizer = None  # no longer quantized: lets generate() compile
+    return len(swaps)
 
 
 def _ban_repeat_trigrams(logits_row, history: list[int], n: int = 3):
@@ -215,6 +256,7 @@ class HyMT2Engine:
         self._model = None
         self._mock = False
         self._last_ssbd = {"path": "-", "draft_len": 0, "accepted": 0}
+        self._static = None  # StaticCache when the decode step is compiled
 
     @property
     def loaded(self):
@@ -243,7 +285,10 @@ class HyMT2Engine:
                     # for regular (bf16/fp32) checkpoints.
                     load_kw["dtype"] = self.dtype
                 self._model = AutoModelForCausalLM.from_pretrained(self.model_id, **load_kw)
+                if quant:
+                    _dequantize_fp8(self._model)
                 self._model.eval()
+                self._enable_compile()
                 log.info("MT ready: %s", self.model_id)
             except Exception as e:
                 log.warning("MT load failed (%s): %s", self.model_id, e)
@@ -376,9 +421,40 @@ class HyMT2Engine:
             pass
         return False
 
+    def _enable_compile(self):
+        """CUDA-graph the decode step: generate() auto-compiles when handed a
+        StaticCache. One fixed-size cache = one graph. Measured RTX 4060,
+        same process: 9.6 -> 31.2 tok/s. Needs triton (triton-windows on
+        Windows, see run.py); compiles here so warmup pays the ~100 s, not
+        the first live segment."""
+        if not bool(self.cfg.get("mt_compile", True)) or self.device != "cuda":
+            return
+        try:
+            import triton  # noqa: F401
+            from transformers import StaticCache
+
+            self._static = StaticCache(
+                config=self._model.config, max_batch_size=1,
+                max_cache_len=int(self.cfg.get("mt_cache_len", 1024)),
+                device=self._model.device, dtype=self._model.dtype)
+            t0 = time.time()
+            self._translate_locked("Good morning, everyone.", "zh", None, None, False)
+            log.info("MT decode compiled in %.0f s (CUDA graphs)", time.time() - t0)
+        except Exception as e:
+            log.warning("MT compile unavailable (%s) — eager decode.", e)
+            self._static = None
+
     def _generate(self, input_ids, attn_mask, gen_kwargs: dict):
         """generate() with graceful fallback if the modeling rejects a kwarg
         (e.g. prompt_lookup on custom modeling). Retries stripped-down."""
+        static = getattr(self, "_static", None)
+        if (static is not None and input_ids.shape[0] == 1
+                and input_ids.shape[-1] + gen_kwargs.get("max_new_tokens", 128)
+                <= static.max_cache_len):
+            static.reset()  # callers hold _lock: one generate at a time
+            gen_kwargs = {k: v for k, v in gen_kwargs.items()
+                          if k not in ("prompt_lookup_num_tokens", "cache_implementation")}
+            gen_kwargs["past_key_values"] = static
         try:
             with torch.no_grad():
                 return self._model.generate(
@@ -544,7 +620,8 @@ class HyMT2Engine:
             return
             yield
         self.ensure_loaded()
-        if self._mock or not draft_text or not draft_text.strip():
+        # compiled decode (3.3x) beats SSBD's eager manual loop (1.4x)
+        if self._mock or not draft_text or not draft_text.strip() or self._static is not None:
             yield from self.translate_stream(text, tgt=tgt, src=src,
                                              context=context, terms=terms)
             return

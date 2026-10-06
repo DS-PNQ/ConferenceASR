@@ -59,7 +59,7 @@ def main():
 
     first_seen: dict[int, float] = {}
     lag: dict[int, tuple[float, float]] = {}  # id -> (t_first, lag_s)
-    counts = {"partial": 0, "tok": 0, "utterance": 0, "mt_error": 0, "untranslated": 0}
+    counts = {"partial": 0, "tok": 0, "partial_tok": 0, "utterance": 0, "mt_error": 0, "untranslated": 0}
     stop_ev = threading.Event()
 
     def consume():  # stands in for main._pump_events
@@ -69,6 +69,8 @@ def main():
             except queue.Empty:
                 continue
             counts[kind] = counts.get(kind, 0) + 1
+            if kind == "tok" and p["id"] not in first_seen:
+                counts["partial_tok"] += 1  # live caption streaming before finalize
             if kind != "utterance":
                 continue
             now = time.time()
@@ -143,6 +145,7 @@ def main():
     assert len(first_seen) > MINUTES * 1.5, "too few segments finalized"
     assert not lost, f"{len(lost)} segments never got a final event"
     assert counts["mt_error"] == 0, "MT errors in finals"
+    assert counts["partial_tok"] > 0, "partial translations never token-streamed"
     assert max_backlog <= limit + 1, f"MT backlog {max_backlog} exceeded shedding limit {limit}"
     assert late <= max(45.0, 2 * early), f"translation lag grows over time ({early:.1f}s -> {late:.1f}s)"
     assert rss_growth < 400, f"memory grows: +{rss_growth:.0f} MB"

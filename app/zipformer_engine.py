@@ -123,7 +123,8 @@ class ZipformerEngine:
 
         if not hasattr(self, "_cuda") or self._cuda is None:
             prefer = str(self.cfg.get("asr_ort_provider", "cpu")).lower() == "cuda"
-            self._cuda = CudaZipformer(str(self.model_dir), prefer_cuda=prefer)
+            self._cuda = CudaZipformer(str(self.model_dir), prefer_cuda=prefer,
+                                       threads=int(self.cfg.get("asr_ort_threads", 2)))
         return self._cuda
 
     def transcribe_final(self, pcm: np.ndarray, sr: int = 16000) -> tuple[str, str]:

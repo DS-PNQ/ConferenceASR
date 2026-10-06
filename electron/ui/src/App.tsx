@@ -476,12 +476,13 @@ export default function App() {
     reconnectingRef.current = false;
   }
 
-  function onTokHandler(t: { id: number; tgt: string; delta: string }) {
+  function onTokHandler(t: { id: number; tgt: string; seq: number; delta: string }) {
     // live token stream for the display language only; the full
     // translations land with the utterance event right after.
     const want = displayLangRef.current;
     if (t.tgt !== want) return;
-    tokAcc.current[t.id] = (tokAcc.current[t.id] ?? "") + t.delta;
+    // seq 0 = a new translation of this segment (next partial, or the final)
+    tokAcc.current[t.id] = (t.seq === 0 ? "" : tokAcc.current[t.id] ?? "") + t.delta;
     const text = tokAcc.current[t.id];
     setTok((cur) => (cur && cur.id === t.id ? { id: t.id, text } : { id: t.id, text }));
   }

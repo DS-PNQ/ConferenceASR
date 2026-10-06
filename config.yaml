@@ -11,6 +11,8 @@ asr_provider: cpu      # sherpa-onnx wheels are CPU-only; cuda if you build with
 asr_quant: auto        # auto | int8 | fp32  (auto = int8 on cpu, fp32 on cuda)
 asr_threads: 4
 asr_cuda_final: true       # kept for compat; finals now use asr_ort_provider
+asr_ort_threads: 2         # final re-decode pool. MEASURED under live MT load: default
+                           # (10) 13.4 s per 12 s segment, 2 -> 1.2 s, 4 -> 1.0-5.4 s
 asr_ort_provider: cpu      # cpu (verified: 15 s audio in ~1 s) | cuda (this
                            # int8 export crashes mid-inference on CUDA EP)
 
@@ -24,14 +26,15 @@ mt_tokenizer: tencent/Hy-MT2-1.8B-FP8  # template+vocab source (local dir has no
 mt_onnx_provider: cpu          # MEASURED: this int8 export crashes mid-inference
                                # on CUDA EP (garbage Expand dims); CPU verified clean.
                                # Set cuda to retry after an ORT/CUDA toolchain upgrade.
+mt_compile: true           # CUDA-graph the decode step (needs triton-windows in ../pydeps).
+                           # MEASURED RTX 4060 same process: 9.6 -> 31.2 tok/s. First
+                           # start compiles ~100 s at warmup (cached on disk after).
 mt_max_new_tokens: 128     # short utterances only; lower = faster (20 s speech ≈ 90 tgt toks)
 mt_do_sample: false        # false = greedy decode (fastest, deterministic)
 mt_use_cache: true         # KV-cache (repo default false = slow recompute)
-mt_kvquant: true           # KIVI/quanto quantized KV cache. MEASURED RTX 4060:
-                           # 9.2 -> 8.9 tok/s (neutral for speed — per-step fixed
-                           # costs dominate, not KV bandwidth). Kept ON because it
-                           # shrinks cache ~4x, so much longer conversations fit
-                           # in 8 GB VRAM. Needs optimum-quanto installed.
+mt_kvquant: false          # quanto KV cache. MEASURED RTX 4060 after the fp16 bake:
+                           # 12.7 vs 19.3 tok/s off — prompts are short (history is
+                           # capped), so the 4x cache saving buys nothing here.
 mt_batch: false            # batched multi-target generate. MEASURED 0.09x on this
                            # modeling (no early stop: runs all 256 steps). OFF.
 mt_speculative: false      # prompt-lookup speculative decoding (drafter-free, exact:
@@ -83,8 +86,8 @@ frame_seconds: 0.5               # mic frame size fed to the streaming recognize
 endpoint_silence: 1.0            # pause (s) that finalizes a segment — breaks at pauses, not mid-word
 endpoint_min_speech: 0.5         # ignore shorter blips
 max_segment: 20.0                # force-finalize run-on speech without pauses
-partial_translate_interval: 4.0  # min seconds between live re-translations (partials
-partial_min_delta: 12           # …share the MT lock with finals — rarer partials
+partial_translate_interval: 2.0  # min seconds between live re-translations (partials
+partial_min_delta: 8            # …share the MT lock with finals — rarer partials
 partial_min_chars: 14           # …let finals start sooner; finals carry full set)
 silence_turn_gap: 0.6            # pause (s) that marks a possible speaker turn
 max_speakers: 3

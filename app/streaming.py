@@ -316,22 +316,11 @@ class StreamingSession:
                         translations[tgt] = text
                         continue
                     try:
-                        draft = self._ssbd_drafts.get((seg_id, tgt))
-                        ssbd = getattr(self.mt, "translate_ssbd", None)
-                        if (draft and callable(ssbd)
-                                and bool(self.cfg.get("mt_ssbd_enable", False))):
-                            with self.mt._lock:
-                                r = self.mt.translate_ssbd(
-                                    text, draft, tgt=tgt, src=lid or "auto",
-                                    context=self._context(),
-                                    terms=self.terms or None)
-                            translations[tgt] = r["text"]
-                            log.info("SSBD partial %s A/D=%d/%d path=%s",
-                                     tgt, r["accepted"], r["draft_len"], r["path"])
-                        else:
-                            translations[tgt] = self.mt.translate(
-                                text, tgt=tgt, src=lid or "auto",
-                                context=self._context(), terms=self.terms or None)
+                        # token-streamed like finals (tok events, SSBD draft
+                        # off the previous partial): the caption fills live
+                        translations[tgt] = self._stream_one_target(
+                            seg_id, text, tgt, lid or "auto",
+                            self._context(), self.terms or None)
                         self._ssbd_drafts[(seg_id, tgt)] = translations[tgt]
                     except Exception as e:
                         translations[tgt] = f"[MT error: {e}]"

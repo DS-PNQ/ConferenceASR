@@ -45,8 +45,10 @@ def _torch_dll_dirs() -> list[str]:
 
 
 class CudaZipformer:
-    def __init__(self, model_dir: str, quant: str = "fp32", prefer_cuda: bool = False):
+    def __init__(self, model_dir: str, quant: str = "fp32", prefer_cuda: bool = False,
+                 threads: int = 2):
         self.model_dir = str(model_dir)
+        self.threads = threads
         self.quant = quant  # fp32 only on CUDA (int8 lacks CUDA EP kernels)
         self.prefer_cuda = prefer_cuda
         self._lock = threading.Lock()
@@ -90,6 +92,10 @@ class CudaZipformer:
                 raise CudaUnavailable(f"model files missing: {missing}")
             opts = ort.SessionOptions()
             opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            # MEASURED i7-13620H, 12 s segment while MT generates: ORT's default
+            # pool (10 spinning threads, P+E cores) took 13.4 s; 2 threads 1.2 s
+            # (4 swung 1.0-5.4 s). Leave cores for MT, streaming ASR and the OS.
+            opts.intra_op_num_threads = max(1, int(self.threads))
             # MEASURED: CUDA EP on these builds either crashes mid-inference
             # (garbage Expand dims) or falls back per-op with memcpy shuttling
             # that turns a segment into 30-40 s. CPU int8/fp32 does 15 s audio
