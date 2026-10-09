@@ -13,6 +13,8 @@ import {
   saveGlossary,
   openMic,
   type ArchivedSession,
+  type ArchivedUtterance,
+  type DiarizerMode,
   type Health,
   type MicHandle,
   type OcrPage,
@@ -42,6 +44,8 @@ type IconName =
   | "check"
   | "wave"
   | "upload"
+  | "sun"
+  | "moon"
   | "scan";
 
 function Icon({ name, size = 18, stroke = 1.8 }: { name: IconName; size?: number; stroke?: number }) {
@@ -77,6 +81,8 @@ function Icon({ name, size = 18, stroke = 1.8 }: { name: IconName; size?: number
     sliders: <><path d="M4 6h6M14 6h6M4 12h10M18 12h2M4 18h3M15 18h5" /><circle cx="12" cy="6" r="2" /><circle cx="16" cy="12" r="2" /><circle cx="9" cy="18" r="2" /></>,
     arrow: <><path d="M5 12h14" /><path d="m13 6 6 6-6 6" /></>,
     check: <path d="m5 12 4.3 4.3L19 6.8" />,
+    sun: <><circle cx="12" cy="12" r="4" /><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4" /></>,
+    moon: <path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z" />,
     wave: <><path d="M3 12h2l1.5-5 3 10 2.4-14L14.5 21l2.5-9H21" /></>,
     scan: <><path d="M4 8V5.5A1.5 1.5 0 0 1 5.5 4H8M16 4h2.5A1.5 1.5 0 0 1 20 5.5V8M20 16v2.5a1.5 1.5 0 0 1-1.5 1.5H16M8 20H5.5A1.5 1.5 0 0 1 4 18.5V16" /><path d="M4 12h16" /></>,
   };
@@ -218,6 +224,18 @@ export default function App() {
   const [terms, setTerms] = useState<Record<string, string>>(() => loadGlossary());
   const [archive, setArchive] = useState<ArchivedSession[]>(() => loadArchive());
   const [openArchived, setOpenArchived] = useState<string | null>(null);
+  // light/dark: stored choice, else follow the OS
+  const [theme, setTheme] = useState<"light" | "dark">(() => {
+    try {
+      const t = localStorage.getItem("conflive.theme");
+      if (t === "light" || t === "dark") return t;
+    } catch { /* noop */ }
+    return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  });
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try { localStorage.setItem("conflive.theme", theme); } catch { /* noop */ }
+  }, [theme]);
   // developer latency readout (per-segment ASR/MT/diar timings); on by default
   const [dev, setDev] = useState(() => {
     try {
@@ -687,7 +705,7 @@ export default function App() {
   return (
     <main className="app-shell">
       <aside className="sidebar">
-        <div className="brand-lockup"><div className="brand-mark"><Icon name="spark" size={18} stroke={1.7} /></div><span>ConfLive</span></div>
+        <div className="brand-lockup"><AppLogo /><span>ConfLive</span></div>
         <button className="new-session" onClick={newSession}><Icon name="plus" size={17} /><span>New session</span></button>
         <nav className="primary-nav" aria-label="Main navigation">
           <p className="nav-kicker">Workspace</p>
@@ -708,6 +726,7 @@ export default function App() {
           <div className="crumbs"><span>All sessions</span><b>/</b><strong>{activeView === "Live session" ? "Live transcription" : activeView}</strong></div>
           <div className="topbar-actions">
             <label className="language-select"><Icon name="translate" size={16} /><select value={displayLang} onChange={(e) => setDisplayLang(e.target.value)} aria-label="Translation language">{DISPLAY_LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}</select><Icon name="chevron" size={15} /></label>
+            <button className="icon-button theme-toggle" aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"} title={theme === "dark" ? "Light mode" : "Dark mode"} onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}><Icon key={theme} name={theme === "dark" ? "sun" : "moon"} size={17} /></button>
             <button className="icon-button" aria-label="Session settings" onClick={() => setActiveView("Settings")}><Icon name="sliders" size={18} /></button>
           </div>
         </header>
@@ -963,6 +982,7 @@ const TranscriptRow = memo(function TranscriptRow({ entry, selected, onPick, sho
 function backendLabel(d: Health["diarizer_status"]): string {
   if (!d) return "volume";
   if (d.backend === "nemo-titanet") return `NeMo Titanet${d.device ? ` (${d.device})` : ""}`;
+  if (d.backend === "nemotron") return `Nemotron streaming${d.latency_ms ? ` (${d.latency_ms} ms)` : ""}`;
   return d.backend;
 }
 
@@ -976,32 +996,68 @@ function WaveBars({ level, live }: { level: number; live: boolean }) {
   </>;
 }
 
+/** Wrap case-insensitive matches of `needle` (already lowercased) in <mark>. */
+function mark(text: string, needle: string): ReactNode {
+  if (!needle) return text;
+  const out: ReactNode[] = [];
+  const low = text.toLowerCase();
+  let i = 0;
+  for (let j = low.indexOf(needle); j >= 0; j = low.indexOf(needle, i)) {
+    out.push(text.slice(i, j), <mark key={j}>{text.slice(j, j + needle.length)}</mark>);
+    i = j + needle.length;
+  }
+  out.push(text.slice(i));
+  return out;
+}
+
+/** Same mark as electron/build/icon.png (scripts/make_icon.py), 1024 -> 100 units. */
+function AppLogo({ size = 28 }: { size?: number }) {
+  return <svg className="brand-mark" width={size} height={size} viewBox="0 0 100 100" aria-hidden="true">
+    <defs><linearGradient id="logo-g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#7C78E0" /><stop offset="1" stopColor="#1D2640" /></linearGradient></defs>
+    <rect x="4" y="4" width="92" height="92" rx="22.5" fill="url(#logo-g)" />
+    <rect x="19.5" y="23.5" width="61" height="45" rx="14.6" fill="#fff" />
+    <path d="M32.2 64.5 29.3 81 46.9 67.4Z" fill="#fff" />
+    {[9, 19.5, 29.3, 19.5, 9].map((h, i) => <rect key={i} x={32.7 + i * 8.8} y={45.9 - h / 2} width="5.3" height={h} rx="2.6" fill="#635FBD" />)}
+  </svg>;
+}
+
 function LibraryView(props: {
   archive: ArchivedSession[]; openId: string | null; onOpen: (id: string | null) => void;
   onDelete: (id: string) => void; displayLang: string; dev: boolean; onNavigate: () => void;
 }) {
+  const [q, setQ] = useState("");
+  const needle = q.trim().toLowerCase();
+  const hits = (u: ArchivedUtterance) => !needle ||
+    [u.text, u.speaker, ...Object.values(archivedDict(u))].some((s) => (s || "").toLowerCase().includes(needle));
+  const searchBox = <label className="search-box library-search">
+    <Icon name="search" size={16} />
+    <input placeholder="Search words in every session" value={q} onChange={(e) => setQ(e.target.value)} autoFocus />
+    {q ? <button className="gt-clear" onClick={() => setQ("")} aria-label="Clear search">✕</button> : null}
+  </label>;
   const open = props.archive.find((s) => s.id === props.openId) ?? null;
   if (open) {
-    return <section className="secondary-view wide">
+    const rows = open.utterances.filter(hits);
+    return <section className="secondary-view wide" key={open.id}>
       <p className="secondary-label">Archive · {open.label || "Live session"} · {new Date(open.startedAt).toLocaleString()}</p>
       <h1>{formatTime(open.seconds)} session</h1>
-      <p>{open.utterances.length} segments.</p>
+      <p>{needle ? `${rows.length} of ${open.utterances.length} segments match “${q.trim()}”.` : `${open.utterances.length} segments.`}</p>
       <div className="archive-actions">
         <button onClick={() => props.onOpen(null)}>← Back to library</button>
         <button className="danger" onClick={() => { props.onDelete(open.id); props.onOpen(null); }}>Delete session</button>
       </div>
+      {searchBox}
       <div className="transcript-list archive-list">
-        {open.utterances.map((u, i) => (
+        {rows.map((u, i) => (
           <div className="transcript-row" key={i}>
             <time>{u.time}</time>
             <span className="speaker-avatar plum">{(u.speaker || "?").replace("Speaker ", "S")}</span>
             <span className="entry-copy">
               <span className="speaker-line"><b>{u.speaker || "Speaker"}</b></span>
-              <span className="original-text">{u.text || ""}</span>
+              <span className="original-text">{mark(u.text || "", needle)}</span>
               {orderedTranslations({ translations: archivedDict(u) }, props.displayLang).map(([code, text]) => (
                 <span className="translated-text" key={code}>
                   <b className="tr-lang">{code}</b>
-                  {text}
+                  {mark(text, needle)}
                 </span>
               ))}
               {props.dev && fmtLatency(u.timings) ? (
@@ -1013,20 +1069,25 @@ function LibraryView(props: {
       </div>
     </section>;
   }
-  return <section className="secondary-view wide">
+  return <section className="secondary-view wide" key="library">
     <p className="secondary-label">Your archive</p>
     <h1>Every conversation, ready when you are.</h1>
     <p>Sessions stay on this device and are automatically organized by date and speaker.</p>
     <button onClick={props.onNavigate}>Open live session <Icon name="arrow" size={17} /></button>
+    {props.archive.length > 0 && searchBox}
     <div className="archive-list">
       {props.archive.length === 0 && <p className="archive-empty">No archived sessions yet — stop a session to save it here.</p>}
-      {props.archive.map((s) => (
-        <button className="archive-row" key={s.id} onClick={() => props.onOpen(s.id)}>
+      {props.archive.map((s) => {
+        const n = needle ? s.utterances.filter(hits).length : 0;
+        if (needle && !n && !(s.label || "").toLowerCase().includes(needle)) return null;
+        return <button className="archive-row" key={s.id} onClick={() => props.onOpen(s.id)}>
           <span className="archive-title">{s.label || "Live session"} · {new Date(s.startedAt).toLocaleString()}</span>
-          <span className="archive-meta">{s.utterances.length} segments · {formatTime(s.seconds)}</span>
+          <span className="archive-meta">{needle ? `${n} match${n === 1 ? "" : "es"} · ` : ""}{s.utterances.length} segments · {formatTime(s.seconds)}</span>
           <Icon name="arrow" size={16} />
-        </button>
-      ))}
+        </button>;
+      })}
+      {needle && props.archive.every((s) => !s.utterances.some(hits) && !(s.label || "").toLowerCase().includes(needle))
+        && <p className="archive-empty">No session mentions “{q.trim()}”.</p>}
     </div>
   </section>;
 }
@@ -1145,22 +1206,22 @@ function TranslateView(props: {
         </select>
       </div>
     </div>
-    <div className="gt-grid">
+    <div className={"gt-grid" + (text.length > 160 || out.length > 160 ? " long" : "")}>
       <div className="gt-card">
         <textarea
-          placeholder="Type a phrase in any language…"
+          placeholder="Type or paste text of any length…"
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void go(); } }}
         />
         <div className="gt-card-foot">
-          <span>{text.trim() ? `${text.trim().length} chars` : ""}</span>
+          <span>{text.trim() ? `${text.trim().split(/\s+/).length} words · ${text.trim().length} chars` : ""}</span>
           {text ? <button className="gt-clear" onClick={() => { setText(""); setOut(""); }}>✕</button> : null}
         </div>
       </div>
       <div className="gt-card result">
         {busy ? <span className="gt-thinking">Translating…</span>
-          : out ? <p>{out}</p>
+          : out ? <p key={out}>{out}</p>
           : <span className="gt-placeholder">Translation</span>}
         {out && !busy ? (
           <div className="gt-card-foot">
@@ -1311,7 +1372,7 @@ function OcrView(props: {
           <button key={code} className={task === code ? "active" : ""} onClick={() => setTask(code)} title={code === "ocr" ? "Block OCR with regions + confidence" : "VLM read (text only, no regions)"}>{label}</button>
         ))}
       </div>
-      <label className="check inline" style={{ display: "flex", alignItems: "center", gap: 7, color: "#343d54", fontSize: 12, fontWeight: 600 }}>
+      <label className="check inline" style={{ display: "flex", alignItems: "center", gap: 7, color: "var(--c343d54)", fontSize: 12, fontWeight: 600 }}>
         <input type="checkbox" checked={wantTr} onChange={(e) => setWantTr(e.target.checked)} />
         Translate with Hy-MT2
       </label>
@@ -1452,11 +1513,13 @@ function SettingsView(props: {
   targets: string[]; onTargets: (t: string[]) => void;
   denoise: boolean; onDenoise: (v: boolean) => void; status: string;
   dev: boolean; onDev: (v: boolean) => void;
-  onRefresh: () => void; onDiarizer: (m: "pyannote" | "volume" | "nemo") => void; onNavigate: () => void;
+  onRefresh: () => void; onDiarizer: (m: DiarizerMode) => void; onNavigate: () => void;
 }) {
   const h = props.health;
   const dBackend = h?.diarizer_status?.backend ?? "";
-  const diarMode = dBackend === "pyannote" || h?.diarizer === "PyannoteDiarizer" ? "pyannote"
+  // the selected class first: a Nemotron diarizer on its Titanet fallback is still "nemotron"
+  const diarMode: DiarizerMode = h?.diarizer === "NemotronDiarizer" ? "nemotron"
+    : dBackend === "pyannote" || h?.diarizer === "PyannoteDiarizer" ? "pyannote"
     : dBackend === "nemo-titanet" || h?.diarizer === "NeMoDiarizer" ? "nemo" : "volume";
   return <section className="secondary-view wide">
     <p className="secondary-label">Preferences</p>
@@ -1478,7 +1541,8 @@ function SettingsView(props: {
         </select>
       </label>
       <label>Speaker diarization
-        <select value={diarMode} onChange={(e) => props.onDiarizer(e.target.value as "pyannote" | "volume" | "nemo")}>
+        <select value={diarMode} onChange={(e) => props.onDiarizer(e.target.value as DiarizerMode)}>
+          <option value="nemotron">Nemotron streaming (switches mid-sentence)</option>
           <option value="pyannote">pyannote embeddings (GPU)</option>
           <option value="nemo">NeMo Titanet (neural)</option>
           <option value="volume">Volume levels (instant)</option>
@@ -1516,7 +1580,7 @@ function SettingsView(props: {
       <p><b>ASR:</b> {h ? `${h.asr.model} · ready=${String(h.asr.ready)}` : "…"}</p>
       <p><b>MT:</b> {h ? `${h.mt.model} · ready=${String(h.mt.ready)}` : "…"}</p>
       <p><b>Diarizer:</b> {h ? backendLabel(h.diarizer_status) : "…"}</p>
-      <p><b>Denoise:</b> {h ? `${h.denoise.backend} (Python 3.11 runtime)` : "…"}</p>
+      <p><b>Denoise:</b> {h ? (h.denoise.backend === "passthrough" ? "OFF — passthrough (deepfilternet not installed; run setup.bat with Python 3.11)" : `${h.denoise.backend} on ${h.denoise.device}`) : "…"}</p>
       <p className="status-line">{props.status}</p>
     </div>
     <div className="settings-actions">

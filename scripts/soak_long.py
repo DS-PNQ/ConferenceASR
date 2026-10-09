@@ -59,8 +59,9 @@ def main():
 
     first_seen: dict[int, float] = {}
     lag: dict[int, tuple[float, float]] = {}  # id -> (t_first, lag_s)
-    counts = {"partial": 0, "tok": 0, "partial_tok": 0, "utterance": 0, "mt_error": 0, "untranslated": 0}
+    counts = {"partial": 0, "tok": 0, "partial_tok": 0, "partial_tr": 0, "utterance": 0, "mt_error": 0, "untranslated": 0}
     stop_ev = threading.Event()
+    stage_ms: dict[str, list[int]] = {"asr_ms": [], "diar_ms": [], "mt_ms": [], "total_ms": []}
 
     def consume():  # stands in for main._pump_events
         while not stop_ev.is_set() or not q.empty():
@@ -71,6 +72,8 @@ def main():
             counts[kind] = counts.get(kind, 0) + 1
             if kind == "tok" and p["id"] not in first_seen:
                 counts["partial_tok"] += 1  # live caption streaming before finalize
+            if kind == "partial" and p.get("translations"):
+                counts["partial_tr"] += 1  # SSBD draft translations on live captions
             if kind != "utterance":
                 continue
             now = time.time()
@@ -79,6 +82,8 @@ def main():
                 lag[p["id"]] = (first_seen[p["id"]], now - first_seen[p["id"]])
                 tr = p.get("translations") or {}
                 tm = p.get("timings") or {}
+                for key in stage_ms:
+                    stage_ms[key].append(int(tm.get(key, 0)))
                 if tm.get("mt_ms", 0) > 15000 or tm.get("diar_ms", 0) > 2000 or tm.get("asr_ms", 0) > 3000:
                     print(f"  slow seg {p['id']}: {tm} src={len(p['text'])}ch "
                           f"tr={ {k: len(v) for k, v in tr.items()} }", flush=True)
@@ -138,6 +143,10 @@ def main():
     print(f"\nsegments={len(first_seen)} finals={len(lag)} lost={len(lost)} tail={n_tail}")
     print(f"events: {counts}")
     print(f"MT lag p95: first sixth {early:.1f}s, last sixth {late:.1f}s; max backlog {max_backlog}")
+    print("stage ms p50/p95 (asr = denoise + final decode): " + ", ".join(
+        f"{k[:-3]} {np.percentile(v, 50):.0f}/{np.percentile(v, 95):.0f}"
+        for k, v in stage_ms.items() if v))
+    print(f"denoise: {ctx['enhancer'].status()}")
     print(f"RSS growth after warmup: {rss_growth:+.0f} MB; thread growth {thread_growth:+d}; "
           f"max open segment {max(x[4] for x in samples):.1f}s")
 
@@ -145,7 +154,8 @@ def main():
     assert len(first_seen) > MINUTES * 1.5, "too few segments finalized"
     assert not lost, f"{len(lost)} segments never got a final event"
     assert counts["mt_error"] == 0, "MT errors in finals"
-    assert counts["partial_tok"] > 0, "partial translations never token-streamed"
+    # tok deltas only exist with mt_batch; the default path ships drafts on partials
+    assert counts["partial_tr"] > 0 or counts["partial_tok"] > 0, "live captions never got translations"
     assert max_backlog <= limit + 1, f"MT backlog {max_backlog} exceeded shedding limit {limit}"
     assert late <= max(45.0, 2 * early), f"translation lag grows over time ({early:.1f}s -> {late:.1f}s)"
     assert rss_growth < 400, f"memory grows: +{rss_growth:.0f} MB"

@@ -11,6 +11,11 @@ are finalized on *silence* (endpointing) — utterances break at pauses::
                         worker -> utterance event again with full
                         translations. ASR never waits for MT.
 
+With a streaming diarizer (Nemotron) every frame is also scored per 10 ms:
+the open row's speaker label follows it live, and a hand-over to another
+voice finalizes the words before the change as their own row (_split) instead
+of waiting for a pause.
+
 The growing sentence is re-translated while it is spoken, each run drafting
 off the previous one with Self-Speculative Biased Decoding (SSBD, COLM 2026):
 the final only verifies the last draft and decodes from the first divergence.
@@ -75,6 +80,12 @@ class StreamingSession:
 
         self._stream = None
         self._rec = None
+        # Streaming diarizer (Nemotron): sample clock shared with it, so frames
+        # and recognizer token times can be addressed by diarizer sample.
+        self._live_diar = False
+        self.split_slack = float(cfg.get("split_token_slack", 0.12))
+        self._pos_end = 0         # diarizer sample after the last fed frame
+        self._stream_s0 = None    # diarizer sample where the recognizer stream began
         self._reset_segment()
         self._n_final = 0
         self._mt_queue = None  # lazy background FIFO worker, see _submit_mt
@@ -102,6 +113,8 @@ class StreamingSession:
         if self._rec is False or self._rec is None:
             raise RuntimeError("ASR unavailable for streaming")
         self._stream = self._rec.create_stream()
+        if callable(getattr(self.diarizer, "push", None)):
+            self.diarizer.ensure_loaded()  # streaming diarizer: up before the first frame
         if self.vad is not None:
             try:
                 self.vad.ensure_loaded()
@@ -150,6 +163,7 @@ class StreamingSession:
         self._seg_vad_sum = 0.0  # neural speech probs (VAD-OR + junk gate)
         self._seg_vad_n = 0
         self._seg_start: float | None = None
+        self._seg_s0: int | None = None  # diarizer sample of the segment's first frame
         self._seg_speaker = "SPEAKER_01"
         self._seg_id: int | None = None
         self._last_partial = ""
@@ -193,6 +207,13 @@ class StreamingSession:
         dur = len(x) / 16000.0
 
         t0 = time.perf_counter()
+        push = getattr(self.diarizer, "push", None)
+        off = push(x) if callable(push) else None
+        self._live_diar = off is not None
+        if off is not None:
+            if self._stream_s0 is None:
+                self._stream_s0 = off
+            self._pos_end = off + x.size
         dia = self.diarizer.assign(x, t)
         energy_silent = bool(dia.get("silent"))
         # Neural gate: one batched Silero forward per frame. silent when
@@ -212,6 +233,7 @@ class StreamingSession:
         if self._seg_start is None and not silent:
             self._seg_start = t
             self._seg_speaker = dia.get("speaker", "SPEAKER_01")
+            self._seg_s0 = off
             self._seg_id = next(self._ids)
         if self._seg_start is None:
             self._idle = self._idle + dur if silent else 0.0
@@ -235,6 +257,8 @@ class StreamingSession:
         t_dec = time.perf_counter()
 
         if self._seg_start is not None:
+            if self._live_diar and self._seg_s0 is not None:
+                self._track_speaker(t)
             self._maybe_emit_partial(t, silent)
             if (silent and self._voice_dur >= self.min_speech
                     and self._trailing_sil >= self.endpoint_silence):
@@ -255,6 +279,60 @@ class StreamingSession:
         if t_end - t0 > 2 * dur:  # slower than realtime: say which stage
             log.warning("slow frame %.2fs: diar+vad %.2f decode %.2f finalize/partial %.2f",
                         t_end - t0, t_vad - t0, t_dec - t_vad, t_end - t_dec)
+
+    # -- streaming diarizer: live label + split at speaker change -------------
+    def _track_speaker(self, t: float):
+        info = self.diarizer.turn(self._seg_s0)
+        spk = info.get("speaker")
+        if info.get("change_at") is not None:
+            if self._split(int(info["change_at"]), info["next_speaker"], t):
+                return
+            spk = info["next_speaker"]  # nothing said before the change: relabel
+        if spk and spk != self._seg_speaker:
+            self._seg_speaker = spk
+            if self._last_partial:  # caption shows the new label now
+                self.results.put(("partial", {
+                    "id": self._seg_id, "speaker": spk, "rms_db": -80.0,
+                    "text": self._last_partial,
+                    "translations": self._drafts.get(self._seg_id), "final": False}))
+
+    def _split(self, tc: int, new_speaker: str, t: float) -> bool:
+        """Finalize the words before diarizer sample `tc` as their own row and
+        carry the audio after it into a new segment for `new_speaker`.
+        Recognizer token times decide which words fall before the cut."""
+        seg = np.concatenate(self._seg_audio) if self._seg_audio else np.zeros(0, np.float32)
+        k = tc - self._seg_s0
+        if k < 4800 or k >= seg.size or self._stream_s0 is None:  # < 0.3 s head: relabel only
+            return False
+        try:
+            r = self._rec.get_result_all(self._stream)
+            # tokens are stamped when emitted, after the audio: see split_token_slack
+            cut = (tc - self._stream_s0) / 16000.0 + self.split_slack
+            head ="".join(tok for tok, ts in zip(r.tokens, r.timestamps) if ts < cut).strip()
+        except Exception as e:
+            log.warning("speaker split: token times unavailable (%s)", e)
+            return False
+        if not head:
+            return False
+        tail = seg[k:].copy()
+        tail_start = (self._seg_start or t) + k / 16000.0
+        self._seg_audio = [seg[:k]]
+        self._trailing_sil = 0.0
+        self._finalize(t, text_override=head)  # resets the segment + recognizer stream
+        self._stream_s0 = tc
+        self._seg_start, self._seg_s0 = tail_start, tc
+        self._seg_id = next(self._ids)
+        self._seg_speaker = new_speaker
+        self._seg_audio = [tail]
+        self._seg_dur = self._voice_dur = tail.size / 16000.0
+        try:
+            self._stream.accept_waveform(16000, np.clip(tail, -1.0, 1.0))
+            while self._rec.is_ready(self._stream):
+                self._rec.decode_stream(self._stream)
+        except Exception as e:
+            log.warning("speaker split: tail decode failed (%s)", e)
+        log.info("speaker change -> %s: split at %.2fs into the segment", new_speaker, k / 16000.0)
+        return True
 
     def _discard_segment(self):
         self._seg_stop.set()
@@ -334,7 +412,9 @@ class StreamingSession:
                 "final": False}))
 
     # -- finalize ---------------------------------------------------------------
-    def _finalize(self, t: float):
+    def _finalize(self, t: float, text_override: str | None = None):
+        """text_override: the head's words when _split cuts mid-stream (the
+        recognizer result also holds the next speaker's words)."""
         self._seg_stop.set()
         seg = np.concatenate(self._seg_audio) if self._seg_audio else np.zeros(0, np.float32)
         vad_frac = (self._seg_vad_sum / self._seg_vad_n
@@ -376,6 +456,8 @@ class StreamingSession:
                 except Exception as e:
                     log.warning("enhanced re-decode failed: %s", e)
                     text = self._last_partial
+            elif text_override is not None:
+                text = text_override
             else:
                 try:
                     text = self._rec.get_result(self._stream).strip()
@@ -395,7 +477,13 @@ class StreamingSession:
         diar_backend = None
         try:
             attr = getattr(self.diarizer, "attribute_segment", None)
-            if callable(attr) and seg.size:
+            if self._live_diar and self._seg_s0 is not None:
+                # streaming diarizer already scored this audio frame by frame
+                voiced = max(1, seg.size - int(self._trailing_sil * 16000))
+                spk = self.diarizer.turn(self._seg_s0, self._seg_s0 + voiced).get("speaker")
+                if spk:
+                    speaker, diar_backend = spk, "nemotron"
+            elif callable(attr) and seg.size:
                 # trailing endpoint silence only dilutes the voice embedding
                 voiced = seg[:max(1, seg.size - int(self._trailing_sil * 16000))]
                 verdict = attr(voiced, 16000)
@@ -578,6 +666,7 @@ class StreamingSession:
             self._drafts.pop(seg_id, None)
 
     def _fresh_stream(self):
+        self._stream_s0 = self._pos_end if self._live_diar else None
         try:
             self._stream = self._rec.create_stream()
         except Exception as e:

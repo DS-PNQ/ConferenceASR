@@ -271,6 +271,9 @@ class PaddleOCRVLEngine:
                     max_new_tokens=int(self.cfg.get("ocr_max_new_tokens", 1024)),
                     do_sample=False,
                     use_cache=True,
+                    # MEASURED ocr_test/samples: vi_sign looped "00 00 …" to the
+                    # 1024-token cap (22 s); 8 stops it (1 s), en/zh unchanged
+                    no_repeat_ngram_size=8,
                 )
             gen = out[0][prompt_len:]
             return self._proc.decode(gen, skip_special_tokens=True).strip()

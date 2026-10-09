@@ -27,8 +27,17 @@ import numpy as np
 
 log = logging.getLogger("conf.asr")
 
-DEFAULT_DIR = "D:/CONFERENCE ASR/zipformer zh-en-vi onnx phaseB s2a"
-TAIL_SECONDS = 0.4  # zero-pad flushes trailing words out of the streaming model
+DEFAULT_DIR = "D:/CONFERENCE ASR/zipformer zh-en-vi onnx phaseB 2e"
+TAIL_SECONDS = 0.66  # zero-pad flushes the last chunk (model card: 32 frames + 7 look-ahead)
+
+
+def model_file(d, part: str, int8: bool = False) -> str:
+    """The one `<part>-<tag>[.int8].onnx` in d, whatever the tag (s2a, 2e, ...)."""
+    hits = [p for p in Path(d).glob(f"{part}-*.onnx") if p.name.endswith(".int8.onnx") == int8]
+    if len(hits) != 1:
+        raise FileNotFoundError(f"need one {part}-*{'.int8' if int8 else ''}.onnx in {d}, "
+                                f"found {[p.name for p in hits]}")
+    return str(hits[0])
 
 
 class ZipformerEngine:
@@ -37,6 +46,8 @@ class ZipformerEngine:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.model_dir = Path(os.getenv("ASR_MODEL", cfg.get("asr_model", DEFAULT_DIR)))
+        if not self.model_dir.is_dir():  # other machines: scripts/download_models.py puts it here
+            self.model_dir = Path(__file__).resolve().parent.parent / "models" / "zipformer-2e"
         self.provider: str = str(cfg.get("asr_provider", "cpu")).lower()
         quant = str(cfg.get("asr_quant", "auto")).lower()
         # int8 encoder is ~2x smaller/faster on CPU; fp32 for CUDA builds
@@ -51,17 +62,15 @@ class ZipformerEngine:
         return self._rec is not None
 
     def _paths(self) -> dict:
-        q = "" if self.quant == "fp32" else ".int8"
-        files = {
-            "encoder": self.model_dir / f"encoder-phaseB_s2a{q}.onnx",
-            "decoder": self.model_dir / f"decoder-phaseB_s2a{q}.onnx",
-            "joiner": self.model_dir / f"joiner-phaseB_s2a{q}.onnx",
-            "tokens": self.model_dir / "tokens.txt",
-        }
-        missing = [str(p) for p in files.values() if not p.is_file()]
-        if missing:
-            raise FileNotFoundError(f"Zipformer model files missing: {missing}")
-        return {k: str(v) for k, v in files.items()}
+        q = self.quant == "int8"
+        tokens = self.model_dir / "tokens.txt"
+        if not tokens.is_file():
+            raise FileNotFoundError(f"Zipformer tokens missing: {tokens}")
+        # int8 = int8 encoder + joiner with the fp32 decoder (model card setup)
+        return {"encoder": model_file(self.model_dir, "encoder", q),
+                "decoder": model_file(self.model_dir, "decoder"),
+                "joiner": model_file(self.model_dir, "joiner", q),
+                "tokens": str(tokens)}
 
     def ensure_loaded(self, demo_ok: bool = True):
         if self._rec is not None:

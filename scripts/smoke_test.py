@@ -1,7 +1,7 @@
 """Smoke test with NO model weights: exercises device, denoiser, diarizer, pipeline (mock), API routes."""
 import numpy as np
 
-from app.diarizer import VolumeDiarizer, rms_dbfs
+from app.diarizer import NemotronDiarizer, VolumeDiarizer, rms_dbfs
 from app.device import device_report, resolve_device, resolve_dtype
 from app.enhancer import DeepFilterNetEnhancer, _resample
 from app.pipeline import ConferencePipeline
@@ -37,6 +37,22 @@ def main():
     dia = VolumeDiarizer(max_speakers=2)
     print("diar loud:", dia.assign(loud, t=0.0))
     print("diar quiet:", dia.assign(quiet, t=2.0))
+
+    # Nemotron hand-over logic on fake 10 ms scores (no sidecar, no weights):
+    # A 1 s -> B alone 1 s splits at B's start; B talking over A never splits.
+    nd = NemotronDiarizer({"diar_split_min": 0.4})
+    a, b, both = np.array([.9, .1]), np.array([.1, .9]), np.array([.9, .8])
+    nd._preds.append((0, np.stack([a] * 100 + [b] * 100).astype(np.float32)))
+    v = nd.turn(0)
+    assert (v["speaker"], v["change_at"], v["next_speaker"]) == ("SPEAKER_01", 100 * 160, "SPEAKER_02"), v
+    nd.reset()
+    nd._preds.append((0, np.stack([a] * 100 + [both] * 100).astype(np.float32)))
+    assert nd.turn(0)["change_at"] is None
+    nd.reset()  # 0.2 s of A (< diar_split_min) then B: relabel, no split
+    nd._preds.append((0, np.stack([a] * 20 + [b] * 100).astype(np.float32)))
+    v = nd.turn(0)
+    assert v["change_at"] is None and v["speaker"] == "SPEAKER_02", v
+    print("nemotron turn(): split / overlap / short-head OK")
 
     # DeepFilterNet enhancer: resample round-trip is shape-preserving;
     # without the package/weights it must pass audio through untouched.

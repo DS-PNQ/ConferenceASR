@@ -4,7 +4,7 @@ Record a conference in **Vietnamese · English · Chinese** and watch it appear 
 like a chat app: speaker-labelled bubbles, live transcription, side-by-side translations.
 
 Two frontends, one Python inference backend (`run.py`: Zipformer ASR, Hy-MT2 FP8 MT,
-volume diarization, DeepFilterNet hook):
+streaming Nemotron diarization, DeepFilterNet hook):
 
 - **Electron + TypeScript app** (`electron/`, primary): `npm run build && npx electron .`.
   Finds `run.py`, picks CUDA/CPU itself, streams mic over `/ws/live` with live
@@ -54,13 +54,22 @@ volume diarization, DeepFilterNet hook):
 | Module | Model (default) | Source |
 |---|---|---|
 | Denoise | `DeepFilterNet3` (auto-download, Python 3.11 runtime) | https://github.com/Rikorose/DeepFilterNet |
-| ASR | Zipformer zh-en-vi ONNX, `phaseB_s2a` (CPU int8 partials + ORT CPU finals) | `D:\DENSEV2 - reading\zipformer zh-en-vi onnx phaseB s2a` |
+| ASR | Zipformer zh-en-vi ONNX, stage 2e (CPU int8 partials) | https://huggingface.co/lmcu000/sherpa-onnx-streaming-zipformer-zh-en-vi-2e |
 | Translation | `tencent/Hy-MT2-1.8B-FP8` (compressed-tensors, CUDA) | https://huggingface.co/collections/tencent/hy-mt2 |
-| Diarization | NeMo Titanet direct-forward on CUDA (pyannote → volume fallback chain) | https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/asr/speaker_diarization/intro.html |
+| Diarization | `nvidia/Nemotron-3-Diarization` streaming, 0.32 s, local + offline (→ NeMo Titanet → volume fallback chain) | https://huggingface.co/nvidia/Nemotron-3-Diarization |
 
 UI is a native desktop window (neutral tones + AI-purple `#7C3AED`):
 sidebar controls + chat-style transcript feed with live partials, token-streamed
 translations, speaker colours, volume meter, and TXT/SRT export. No browser needed.
+
+## 0. Quick start for testers
+
+Install **Python 3.11** (needed for DeepFilterNet denoise) and **Node.js LTS**, then
+double-click **`ConfLive.bat`**. The first run creates `.venv`, installs torch (CUDA if
+`nvidia-smi` exists, else CPU) + requirements + deepfilternet, downloads the models
+(ASR → `models/zipformer-2e`, Hy-MT2, DeepFilterNet3, Nemotron diarizer →
+`models/nemotron-3-diarization`, Titanet), installs the diarizer's `..\diardeps`, builds the UI and opens
+the app. Later runs just launch. A failed step is retried on the next run.
 
 ## 1. Setup (Python 3.12, RTX 4060 / CPU)
 
@@ -71,6 +80,7 @@ C:\Users\Asus\AppData\Local\Programs\Python\Python312\python.exe -m venv .venv
 pip install --upgrade pip
 pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu126   # or .../cpu for CPU-only
 pip install -r requirements.txt
+pip install --no-deps rapidocr_onnxruntime   # OCR blocks; its `onnxruntime` dep would clobber onnxruntime-gpu
 ```
 
 > Python version note: `deepfilternet` bundles prebuilt wheels for Python
@@ -85,9 +95,16 @@ pip install -r requirements.txt
 > are fetched automatically by `init_df()` on first warmup (see
 > `scripts/download_models.py`) — nothing to download by hand.
 
+Speaker diarization (default `diarizer: nemotron`, see §5): transformers 5.19 in its own
+folder for the sidecar, then the model once into a local folder:
+```powershell
+py -3 -m pip install --no-deps --target ..\diardeps "transformers==5.19.0" "huggingface_hub>=1.31,<2" "tokenizers>=0.23.1,<0.24"
+python scripts/download_models.py   # -> models/nemotron-3-diarization (or set nemotron_model to a local dir)
+```
+
 Optional (extra):
 ```powershell
-pip install "nemo_toolkit[asr]"                                   # only if diarizer: nemo
+pip install "nemo_toolkit[asr]"                                   # Titanet: diarizer: nemo, and Nemotron's fallback
 ```
 
 ## 2. Run (desktop app)
@@ -154,9 +171,11 @@ In the window (React redesign: Live session / Library / Glossary / Translate + S
   applied. Glossary terms are injected original + UPPER + lower with a MUST
   instruction, because our ASR emits UPPERCASE English while users type
   lowercase (verified: `standup → 站会` lands on `STANDUP` input).
-- Settings: mic picker (hot-swappable mid-session), source language, **target
+- Settings: mic picker (hot-swappable mid-session; its last entry, **System audio**,
+  transcribes what the computer plays — online meetings, videos — via Electron's
+  Windows loopback capture), source language, **target
   chooser (vi/en/zh)** for what gets translated, DeepFilterNet switch, diarizer
-  switch (pyannote/nemo/volume), dev latency readout (on by default), model
+  switch (nemotron/pyannote/nemo/volume), dev latency readout (on by default), model
   status + reload.
 - Mic hardening: autoplay-policy resume, track-ended auto-stop, resume-pop
   guard, stall watchdog (one auto-recapture), WS auto-reconnect with fresh
@@ -169,7 +188,7 @@ No weights / no GPU? The backend boots in clearly-labelled **demo mode**
 
 ```yaml
 device: auto            # auto | cuda | cpu   (env DEVICE overrides, affects MT)
-asr_model: D:/DENSEV2 - reading/zipformer zh-en-vi onnx phaseB s2a  # local ONNX dir
+asr_model: D:/CONFERENCE ASR/zipformer zh-en-vi onnx phaseB 2e  # local ONNX dir (any phaseB tag)
 asr_provider: cpu       # sherpa-onnx wheels are CPU-only
 asr_quant: auto         # auto = int8 on cpu
 asr_threads: 4
@@ -185,12 +204,21 @@ mt_lookup_tokens: 10
 mt_history_turns: 3     # past segments as translation context (terminology/style)
 mt_history_chars: 600
 mt_do_sample: false     # greedy decode = fastest
-noise_suppress: true    # DeepFilterNet pre-ASR denoising (UI toggle overrides per request)
+noise_suppress: true    # pre-ASR denoising (UI toggle overrides per request)
+denoise_mode: gate      # gate = lightest (spectral gate, 24 ms / -13.4 dB per 10 s) | deepfilternet
 df_model: null          # null = DeepFilterNet3; alt: DeepFilterNet2, DeepFilterNet
 df_post_filter: false
 df_atten_lim_db: null   # e.g. 12 caps suppression, keeps ambience
-diarizer: nemo                   # nemo (Titanet embeddings) | volume (levels)
-use_nemo: true
+diarizer: nemotron               # nemotron (streaming) | nemo (Titanet) | pyannote | volume (levels)
+use_nemo: false
+nemotron_model: D:/CONFERENCE ASR/Nemotron-3-Diarization  # LOCAL dir; else models/nemotron-3-diarization
+nemotron_chunk: [3, 1]           # [chunk, right context] x 80 ms; [3,1] = 0.32 s, lowest that keeps up
+nemotron_dtype: bfloat16
+nemotron_threshold: 0.5
+nemotron_python: null            # null = backend's Python
+nemotron_deps: null              # null = ../diardeps
+diar_split_min: 0.4              # new voice alone this long = split the live row
+split_token_slack: 0.12          # ASR token-time lag allowance at a split
 nemo_embedding_model: nvidia/speakerverification_en_titanet_large
 nemo_cos_thresh: 0.55            # below this cosine -> new speaker (to max_speakers)
 frame_seconds: 0.5       # mic frame size for the streaming recognizer
@@ -206,6 +234,20 @@ Env overrides: `DEVICE=cuda|cpu`, `DTYPE`, `ASR_MODEL`, `MT_MODEL`, `DEMO_MODE=t
 
 ## 4. Voice suppression — DeepFilterNet pre-ASR stage
 
+Backend chain (`/api/health → denoise.mode`): **inproc** (deepfilternet importable,
+i.e. Python 3.11) → **sidecar** (`app/df_sidecar.py` under `../dfenv`, a Python 3.11
+venv with CPU torch 2.5.1 + deepfilternet; used when the backend runs on 3.12 for
+triton) → **gate** (numpy/scipy spectral gate, the lightest option). `denoise_mode: gate`
+(the default) skips straight to the gate; `denoise_mode: deepfilternet` runs the chain. Measured on 10 s
+of noisy audio: DF sidecar 445 ms / −26.5 dB, spectral gate 24 ms / −13.4 dB
+(`py -3 scripts/test_denoise.py`). Recreate the sidecar env:
+
+```powershell
+uv venv ..\dfenv --python 3.11
+uv pip install --python ..\dfenv\Scripts\python.exe torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+uv pip install --python ..\dfenv\Scripts\python.exe deepfilternet "numpy<2"
+```
+
 Every segment is denoised *before* diarization/ASR (`app/enhancer.py`):
 16 kHz audio → 48 kHz → `DeepFilterNet3` enhance → back to 16 kHz.
 Uploads are denoised whole-file in one pass (no chunk boundaries); live-mic
@@ -215,7 +257,36 @@ pass-through (check `/api/health → denoise.backend`). Toggle per session with
 the **🔇 Denoise** checkbox, `denoise=true|false` on `/api/transcribe`, or
 `{"denoise": false}` on `/ws/live`.
 
-## 5. Speaker diarization — NeMo Titanet direct-forward (default)
+## 5. Speaker diarization — Nemotron streaming (default)
+
+`NemotronDiarizer` (`app/diarizer.py`, `diarizer: nemotron`) runs
+`nvidia/Nemotron-3-Diarization` (99M params, arrival-order speaker ids, up to 8,
+overlap-aware) **fully offline** from a local folder (`nemotron_model`, else
+`models/nemotron-3-diarization`). Every live frame is pushed to it and scored per
+10 ms, so a speaker change no longer waits for a pause:
+
+- the open row's speaker label follows the voice live;
+- when a new voice speaks alone for `diar_split_min` (0.4 s) after the previous one,
+  the words before the change are finalized as their own row and the rest continues
+  as a new row (`StreamingSession._split`, cut placed by ASR token times + `split_token_slack`);
+- talking over each other or a short "yeah" never splits.
+
+It runs in a sidecar process (`app/nemotron_sidecar.py`): the model needs
+transformers 5.19 while the backend keeps 4.57 for Hy-MT, and NeMo 3.0.0 can't build
+it (RoPE encoder). The sidecar uses the backend's Python with `..\diardeps` first on
+`PYTHONPATH` and `HF_HUB_OFFLINE=1` — it never touches the network.
+
+MEASURED (RTX 4060, bf16, `[3,1]` = 0.32 s buffer): 19–47 ms per 0.24 s chunk
+(8–25% of the GPU), 205 MB VRAM. Smaller chunks don't pay: `[1,0]` (0.08 s) needs 64 ms
+per 80 ms chunk (77% GPU) and falls behind under MT load. Two-voice meeting with
+0–0.2 s hand-overs: 8/8 turns split and labelled correctly, every word on the right
+side, boundaries within ±60 ms. bf16 is no faster than fp32 (launch-bound) but halves
+VRAM. Startup ~20–30 s (transformers 5.x imports), overlapped with ASR/MT at warmup.
+OCR mode stops the sidecar (all its VRAM back); the next stream restarts it. If the
+sidecar can't start (no `..\diardeps`, no local model) the chain falls to Titanet →
+volume, reported in `/api/health`.
+
+### NeMo Titanet direct-forward (`diarizer: nemo`, Nemotron's fallback)
 
 `NeMoDiarizer` (`app/diarizer.py`, `diarizer: nemo`): each finalized segment is
 embedded with `nvidia/speakerverification_en_titanet_large` on CUDA and
@@ -232,8 +303,9 @@ Why this is the lightest NeMo setup that works: no smaller checkpoint exists
 win is calling `forward()` directly on tensors — no temp wav files per segment
 (steady 41 ms vs 50 ms with file I/O). Chain on failure: pyannote (gated) →
 volume, always reported, never silent. Switch at runtime without restart:
-`POST /api/settings {"diarizer": "pyannote"|"nemo"|"volume"}` (Settings view
-does this; in-flight sessions keep theirs).
+`POST /api/settings {"diarizer": "nemotron"|"pyannote"|"nemo"|"volume"}` (Settings view
+does this; the replaced diarizer is unloaded — a Nemotron sidecar is stopped for good —
+so an in-flight session finishes on the Titanet/volume fallback).
 
 ## 6. MT upgrades: token streaming, dialogue context, speculative decoding
 
@@ -271,7 +343,7 @@ does this; in-flight sessions keep theirs).
 ## 7. Verify (engines need cached weights; fakes don't)
 
 ```powershell
-python scripts/smoke_test.py      # device, denoiser, diarizer, pipeline, API routes
+python -m scripts.smoke_test      # device, denoiser, diarizer, pipeline, API routes
 python scripts/streaming_smoke.py # REAL engines: live partials + endpointed finals + MT
 ```
 
@@ -282,7 +354,11 @@ python scripts/streaming_smoke.py # REAL engines: live partials + endpointed fin
 - `WS /ws/live` — `stream_start {targets, src_lang, denoise, terms?}` /
   `stream_audio` / `stream_stop` → `partial`, per-target `tok` token deltas
   during final translation, `utterance` finals
-- `POST /api/settings` (`{"diarizer": "pyannote"|"nemo"|"volume"}`) — runtime switch
+- `POST /api/ocr` (multipart `files`, `task=ocr|table|formula|chart`, `translate_to`, `src`,
+  `terms`, `rotate`, `crop`) — `task=ocr` = PP-OCR blocks (boxes + scores) except `src=vi`,
+  which goes to the PaddleOCR-VL reader: PP-OCR's dictionaries lack most Vietnamese letters
+  (`CẤM ĐỖ XE` → `CAMDOXE`). Blocks are translated one MT pass, off the event loop.
+- `POST /api/settings` (`{"diarizer": "nemotron"|"pyannote"|"nemo"|"volume"}`) — runtime switch
 - `GET /api/health` — device, ASR/MT/denoise/diarizer status
 - Glossary `terms` (`{source: target}`) ride Hy-MT2's documented terminology
   block; verified steering output (e.g. forced `光子引擎`).
@@ -292,7 +368,7 @@ python scripts/streaming_smoke.py # REAL engines: live partials + endpointed fin
 ```
 config.yaml  run.py  requirements.txt
 app/engines.py  app/device.py  app/zipformer_engine.py  app/mt_engine.py
-app/diarizer.py  app/enhancer.py  app/audio_io.py  app/pipeline.py
+app/diarizer.py  app/nemotron_sidecar.py  app/enhancer.py  app/audio_io.py  app/pipeline.py
 app/streaming.py  app/main.py
 electron/package.json  electron/tsconfig.json
 electron/src/main.ts  electron/src/preload.ts
@@ -301,6 +377,6 @@ csharp/ConfLive/*.csproj,*.xaml,*.cs  installer/ConfLive.iss + build.ps1
 scripts/download_models.py  scripts/smoke_test.py  scripts/streaming_smoke.py
 ```
 
-> Note on `AGENTS.md`: the workspace-root `AGENTS.md` is the Apple design-review
-> skill manual — it contains no UI spec for this app, so the UI keeps its
-> current layout, relabelled for Zipformer + Hy-MT2 FP8.
+> Agents: this repo's `AGENTS.md` (imported by `CLAUDE.md`) maps every file, the
+> pipeline, the WS contract and the update rules. The workspace-root `AGENTS.md`
+> is an unrelated Apple design-review skill manual.

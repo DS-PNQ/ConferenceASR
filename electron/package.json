@@ -19,12 +19,16 @@
     "appId": "com.conflive.app",
     "productName": "ConfLive",
     "win": {
-      "target": ["nsis"]
+      "target": [
+        "nsis"
+      ],
+      "icon": "build/icon.ico"
     },
     "files": [
       "dist/**/*",
       "ui/dist/index.html",
-      "package.json"
+      "package.json",
+      "build/icon.png"
     ]
   }
 }

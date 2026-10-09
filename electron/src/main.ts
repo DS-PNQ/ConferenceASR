@@ -1,5 +1,5 @@
 // Main process: window + Python backend lifecycle (find, CUDA-detect, spawn, reap).
-import { app, BrowserWindow, Menu, powerSaveBlocker } from "electron";
+import { app, BrowserWindow, Menu, desktopCapturer, powerSaveBlocker, session } from "electron";
 import { spawn, execFile, ChildProcess } from "child_process";
 import * as path from "path";
 import * as fs from "fs";
@@ -118,6 +118,7 @@ async function createWindow(): Promise<void> {
     minWidth: 980,
     minHeight: 640,
     title: "ConfLive",
+    icon: path.join(__dirname, "..", "build", "icon.png"),
     backgroundColor: "#F2F2F7",
     autoHideMenuBar: true,
     // minimized during an hour-long meeting must not throttle the mic/WS loop
@@ -131,6 +132,13 @@ async function createWindow(): Promise<void> {
 app.whenReady().then(async () => {
   // ponytail: blocks system sleep while the app is open; scope to live sessions via IPC if battery matters
   powerSaveBlocker.start("prevent-app-suspension");
+  // "System audio" input: the renderer's getDisplayMedia gets the screen's
+  // loopback audio (what the speakers play), no picker; the UI drops the video.
+  session.defaultSession.setDisplayMediaRequestHandler((_req, callback) => {
+    desktopCapturer.getSources({ types: ["screen"] })
+      .then((s) => callback(s[0] ? { video: s[0], audio: "loopback" } : {}))
+      .catch(() => callback({}));
+  });
   try {
     await ensureBackend();
   } catch (e) {

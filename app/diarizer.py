@@ -1,8 +1,10 @@
 """Speaker diarization.
 
-Default: pyannote embedding diarizer (WeSpeaker on GPU) with graceful
-fallback chain pyannote -> NeMo Titanet -> volume levels. The active backend
-is always reported (status / entry diar_backend), never silently swapped.
+Default: Nemotron-3-Diarization, streaming end-to-end (10 ms frames, 0.32 s
+buffer, sidecar process), so live rows switch speaker mid-utterance.
+Fallback chain nemotron -> NeMo Titanet -> volume levels; pyannote is the
+other selectable embedding backend. The active backend is always reported
+(status / entry diar_backend), never silently swapped.
 
 Volume mode segments speaker turns from per-chunk loudness (RMS dBFS), pause
 gaps, and stereo pan when available. NeMo/pyannote attribute finalized
@@ -144,7 +146,9 @@ class NeMoDiarizer:
             max_speakers=self.max_speakers,
             silence_turn_gap=float(cfg.get("silence_turn_gap", 0.6)),
         )
-        self._lock = None
+        import threading
+
+        self._lock = threading.Lock()  # eager: warmup thread vs stream_start
         self._model = None
         self._ready = False
         self._available = False
@@ -160,10 +164,6 @@ class NeMoDiarizer:
     def ensure_loaded(self, demo_ok: bool = True):
         if self._ready:
             return
-        import threading
-
-        if self._lock is None:
-            self._lock = threading.Lock()
         with self._lock:
             if self._ready:
                 return
@@ -328,7 +328,9 @@ class PyannoteDiarizer:
             silence_turn_gap=float(cfg.get("silence_turn_gap", 0.6)),
         )
         self._nemo = NeMoDiarizer(cfg)  # second rung of the fallback chain
-        self._lock = None
+        import threading
+
+        self._lock = threading.Lock()  # eager: warmup thread vs stream_start
         self._infer = None
         self._ready = False
         self._available = False
@@ -354,10 +356,6 @@ class PyannoteDiarizer:
     def ensure_loaded(self, demo_ok: bool = True):
         if self._ready:
             return
-        import threading
-
-        if self._lock is None:
-            self._lock = threading.Lock()
         with self._lock:
             if self._ready:
                 return
@@ -513,6 +511,311 @@ class PyannoteDiarizer:
         return {"unloaded": True, "was": was}
 
 
+class NemotronDiarizer:
+    """Streaming end-to-end diarization: nvidia/Nemotron-3-Diarization.
+
+    Unlike the embedding diarizers it labels every 10 ms of audio while it
+    is spoken (arrival-order speaker ids, up to 8, overlap-aware), so a live
+    session can relabel the open row and split it where the speaker changes
+    (StreamingSession._track_speaker). Runs in ``app/nemotron_sidecar.py``
+    (transformers 5.19 from ``../diardeps``; the backend pins 4.57 for
+    Hy-MT). Falls back to NeMo Titanet -> volume when the sidecar can't start.
+
+    Time base: samples pushed since the last reset; ``push`` returns the
+    offset of each frame so callers can address frames by sample.
+    """
+
+    FRAME = 160  # samples per output frame (10 ms @ 16 kHz)
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.model_name = str(cfg.get("nemotron_model") or "")  # local folder, never the hub
+        self.chunk, self.right = (int(v) for v in cfg.get("nemotron_chunk", [3, 1]))
+        self.dtype = str(cfg.get("nemotron_dtype", "bfloat16"))
+        self.thresh = float(cfg.get("nemotron_threshold", 0.5))
+        self.split_min = float(cfg.get("diar_split_min", 0.4))
+        self._volume = VolumeDiarizer(
+            max_speakers=int(cfg.get("max_speakers", 3)),
+            silence_turn_gap=float(cfg.get("silence_turn_gap", 0.6)),
+        )
+        self._fallback = NeMoDiarizer(cfg)
+        import threading
+
+        self._lock = threading.Lock()      # preds + counters
+        self._io = threading.Lock()        # sidecar stdin
+        self._load_lock = threading.Lock()
+        self._proc = None
+        self._info: dict = {}
+        self._ready = False
+        self._available = False
+        self._closed = False               # close(): never restart the sidecar
+        self._epoch = 0
+        self._pushed = 0                   # samples sent since reset
+        # (start_frame, probs[n, n_spk]) per sidecar chunk; ponytail: 10 min
+        # of history at 0.24 s chunks, plenty for a 20 s max_segment.
+        self._preds: "deque" = None
+        self._covered = 0                  # frames scored so far
+        self._last_spk: int | None = None
+        self._n_spk = 0
+        self.reset()
+
+    # -- lifecycle ---------------------------------------------------------
+    def reset(self):
+        from collections import deque
+
+        with self._lock:
+            self._epoch += 1
+            self._pushed = 0
+            self._preds = deque(maxlen=2500)
+            self._covered = 0
+            self._last_spk = None
+            self._n_spk = 0
+        self._volume.reset()
+        self._fallback.reset()
+        self._send(b"R", self._epoch)
+
+    def ensure_loaded(self, demo_ok: bool = True):
+        if self._ready:
+            return
+        with self._load_lock:
+            if self._ready:
+                return
+            try:
+                if self._closed:
+                    raise RuntimeError("replaced via /api/settings")
+                self._start()
+                self._available = True
+                log.info("Nemotron diarizer ready: %s", self._info)
+            except Exception as e:
+                self._available = False
+                log.warning("Nemotron diarizer unavailable (%s) — NeMo Titanet fallback.", e)
+                if not demo_ok:
+                    raise
+                self._fallback.ensure_loaded(demo_ok=True)
+            self._ready = True
+
+    def _start(self):
+        import json
+        import os
+        import subprocess
+        import sys
+        import threading
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent
+        py = str(self.cfg.get("nemotron_python") or sys.executable)
+        deps = Path(str(self.cfg.get("nemotron_deps") or root.parent / "diardeps"))
+        if not (deps / "transformers").is_dir():
+            raise RuntimeError(f"{deps} has no transformers (see README: diardeps)")
+        for cand in (self.model_name, root / "models" / "nemotron-3-diarization"):
+            if cand and (Path(cand) / "model.safetensors").is_file():
+                self.model_name = str(cand)
+                break
+        else:
+            raise RuntimeError(f"no local Nemotron model at {self.model_name!r} or "
+                               "models/nemotron-3-diarization (run scripts/download_models.py once)")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(
+            [str(deps)] + [p for p in [os.environ.get("PYTHONPATH")] if p]),
+            HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_HUB_DISABLE_TELEMETRY="1",
+            HF_HUB_DISABLE_PROGRESS_BARS="1")
+        self._proc = subprocess.Popen(
+            [py, str(root / "app" / "nemotron_sidecar.py"), self.model_name,
+             f"{self.chunk},{self.right}", self.dtype],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        line = self._proc.stdout.readline().decode(errors="replace").strip()  # model load, ~5 s
+        if not line.startswith("READY"):
+            self._kill()
+            raise RuntimeError(line or "sidecar exited")
+        self._info = json.loads(line[5:] or "{}")
+        self._send(b"R", self._epoch)  # stream clock = this diarizer's epoch
+        threading.Thread(target=self._read_loop, args=(self._proc,), daemon=True).start()
+
+    def _kill(self):
+        p, self._proc = self._proc, None
+        if p is not None:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+    def _send(self, op: bytes, n: int, payload: bytes = b"") -> bool:
+        import struct
+
+        p = self._proc
+        if p is None:
+            return False
+        try:
+            with self._io:
+                p.stdin.write(op + struct.pack("<I", n) + payload)
+                p.stdin.flush()
+            return True
+        except Exception as e:
+            log.warning("Nemotron sidecar write failed (%s) — fallback.", e)
+            self._available = False
+            self._kill()
+            return False
+
+    def _read_loop(self, proc):
+        import struct
+
+        f = proc.stdout
+        while True:
+            head = f.read(17)
+            if len(head) < 17:
+                break
+            _, epoch, start, n, k = struct.unpack("<cIIII", head)
+            p = np.frombuffer(f.read(n * k * 4), dtype=np.float32).reshape(n, k)
+            with self._lock:
+                if epoch != self._epoch:
+                    continue  # chunk from before a reset
+                self._preds.append((start, p))
+                self._covered = start + n
+                act = np.nonzero(p.max(0) >= self.thresh)[0]
+                if act.size:
+                    self._n_spk = max(self._n_spk, int(act.max()) + 1)
+                    last = p[-1]
+                    if last.max() >= self.thresh:
+                        self._last_spk = int(last.argmax())
+        if self._proc is proc:
+            log.warning("Nemotron sidecar exited — fallback until reload.")
+            self._available = False
+            self._ready = False
+            self._proc = None
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    # -- streaming input ---------------------------------------------------
+    def push(self, pcm: np.ndarray) -> int | None:
+        """Feed 16 kHz audio; returns its sample offset, or None when the
+        streaming path is down (caller falls back to attribute_segment)."""
+        if not self._available:
+            return None
+        x = np.clip(np.asarray(pcm, dtype=np.float32).ravel(), -1.0, 1.0)
+        with self._lock:
+            off = self._pushed
+            self._pushed += x.size
+        return off if self._send(b"A", x.size, x.tobytes()) else None
+
+    def _labels(self, s0: int, s1: int | None):
+        """[(sample, speaker|-1, probs)] for scored 10 ms frames in [s0, s1)."""
+        f0, f1 = s0 // self.FRAME, None if s1 is None else -(-s1 // self.FRAME)
+        out = []
+        with self._lock:
+            chunks = [c for c in self._preds if c[0] + len(c[1]) > f0
+                      and (f1 is None or c[0] < f1)]
+        for start, p in chunks:
+            for i, row in enumerate(p):
+                f = start + i
+                if f < f0 or (f1 is not None and f >= f1):
+                    continue
+                spk = int(row.argmax())
+                out.append((f * self.FRAME, spk if row[spk] >= self.thresh else -1, row))
+        return out
+
+    def turn(self, s0: int, s1: int | None = None) -> dict:
+        """Who holds [s0, s1), and where a different speaker took over.
+
+        Returns {"speaker", "change_at" (sample|None), "next_speaker"}. A
+        change needs the new voice alone (old speaker below threshold) for
+        diar_split_min s, after the old one spoke at least that long;
+        overlap/backchannel never splits. speaker None = nothing scored yet.
+        """
+        need = max(1, int(round(self.split_min * 16000 / self.FRAME)))
+        cur, cur_n, run_spk, run_at, run_n = None, 0, None, None, 0
+        for s, spk, row in self._labels(s0, s1):
+            if spk < 0:
+                continue
+            if cur is None or spk == cur:
+                cur, cur_n, run_spk, run_n = spk, cur_n + 1, None, 0
+                continue
+            if row[cur] >= self.thresh:
+                continue  # both talking: not a hand-over
+            if spk != run_spk:
+                run_spk, run_at, run_n = spk, s, 0
+            run_n += 1
+            if run_n >= need:
+                if cur_n >= need:
+                    return {"speaker": self._name(cur), "change_at": run_at,
+                            "next_speaker": self._name(spk)}
+                cur, cur_n, run_spk, run_n = spk, run_n, None, 0  # head too short: relabel
+        return {"speaker": None if cur is None else self._name(cur),
+                "change_at": None, "next_speaker": None}
+
+    @staticmethod
+    def _name(i: int) -> str:
+        return f"SPEAKER_{i + 1:02d}"
+
+    # -- diarizer interface ------------------------------------------------
+    def assign(self, pcm: np.ndarray, t=None) -> dict:
+        """Volume levels for the silence gate; speaker = latest Nemotron voice."""
+        out = self._volume.assign(pcm, t)
+        if self._available:
+            out["backend"] = "nemotron"
+            if self._last_spk is not None:
+                out["speaker"], out["speaker_id"] = self._name(self._last_spk), self._last_spk
+        else:
+            out["backend"] = self._fallback.status().get("backend", "volume(fallback)")
+        return out
+
+    def attribute_segment(self, pcm: np.ndarray, sr: int = 16000) -> dict:
+        """Whole-segment verdict for callers that don't stream (upload/legacy
+        pipeline): push it, wait for the scores, take the dominant speaker."""
+        self.ensure_loaded()
+        off = self.push(pcm) if int(sr) == 16000 else None
+        if off is None:
+            return self._fallback.attribute_segment(pcm, sr)
+        end = off + int(np.asarray(pcm).size)
+        # the last right-context + chunk frames wait for audio that may never come
+        want = (end - (self.chunk + self.right) * 8 * self.FRAME) // self.FRAME
+        deadline = time.time() + 3.0
+        while self._covered < want and time.time() < deadline and self._available:
+            time.sleep(0.01)
+        labs = [spk for _, spk, _ in self._labels(off, end) if spk >= 0]
+        if not labs:
+            out = self._volume.assign(np.asarray(pcm, dtype=np.float32).ravel())
+            out["backend"] = "volume(fallback)"
+            return out
+        best = int(np.bincount(labs).argmax())
+        return {"speaker": self._name(best), "speaker_id": best,
+                "n_speakers": self._n_spk, "backend": "nemotron"}
+
+    def status(self) -> dict:
+        if not self._available:
+            sub = self._fallback.status()
+            return dict(sub, ready=self._ready)
+        return {
+            "backend": "nemotron",
+            "model": self.model_name,
+            "device": self._info.get("device", "?"),
+            "dtype": self._info.get("dtype"),
+            "latency_ms": self._info.get("latency_ms"),
+            "n_speakers": self._n_spk,
+            "ready": self._ready,
+        }
+
+    def unload(self) -> dict:
+        """Stop the sidecar (frees all its VRAM). Next ensure_loaded restarts it."""
+        was = self.status()
+        self._available = False
+        self._ready = False
+        self._kill()
+        try:
+            self._fallback.unload()
+        except Exception:
+            pass
+        log.info("Nemotron diarizer unloaded (OCR mode)")
+        return {"unloaded": True, "was": was}
+
+    def close(self) -> dict:
+        """Replaced by another diarizer: stop the sidecar for good. A session
+        still holding this object finishes on the Titanet/volume fallback."""
+        self._closed = True
+        return self.unload()
+
+
 def _cuda() -> bool:
     try:
         import torch
@@ -523,7 +826,9 @@ def _cuda() -> bool:
 
 
 def make_diarizer(cfg: dict):
-    mode = str(cfg.get("diarizer", "pyannote")).lower()
+    mode = str(cfg.get("diarizer", "nemotron")).lower()
+    if mode == "nemotron":
+        return NemotronDiarizer(cfg)
     if mode == "pyannote":
         return PyannoteDiarizer(cfg)
     if mode == "nemo" or bool(cfg.get("use_nemo", False)):

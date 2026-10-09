@@ -41,8 +41,8 @@ export interface Health {
   asr: { model: string; backend?: string; device?: string; ready: boolean };
   mt: { model: string; device?: string; ready: boolean };
   diarizer: string;
-  diarizer_status: { backend: string; model?: string; device?: string; ready: boolean };
-  denoise: { backend: string; ready: boolean };
+  diarizer_status: { backend: string; model?: string; device?: string; ready: boolean; latency_ms?: number };
+  denoise: { backend: string; ready: boolean; device?: string };
   langs: string[];
 }
 
@@ -58,7 +58,9 @@ export async function apiWarmup(): Promise<unknown> {
   return r.json();
 }
 
-export async function apiSetDiarizer(mode: "pyannote" | "volume" | "nemo"): Promise<unknown> {
+export type DiarizerMode = "nemotron" | "pyannote" | "volume" | "nemo";
+
+export async function apiSetDiarizer(mode: DiarizerMode): Promise<unknown> {
   const r = await fetch(`${BASE}/api/settings`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -345,17 +347,31 @@ function resample16k(input: Float32Array, fromRate: number): Float32Array {
   return out;
 }
 
+/** openMic device id for "what the computer plays" (Electron grants
+ *  getDisplayMedia with Windows loopback audio, see electron/src/main.ts). */
+export const SYSTEM_AUDIO = "system";
+
+async function systemAudioStream(): Promise<MediaStream> {
+  const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+  stream.getVideoTracks().forEach((t) => t.stop()); // audio only
+  if (!stream.getAudioTracks().length) {
+    stream.getTracks().forEach((t) => t.stop());
+    throw new Error("no system audio track (share a screen with audio)");
+  }
+  return stream;
+}
+
 export async function openMic(
   deviceId: string | undefined,
   onFrame: (b64: string) => void,
   frameSeconds = 0.5,
   onTrackEnded?: () => void,
 ): Promise<MicHandle> {
-  const stream = await navigator.mediaDevices.getUserMedia({
+  const stream = deviceId === SYSTEM_AUDIO ? await systemAudioStream() : await navigator.mediaDevices.getUserMedia({
     audio: deviceId ? { deviceId: { exact: deviceId }, echoCancellation: true } : { echoCancellation: true },
   });
   const track = stream.getAudioTracks()[0];
-  const label = track?.label || "Microphone";
+  const label = deviceId === SYSTEM_AUDIO ? "System audio" : track?.label || "Microphone";
   if (track) {
     track.onended = () => {
       try {
@@ -443,11 +459,14 @@ export async function listMics(): Promise<{ id: string; label: string }[]> {
   }
   try {
     const devs = await navigator.mediaDevices.enumerateDevices();
-    return devs
-      .filter((d) => d.kind === "audioinput")
-      .map((d, i) => ({ id: d.deviceId, label: d.label || `Microphone ${i + 1}` }));
+    return [
+      ...devs
+        .filter((d) => d.kind === "audioinput")
+        .map((d, i) => ({ id: d.deviceId, label: d.label || `Microphone ${i + 1}` })),
+      { id: SYSTEM_AUDIO, label: "System audio (what this computer plays)" },
+    ];
   } catch {
-    return [];
+    return [{ id: SYSTEM_AUDIO, label: "System audio (what this computer plays)" }];
   }
 }
 

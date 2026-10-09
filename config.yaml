@@ -6,7 +6,7 @@ cuda_fallback_on_oom: true
 
 # ---- ASR: local Zipformer zh-en-vi ONNX (sherpa-onnx, CPU) ----
 # Folder holds encoder/decoder/joiner .onnx (fp32 + int8) + tokens.txt.
-asr_model: D:/CONFERENCE ASR/zipformer zh-en-vi onnx phaseB s2a   # or set ASR_MODEL
+asr_model: D:/CONFERENCE ASR/zipformer zh-en-vi onnx phaseB 2e    # or set ASR_MODEL
 asr_provider: cpu      # sherpa-onnx wheels are CPU-only; cuda if you build with GPU
 asr_quant: auto        # auto | int8 | fp32  (auto = int8 on cpu, fp32 on cuda)
 asr_threads: 4
@@ -58,7 +58,7 @@ ocr_device: auto             # auto | cuda | cpu (CUDA bf16 ≈ 2 GB VRAM)
 ocr_task: ocr                # ocr | table | formula | chart (UI overrides per job)
 ocr_max_new_tokens: 1024     # page-level text budget per image
 ocr_dpi: 200                 # PDF rasterization resolution
-ocr_translate_chunk_chars: 800  # Hy-MT doc translation chunk width
+translate_chunk_chars: 240   # Translate tab + OCR: chunk cost (CJK x3) so each MT call fits mt_max_new_tokens
 
 # ---- Voice activity (Silero VAD: https://github.com/snakers4/silero-vad) ----
 vad_enable: true             # neural speech gate in front of the diarizer;
@@ -72,9 +72,15 @@ vad_skip_denoise: false      # also skip DeepFilterNet when VAD frac >= 0.9
 
 # ---- Voice suppression (DeepFilterNet: https://github.com/Rikorose/DeepFilterNet) ----
 noise_suppress: true       # master toggle; also flippable per-request from the UI
+denoise_mode: gate         # gate = lightest: numpy/scipy spectral gate, stationary noise only
+                           # | deepfilternet = DF in-proc -> DF sidecar -> gate chain.
+                           # MEASURED 10 s noisy audio: gate 24 ms / -13.4 dB,
+                           # DF sidecar 445 ms / -26.5 dB (scripts/test_denoise.py)
 df_model: null             # null = package default (DeepFilterNet3). Alt: DeepFilterNet2, DeepFilterNet
 df_post_filter: false      # extra attenuation of very noisy sections
 df_atten_lim_db: null      # e.g. 12 = cap suppression at 12 dB, keep some ambience; null = full
+df_python: null            # Python with deepfilternet for the sidecar (null = ../dfenv/Scripts/python.exe).
+                           # Chain: df in-process -> df sidecar (3.11) -> spectral gate (~2 ms/s audio)
 
 # ---- Conference / diarization ----
 sample_rate: 16000
@@ -89,8 +95,22 @@ mt_retranslate_words: 3          # re-translate the live sentence every 3 new wo
                                  # MEASURED 15 s turns: final 0.1-1.1 s vs 0.8-2.2 s scratch
 silence_turn_gap: 0.6            # pause (s) that marks a possible speaker turn
 max_speakers: 3
-diarizer: nemo                   # nemo Titanet (direct-forward, CUDA) | pyannote | volume
-use_nemo: true
+diarizer: nemotron               # nemotron (streaming, splits rows at speaker changes) | nemo Titanet | pyannote | volume
+use_nemo: false                  # true forces nemo when diarizer isn't nemotron/pyannote
+# Nemotron-3-Diarization: app/nemotron_sidecar.py with transformers 5.19 from ../diardeps
+# (the backend keeps 4.57 for Hy-MT; NeMo 3.0.0 can't build this RoPE model).
+# MEASURED RTX 4060, bf16, per chunk: [3,1] 0.32 s buffer 19-47 ms (8-25% GPU);
+# [1,0] 0.08 s 64 ms (77% GPU: falls behind under MT); [6,2] 0.64 s 18-40 ms. 205 MB VRAM.
+# Two-voice test: 100% turn consistency in every mode, boundaries within +-60 ms.
+nemotron_model: D:/CONFERENCE ASR/Nemotron-3-Diarization   # LOCAL folder (offline); download_models.py fills it once
+nemotron_chunk: [3, 1]           # [chunk, right context] in 80 ms frames; [3,1] = 0.32 s, lowest that keeps up
+nemotron_dtype: bfloat16         # same speed as float32 (launch-bound), half the VRAM
+nemotron_threshold: 0.5          # speaker probability that counts as speech
+nemotron_python: null            # null = the backend's own Python (needs torch)
+nemotron_deps: null              # null = ../diardeps (pip install --target, see README §5)
+diar_split_min: 0.4              # new voice alone this long (s) = speaker change: split the live row
+split_token_slack: 0.12          # ASR tokens stamped up to this long after the cut stay with the old speaker.
+                                 # MEASURED 7 hand-overs: old speaker's last token <= +0.04 s, new one's first >= +0.22 s
 pyannote_model: pyannote/embedding   # gated: accept once at hf.co/pyannote/embedding
 pyannote_cos_thresh: 0.55            # below this cosine -> new speaker (to max_speakers)
 hf_token: null                       # or HF_TOKEN env / cached `huggingface login`

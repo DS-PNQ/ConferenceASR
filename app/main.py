@@ -10,6 +10,8 @@ import base64
 import json
 import logging
 import os
+import re
+import threading
 from pathlib import Path
 
 import yaml
@@ -143,6 +145,18 @@ def _parse_denoise(v) -> bool | None:
 def warmup():
     """Load models now (else they lazy-load on first request)."""
     demo_ok = DEMO != "false"
+    d = RUNTIME.get("diarizer", diarizer)
+    ensure = getattr(d, "ensure_loaded", None)
+    if callable(ensure):
+        def _load():
+            try:
+                ensure(demo_ok=demo_ok)
+            except Exception as e:
+                log.warning("diarizer warmup failed: %s", e)
+        # First and in the background: the Nemotron sidecar spends ~20-30 s importing
+        # transformers 5.x, overlapped with ASR/MT loading below. A stream_start
+        # before it's done waits in configure() (ensure_loaded locks).
+        threading.Thread(target=_load, daemon=True).start()
     asr.ensure_loaded(demo_ok=demo_ok)
     try:
         asr._ort().ensure_loaded()  # final re-decoder: else ~10 s on the first segment
@@ -154,20 +168,13 @@ def warmup():
         vad.ensure_loaded(demo_ok=demo_ok)  # preloaded: no first-frame stall
     except Exception as e:
         log.warning("vad warmup failed: %s", e)
-    d = RUNTIME.get("diarizer", diarizer)
-    ensure = getattr(d, "ensure_loaded", None)
-    if callable(ensure):
-        try:
-            ensure(demo_ok=demo_ok)
-        except Exception as e:
-            log.warning("diarizer warmup failed: %s", e)
     return {"asr": asr.status(), "mt": mt.status(), "denoise": enhancer.status(),
             "diarizer": _diarizer_status()}
 
 
 @app.post("/api/settings")
 def settings(payload: dict):
-    """Runtime settings. Currently: {"diarizer": "pyannote"|"nemo"|"volume"}.
+    """Runtime settings. Currently: {"diarizer": "nemotron"|"pyannote"|"nemo"|"volume"}.
 
     Applies to new streaming sessions and the legacy pipeline immediately;
     in-flight sessions keep theirs. Affects /api/health output.
@@ -176,9 +183,9 @@ def settings(payload: dict):
     which = (payload or {}).get("diarizer")
     if which is not None:
         mode = str(which).strip().lower()
-        if mode not in ("pyannote", "volume", "nemo"):
+        if mode not in ("nemotron", "pyannote", "volume", "nemo"):
             return JSONResponse({"ok": False,
-                                 "error": "diarizer must be 'pyannote', 'nemo' or 'volume'"},
+                                 "error": "diarizer must be 'nemotron', 'pyannote', 'nemo' or 'volume'"},
                                 status_code=400)
         cfg = dict(CFG)
         cfg["diarizer"] = mode
@@ -188,6 +195,13 @@ def settings(payload: dict):
         except Exception as e:
             return JSONResponse({"ok": False, "error": f"diarizer init failed: {e}"},
                                 status_code=500)
+        old = RUNTIME.get("diarizer")
+        drop = getattr(old, "close", None) or getattr(old, "unload", None)
+        if callable(drop):
+            try:
+                drop()  # a replaced Nemotron sidecar would otherwise hold its VRAM forever
+            except Exception:
+                pass
         RUNTIME["diarizer"] = new_d
         pipe.diarizer = new_d
         out["diarizer"] = _diarizer_status()
@@ -221,8 +235,10 @@ async def translate(payload: dict):
     text = payload.get("text", "")
     targets = payload.get("targets", ["en"])
     src = payload.get("src", "auto")
-    return {"ok": True, "translations": mt.translate_multi(
-        text, targets, src=src, terms=_parse_terms(payload.get("terms")))}
+    terms = _parse_terms(payload.get("terms"))
+    # off the event loop: a long text takes minutes and /ws/live must keep flowing
+    return {"ok": True, "translations": {
+        t: await asyncio.to_thread(_translate_long, text, t, src, terms) for t in targets}}
 
 
 def _enter_ocr_mode() -> dict:
@@ -292,27 +308,54 @@ def _apply_transform(img, rotate: int, crop: list | None):
     return img
 
 
-def _translate_long(text: str, target: str, src: str, terms: dict) -> str:
-    """Hy-MT over long OCR text: chunk (live MT caps output length), join."""
-    import re
+_CJK = re.compile(r"[　-〿぀-ヿ㐀-鿿가-힯＀-￯]")
 
-    width = max(200, int(CFG.get("ocr_translate_chunk_chars", 800)))
-    parts = re.split(r"(?<=[.!?。！？\n])\s+", text)
+
+def _cost(s: str) -> int:
+    """Rough output-token weight: a CJK char expands ~3x in vi/en."""
+    return len(s) + 2 * len(_CJK.findall(s))
+
+
+def _split_chunks(line: str, width: int) -> list[str]:
+    """Pack sentences into chunks of cost <= width; run-ons cut at a space."""
     chunks, cur = [], ""
-    for p in parts:
-        if len(cur) + len(p) + 1 > width and cur.strip():
-            chunks.append(cur.strip())
+    for p in re.split(r"(?<=[.!?;:])\s+|(?<=[。！？；])", line):
+        while _cost(p) > width:  # one sentence longer than a chunk
+            c = 0
+            for i, ch in enumerate(p):
+                c += 3 if _CJK.match(ch) else 1
+                if c > width:
+                    break
+            sp = p.rfind(" ", 0, i)
+            i = sp if sp > i // 2 else i
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(p[:i].strip())
+            p = p[i:].strip()
+        sep = "" if not cur or _CJK.match(cur[-1]) else " "
+        if cur and _cost(cur + sep + p) > width:
+            chunks.append(cur)
             cur = p
         else:
-            cur = (cur + " " + p).strip()
+            cur = cur + sep + p
     if cur.strip():
         chunks.append(cur.strip())
-    if not chunks:
-        return ""
+    return [c for c in chunks if c]
+
+
+def _translate_long(text: str, target: str, src: str, terms: dict) -> str:
+    """Hy-MT over text of any length: mt_max_new_tokens caps one call's
+    output, so translate line by line in sentence-packed chunks. mt.translate
+    takes its lock per chunk, so live sessions interleave between chunks."""
+    width = max(80, int(CFG.get("translate_chunk_chars", 240)))
     mt.ensure_loaded(demo_ok=True)
-    return "\n".join(
-        mt.translate(c, tgt=target, src=src, terms=terms or None) for c in chunks
-    ).strip()
+    out = []
+    for line in (text or "").split("\n"):
+        out.append(" ".join(
+            mt.translate(c, tgt=target, src=src, terms=terms or None)
+            for c in _split_chunks(line.strip(), width)))
+    return "\n".join(out).strip()
 
 
 @app.post("/api/ocr")
@@ -345,7 +388,9 @@ async def ocr_docs(
         crop_rect = None
     dpi = max(72, min(400, int(CFG.get("ocr_dpi", 200))))
     deloaded = _enter_ocr_mode()
-    use_blocks = (task == "ocr")
+    # PP-OCR rec dicts lack most Vietnamese letters ("CẤM ĐỖ XE" -> "CAMDOXE",
+    # ocr_test/README.md); the VLM keeps diacritics, at the cost of no boxes
+    use_blocks = (task == "ocr" and src_lang != "vi")
     if use_blocks:
         try:
             await asyncio.to_thread(blockocr.ensure_loaded)
@@ -402,19 +447,24 @@ async def ocr_docs(
                     continue
                 entry["ocr_ms"] = int((time.time() - t0) * 1000)
                 if target and entry.get("text"):
+                    # One MT pass, off the event loop: blocks are translated
+                    # one by one and the page translation is their join (the
+                    # old per-block mt.translate ran on the loop, stalling
+                    # /ws/live, and translated every line twice).
+                    blocks = [b for b in entry.get("blocks", []) if b.get("text")]
                     try:
-                        entry["translation"] = await asyncio.to_thread(
-                            _translate_long, entry["text"], target,
-                            src_lang or "auto", terms_d)
-                        for b in entry.get("blocks", []):
-                            if b.get("text"):
-                                try:
-                                    b["translation"] = mt.translate(
-                                        b["text"], tgt=target,
-                                        src=src_lang or "auto",
-                                        terms=terms_d or None)
-                                except Exception as e:
-                                    b["translation_error"] = str(e)
+                        if blocks:
+                            trs = await asyncio.to_thread(
+                                lambda: [_translate_long(b["text"], target,
+                                                         src_lang or "auto", terms_d)
+                                         for b in blocks])
+                            for b, tr in zip(blocks, trs):
+                                b["translation"] = tr
+                            entry["translation"] = "\n".join(trs)
+                        else:
+                            entry["translation"] = await asyncio.to_thread(
+                                _translate_long, entry["text"], target,
+                                src_lang or "auto", terms_d)
                     except Exception as e:
                         entry["translation_error"] = str(e)
                 pages_out.append(entry)

@@ -41,14 +41,29 @@ optimum-quanto>=0.2
 # (models auto-download on first warmup). Missing = pass-through mode.
 # deepfilternet>=0.5
 
-# Speaker diarization: pyannote embeddings on GPU (default), NeMo Titanet and
-# volume levels as automatic fallbacks. pyannote weights are license-gated:
-# accept once at https://hf.co/pyannote/embedding (uses cached HF login).
+# Speaker diarization: Nemotron-3-Diarization streaming (default) runs in a
+# sidecar with transformers 5.19 from ../diardeps, NOT this file (Hy-MT keeps
+# transformers 4.x here):
+#   pip install --no-deps --target ..\diardeps "transformers==5.19.0" "huggingface_hub>=1.31,<2" "tokenizers>=0.23.1,<0.24"
+# NeMo Titanet is its fallback (and diarizer: nemo); pyannote is selectable.
+# pyannote weights are license-gated: accept once at https://hf.co/pyannote/embedding.
 pyannote.audio>=4.0
 nemo_toolkit[asr]>=3.0
 
 # Fast language ID (vi/en/zh, ms-level) to skip same-language MT calls.
 lingua-language-detector>=2.0
+
+# Spectral-gate denoise (denoise_mode: gate, the default) — missing = pass-through.
+scipy>=1.10
+
+# OCR tab: PP-OCR blocks via rapidocr_onnxruntime, PDFs via PyMuPDF.
+# rapidocr itself is installed with --no-deps (ConfLive.bat): its `onnxruntime`
+# requirement would overwrite onnxruntime-gpu. These are its other deps.
+pymupdf>=1.24
+pillow>=10.0
+opencv-python>=4.8
+pyclipper>=1.3
+shapely>=2.0
 
 # Neural voice activity gate (Silero VAD, CUDA/CPU, ~2 MB). Fail-open
 # (energy-only endpointing) when missing.

@@ -57,15 +57,14 @@ class CudaZipformer:
         self.provider = "?"
 
     def _paths(self) -> dict:
-        import pathlib
+        from .zipformer_engine import model_file
 
-        d = pathlib.Path(self.model_dir)
-        return {
-            "encoder": str(d / "encoder-phaseB_s2a.onnx"),
-            "decoder": str(d / "decoder-phaseB_s2a.onnx"),
-            "joiner": str(d / "joiner-phaseB_s2a.onnx"),
-            "tokens": str(d / "tokens.txt"),
-        }
+        try:
+            return {part: model_file(self.model_dir, part)
+                    for part in ("encoder", "decoder", "joiner")} | {
+                "tokens": os.path.join(self.model_dir, "tokens.txt")}
+        except FileNotFoundError as e:
+            raise CudaUnavailable(str(e))
 
     def ensure_loaded(self):
         if self._sessions is not None:

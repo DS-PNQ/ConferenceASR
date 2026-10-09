@@ -55,6 +55,7 @@ release/
 [Bb]in/
 [Oo]bj/
 .cache/
+.impeccable/
 
 # --- Electron / Python build outputs ---
 node_modules/
