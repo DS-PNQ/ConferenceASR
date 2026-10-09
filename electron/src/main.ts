@@ -125,6 +125,18 @@ async function createWindow(): Promise<void> {
     webPreferences: { preload: path.join(__dirname, "preload.js"), backgroundThrottling: false },
   });
   win.setMenu(null);
+  // Whole-UI zoom, which the removed menu used to provide: Ctrl+= / Ctrl+- /
+  // Ctrl+0 and Ctrl+wheel (the OCR viewer keeps Ctrl+wheel for the page).
+  const wc = win.webContents;
+  const zoomBy = (d: number) => wc.setZoomLevel(d ? Math.max(-3, Math.min(4, wc.getZoomLevel() + d)) : 0);
+  wc.on("before-input-event", (e, i) => {
+    if (i.type !== "keyDown" || !(i.control || i.meta) || i.alt) return;
+    const d = ({ "=": 0.5, "+": 0.5, "-": -0.5, "_": -0.5, "0": 0 } as Record<string, number>)[i.key];
+    if (d === undefined) return;
+    e.preventDefault();
+    zoomBy(d);
+  });
+  wc.on("zoom-changed", (_e, dir) => zoomBy(dir === "in" ? 0.5 : -0.5));
   await win.loadFile(path.join(__dirname, "..", "ui", "dist", "index.html"));
   win.on("closed", () => (win = null));
 }

@@ -1,6 +1,9 @@
+import os
+
 import uvicorn
 import yaml
 
+os.chdir(os.path.dirname(os.path.abspath(__file__)))  # config.yaml + app/ are relative
 with open("config.yaml", encoding="utf-8") as f:
     cfg = yaml.safe_load(f) or {}
 

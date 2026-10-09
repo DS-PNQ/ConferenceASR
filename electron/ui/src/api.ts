@@ -43,6 +43,7 @@ export interface Health {
   diarizer: string;
   diarizer_status: { backend: string; model?: string; device?: string; ready: boolean; latency_ms?: number };
   denoise: { backend: string; ready: boolean; device?: string };
+  ocr?: { model: string; device?: string; ready: boolean; vietocr?: boolean };
   langs: string[];
 }
 
@@ -106,6 +107,7 @@ export interface OcrBlock {
   id: number;
   text: string;
   conf: number;
+  rec?: "pp-ocr" | "vietocr"; // line reader (VietOCR = Vietnamese diacritics)
   box: [number, number, number, number]; // relative x0,y0,x1,y1
   translation?: string;
   translation_error?: string;

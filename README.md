@@ -81,6 +81,7 @@ pip install --upgrade pip
 pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu126   # or .../cpu for CPU-only
 pip install -r requirements.txt
 pip install --no-deps rapidocr_onnxruntime   # OCR blocks; its `onnxruntime` dep would clobber onnxruntime-gpu
+python scripts/get_vietocr.py                # optional: Vietnamese OCR reader (VietOCR fp16 ONNX, 45 MB) -> models/vietocr-s2s
 ```
 
 > Python version note: `deepfilternet` bundles prebuilt wheels for Python
@@ -130,6 +131,10 @@ language streams first at finalize too (`display_lang` in `stream_start`,
 hot-updatable mid-session via `stream_config`), and live re-translation
 covers the display language only — one MT call keeps the feed loop realtime.
 Layout: fixed-height shell, sidebar scrolls independently of the transcript.
+Zoom the whole UI with Ctrl+= / Ctrl+- / Ctrl+0 or Ctrl+wheel. The OCR view has its own
+page viewer: Ctrl+wheel / touchpad pinch zooms at the cursor, `+` `-` `0` (fit width) when
+the viewer is focused, a zoom slider + Fit button, drag to pan, double-click toggles 200%.
+The picked image shows (with live rotate/crop) before Run OCR; rotate/crop clear old results.
 
 ### C# app (WPF alternative, same protocol)
 
@@ -227,6 +232,7 @@ endpoint_min_speech: 0.5
 max_segment: 20.0        # force-finalize run-on speech
 mt_retranslate_words: 5  # live re-translation pace (new words); finals verify the last SSBD draft
 segment_seconds: 5.0     # fixed-window size for the /api/transcribe upload path
+vi_ocr_model: models/vietocr-s2s  # optional Vietnamese OCR reader (scripts/get_vietocr.py); missing = PP-OCR/VLM only
 max_speakers: 3
 ```
 
@@ -355,9 +361,12 @@ python scripts/streaming_smoke.py # REAL engines: live partials + endpointed fin
   `stream_audio` / `stream_stop` → `partial`, per-target `tok` token deltas
   during final translation, `utterance` finals
 - `POST /api/ocr` (multipart `files`, `task=ocr|table|formula|chart`, `translate_to`, `src`,
-  `terms`, `rotate`, `crop`) — `task=ocr` = PP-OCR blocks (boxes + scores) except `src=vi`,
-  which goes to the PaddleOCR-VL reader: PP-OCR's dictionaries lack most Vietnamese letters
-  (`CẤM ĐỖ XE` → `CAMDOXE`). Blocks are translated one MT pass, off the event loop.
+  `terms`, `rotate`, `crop`) — `task=ocr` = PP-OCR blocks (boxes + scores). PP-OCR's
+  dictionaries lack most Vietnamese letters (`CẤM ĐỖ XE` → `CAMDOXE`), so with the optional
+  VietOCR reader installed (`vi_ocr_model`) every non-CJK line is re-read by it (`rec` per
+  block, page `backend: "pp-ocr + vietocr"`); without it `src=vi` falls back to the
+  PaddleOCR-VL reader (diacritics, no boxes). `block_ocr.vietocr` / health `ocr.vietocr` say
+  whether it is installed. Blocks are translated one MT pass, off the event loop.
 - `POST /api/settings` (`{"diarizer": "nemotron"|"pyannote"|"nemo"|"volume"}`) — runtime switch
 - `GET /api/health` — device, ASR/MT/denoise/diarizer status
 - Glossary `terms` (`{source: target}`) ride Hy-MT2's documented terminology
@@ -374,7 +383,9 @@ electron/package.json  electron/tsconfig.json
 electron/src/main.ts  electron/src/preload.ts
 electron/ui/ (React+Vite+Tailwind redesign, wired live: src/App.tsx, src/api.ts)
 csharp/ConfLive/*.csproj,*.xaml,*.cs  installer/ConfLive.iss + build.ps1
-scripts/download_models.py  scripts/smoke_test.py  scripts/streaming_smoke.py
+scripts/download_models.py  scripts/get_vietocr.py  scripts/smoke_test.py  scripts/streaming_smoke.py
+app/ocr_engine.py (PP-OCR blocks + VietRec + PaddleOCR-VL)  models/vietocr-s2s/ (optional)
+checkpoints/ (source snapshots, see checkpoints/WORKLOG.md)
 ```
 
 > Agents: this repo's `AGENTS.md` (imported by `CLAUDE.md`) maps every file, the

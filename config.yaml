@@ -58,6 +58,10 @@ ocr_device: auto             # auto | cuda | cpu (CUDA bf16 ≈ 2 GB VRAM)
 ocr_task: ocr                # ocr | table | formula | chart (UI overrides per job)
 ocr_max_new_tokens: 1024     # page-level text budget per image
 ocr_dpi: 200                 # PDF rasterization resolution
+vi_ocr_model: models/vietocr-s2s  # optional VietOCR seq2seq fp16 ONNX (44.7 MB, CPU) from
+                             # scripts/get_vietocr.py; re-reads non-CJK PP-OCR lines so Vietnamese keeps
+                             # diacritics + boxes. MEASURED ocr_test/samples: vi_sign 'CAMDOXE' -> 'CÁM ĐỖ XE',
+                             # ~0.1 s/line; fp32 (89 MB) gave identical text. Missing dir = PP-OCR/VLM as before
 translate_chunk_chars: 240   # Translate tab + OCR: chunk cost (CJK x3) so each MT call fits mt_max_new_tokens
 
 # ---- Voice activity (Silero VAD: https://github.com/snakers4/silero-vad) ----

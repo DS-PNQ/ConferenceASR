@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState, Component, type ReactNode } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, Component, type ReactNode } from "react";
 import {
   apiHealth,
   apiOcr,
@@ -46,7 +46,15 @@ type IconName =
   | "upload"
   | "sun"
   | "moon"
-  | "scan";
+  | "scan"
+  | "rotateL"
+  | "rotateR"
+  | "crop"
+  | "zoomIn"
+  | "zoomOut"
+  | "fit"
+  | "play"
+  | "globe";
 
 function Icon({ name, size = 18, stroke = 1.8 }: { name: IconName; size?: number; stroke?: number }) {
   const common = {
@@ -84,6 +92,14 @@ function Icon({ name, size = 18, stroke = 1.8 }: { name: IconName; size?: number
     sun: <><circle cx="12" cy="12" r="4" /><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4" /></>,
     moon: <path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z" />,
     wave: <><path d="M3 12h2l1.5-5 3 10 2.4-14L14.5 21l2.5-9H21" /></>,
+    rotateL: <><path d="M4 4v5h5" /><path d="M5.1 13.5A7 7 0 1 0 6.6 7L4 9" /></>,
+    rotateR: <><path d="M20 4v5h-5" /><path d="M18.9 13.5A7 7 0 1 1 17.4 7L20 9" /></>,
+    crop: <><path d="M6 2.5V18h15.5" /><path d="M2.5 6H18v15.5" /></>,
+    zoomIn: <><circle cx="10.8" cy="10.8" r="6.2" /><path d="m16 16 4.2 4.2M10.8 8.3v5M8.3 10.8h5" /></>,
+    zoomOut: <><circle cx="10.8" cy="10.8" r="6.2" /><path d="m16 16 4.2 4.2M8.3 10.8h5" /></>,
+    fit: <><path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5" /></>,
+    play: <path d="M7.5 5.5v13l11-6.5-11-6.5Z" />,
+    globe: <><circle cx="12" cy="12" r="8.5" /><path d="M3.5 12h17M12 3.5c2.3 2.4 3.4 5.2 3.4 8.5s-1.1 6.1-3.4 8.5c-2.3-2.4-3.4-5.2-3.4-8.5s1.1-6.1 3.4-8.5Z" /></>,
     scan: <><path d="M4 8V5.5A1.5 1.5 0 0 1 5.5 4H8M16 4h2.5A1.5 1.5 0 0 1 20 5.5V8M20 16v2.5a1.5 1.5 0 0 1-1.5 1.5H16M8 20H5.5A1.5 1.5 0 0 1 4 18.5V16" /><path d="M4 12h16" /></>,
   };
 
@@ -753,7 +769,7 @@ export default function App() {
         ) : activeView === "Translate" ? (
           <TranslateView displayLang={displayLang} terms={terms} status={status} setStatus={setStatus} />
         ) : activeView === "OCR" ? (
-          <OcrView displayLang={displayLang} terms={terms} setStatus={setStatus} />
+          <OcrView displayLang={displayLang} terms={terms} setStatus={setStatus} vietOcr={health?.ocr?.vietocr} />
         ) : (
           <SettingsView
             health={health} mics={mics} micId={micId} onMic={(id) => {
@@ -1237,17 +1253,30 @@ function TranslateView(props: {
   </section>;
 }
 
+const ZOOM_MIN = 0.25;
+const ZOOM_MAX = 5;
+const ZOOM_STEP = 1.25;
+const CJK_RE = /[　-〿぀-ヿ㐀-鿿가-힯＀-￯]/;
+
+// lang= on recognised text lets Chromium pick the right fallback font
+// (CJK glyph variants, Vietnamese stacked diacritics)
+function textLang(text: string, src: string): string | undefined {
+  if (CJK_RE.test(text)) return "zh-Hans";
+  return src === "auto" ? undefined : src;
+}
+
 function OcrView(props: {
   displayLang: string; terms: Record<string, string>;
-  setStatus: (s: string) => void;
+  setStatus: (s: string) => void; vietOcr?: boolean;
 }) {
   const [files, setFiles] = useState<File[]>([]);
+  const [srcUrl, setSrcUrl] = useState<string | null>(null);
   const [task, setTask] = useState("ocr");
   const [wantTr, setWantTr] = useState(true);
   const [tgt, setTgt] = useState(props.displayLang);
   const [srcLang, setSrcLang] = useState("auto");
   const [rotate, setRotate] = useState(0);
-  const [zoom, setZoom] = useState(1);
+  const [zoom, setZoom] = useState(1); // 1 = fit width
   const [cropMode, setCropMode] = useState(false);
   const [crop, setCrop] = useState<[number, number, number, number] | null>(null);
   const [busy, setBusy] = useState(false);
@@ -1257,8 +1286,13 @@ function OcrView(props: {
   const [tab, setTab] = useState<"text" | "regions" | "quality" | "export">("text");
   const [trace, setTrace] = useState<string[]>([]);
   const fileRef = useRef<HTMLInputElement>(null);
+  const viewRef = useRef<HTMLDivElement>(null);
   const previewRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<{ x0: number; y0: number } | null>(null);
+  const panRef = useRef<{ x: number; y: number; l: number; t: number } | null>(null);
+  const zoomRef = useRef(zoom);
+  const anchorRef = useRef<{ ux: number; uy: number; px: number; py: number } | null>(null);
+  zoomRef.current = zoom;
 
   const page = pages[sel] ?? null;
   const blocks = page?.blocks ?? [];
@@ -1266,6 +1300,13 @@ function OcrView(props: {
   const review = blocks.filter((b) => b.conf < 0.6);
   const overall = pages.length
     ? pages.reduce((a, p) => a + (p.overall_conf ?? 0), 0) / pages.length : 0;
+  // Before a run: the picked image with live rotate/crop. After: the
+  // backend's preview, already rotated + cropped, so no CSS rotate on it.
+  const showing = page?.preview ?? srcUrl;
+  const isSource = !page?.preview && !!srcUrl;
+  const canCrop = !!srcUrl && rotate === 0;
+
+  useEffect(() => () => { if (srcUrl) URL.revokeObjectURL(srcUrl); }, [srcUrl]);
 
   function stamp(msg: string) {
     const t = new Date().toTimeString().slice(0, 8);
@@ -1278,12 +1319,71 @@ function OcrView(props: {
     setSel(0);
     setSelBlock(null);
     setCrop(null);
+    setRotate(0);
+    setZoom(1);
+    const img = fs.find((f) => f.type.startsWith("image/"));
+    setSrcUrl(img ? URL.createObjectURL(img) : null);
     if (fs.length) stamp(`Document loaded — ${fs.map((f) => f.name).join(", ")}`);
   }
 
+  // Rotate/crop edit the source; old results would no longer match it.
+  function backToSource() {
+    if (pages.length) { setPages([]); setSelBlock(null); stamp("Results cleared — edit the page, then Run OCR again"); }
+  }
+
   function turn(deg: number) {
+    backToSource();
     setRotate((r) => (r + deg + 360) % 360);
     if (crop) { setCrop(null); stamp("Crop cleared (rotation resets the crop area)"); }
+  }
+
+  // Zoom keeping the point under (cx, cy) — viewport coords — still.
+  function zoomTo(next: number, cx?: number, cy?: number) {
+    const v = viewRef.current;
+    const z0 = zoomRef.current;
+    const z = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, +next.toFixed(3)));
+    if (!v || z === z0) return;
+    const r = v.getBoundingClientRect();
+    const px = (cx ?? r.left + r.width / 2) - r.left;
+    const py = (cy ?? r.top + r.height / 2) - r.top;
+    // anchor in zoom-1 units; ticks landing before the next render keep it
+    const c = previewRef.current;
+    anchorRef.current ??= { ux: (v.scrollLeft + px - (c?.offsetLeft ?? 0)) / z0,
+                            uy: (v.scrollTop + py - (c?.offsetTop ?? 0)) / z0, px, py };
+    zoomRef.current = z;
+    setZoom(z);
+  }
+
+  useLayoutEffect(() => {
+    const a = anchorRef.current;
+    const v = viewRef.current;
+    if (!a || !v) return;
+    anchorRef.current = null;
+    const c = previewRef.current;
+    v.scrollLeft = a.ux * zoom + (c?.offsetLeft ?? 0) - a.px;
+    v.scrollTop = a.uy * zoom + (c?.offsetTop ?? 0) - a.py;
+  }, [zoom]);
+
+  // Ctrl/⌘ + wheel and touchpad pinch (Chromium sends it as ctrl+wheel).
+  // Needs a non-passive listener, which React's onWheel is not.
+  useEffect(() => {
+    const v = viewRef.current;
+    if (!v) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      zoomTo(zoomRef.current * Math.exp(-e.deltaY * 0.0025), e.clientX, e.clientY);
+    };
+    v.addEventListener("wheel", onWheel, { passive: false });
+    return () => v.removeEventListener("wheel", onWheel);
+  }, [showing]);
+
+  function onViewKey(e: React.KeyboardEvent) {
+    if (e.key === "+" || e.key === "=") zoomTo(zoomRef.current * ZOOM_STEP);
+    else if (e.key === "-" || e.key === "_") zoomTo(zoomRef.current / ZOOM_STEP);
+    else if (e.key === "0") zoomTo(1);
+    else return;
+    e.preventDefault();
   }
 
   async function run() {
@@ -1300,10 +1400,13 @@ function OcrView(props: {
       setPages(r.pages);
       setSel(0);
       setSelBlock(null);
+      setCropMode(false);
       const n = r.pages.reduce((a, p) => a + (p.blocks?.length ?? 0), 0);
       const c = r.pages.length ? r.pages.reduce((a, p) => a + (p.overall_conf ?? 0), 0) / r.pages.length : 0;
+      const errs = r.pages.filter((p) => p.error);
       stamp(`OCR completed — ${r.pages.length} page(s), ${n} blocks, ${Math.round(c * 100)}% overall confidence`);
-      props.setStatus(`OCR done — ${r.pages.length} page(s), ${n} blocks.`);
+      errs.forEach((p) => stamp(`Page ${p.page} of ${p.file}: ${p.error}`));
+      props.setStatus(`OCR done — ${r.pages.length} page(s), ${n} blocks${errs.length ? `, ${errs.length} failed` : ""}.`);
     } catch (e) {
       stamp(`OCR failed — ${(e as Error).message}`);
       props.setStatus("OCR failed: " + (e as Error).message);
@@ -1318,7 +1421,6 @@ function OcrView(props: {
     document.querySelector(`[data-ocrblock="${id}"]`)?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
 
-  // crop drag on the preview (only when unrotated, so coords stay honest)
   function relOf(e: React.MouseEvent): [number, number] {
     const el = previewRef.current!.getBoundingClientRect();
     return [
@@ -1341,45 +1443,59 @@ function OcrView(props: {
     return pages.map((p) => `=== ${p.file} · page ${p.page} ===\n${p.text ?? ""}`).join("\n\n");
   }
 
-  return <section className="secondary-view wide ocr-scope">
-    <p className="secondary-label">Quick OCR · PP-OCR blocks + PaddleOCR-VL</p>
-    <h1>Drop a scan, get the text back.</h1>
-    <p>Images and PDFs. OCR mode switches speaker diarization off and frees its VRAM; optionally runs every block through Hy-MT2{Object.keys(props.terms).length ? " with your glossary applied" : ""}.</p>
+  async function copyPage() {
+    if (!page?.text) return;
+    await navigator.clipboard.writeText(page.translation ? `${page.text}\n\n${page.translation}` : page.text);
+    stamp(`Copied page ${page.page} text`);
+  }
 
-    <div className="ocr-toolbar">
-      <button className="ocr-tool" onClick={() => fileRef.current?.click()}><Icon name="plus" size={15} />Add document</button>
+  const zoomPct = Math.round(zoom * 100);
+  const runLabel = busy ? "Reading…" : pages.length ? "Run again" : "Run OCR";
+
+  return <section className="secondary-view wide ocr-scope">
+    <header className="ocr-head">
+      <h1>Document OCR</h1>
+      <p>Images and PDFs, Vietnamese · English · Chinese. OCR mode switches speaker diarization off and frees its VRAM; optionally runs every block through Hy-MT2{Object.keys(props.terms).length ? " with your glossary applied" : ""}.</p>
+      <p className={`ocr-vi ${props.vietOcr ? "ok" : ""}`}>
+        {props.vietOcr === undefined ? "Checking Vietnamese reader…"
+          : props.vietOcr ? <>Vietnamese reader: <b>VietOCR</b> — diacritics kept, with regions</>
+          : <>Vietnamese reader not installed — Vietnamese loses its diacritics. Add it (45 MB): <code>python scripts/get_vietocr.py</code></>}
+      </p>
+    </header>
+
+    <div className="ocr-toolbar" role="toolbar" aria-label="Document">
+      <button className="ocr-tool" onClick={() => fileRef.current?.click()}><Icon name="plus" size={16} />Add document</button>
       <input ref={fileRef} type="file" accept="image/*,.pdf" multiple hidden onChange={(e) => { pick(Array.from(e.target.files ?? [])); e.target.value = ""; }} />
+      {files.length > 0 && <span className="ocr-file" title={files.map((f) => f.name).join(", ")}>{files.length === 1 ? files[0].name : `${files.length} files`}</span>}
       <span className="ocr-sep" />
-      <button className="ocr-tool" onClick={() => turn(-90)} title="Rotate left">⟲ Rotate left</button>
-      <button className="ocr-tool" onClick={() => turn(90)} title="Rotate right">⟳ Rotate right</button>
-      <button className={`ocr-tool ${cropMode ? "on" : ""}`} disabled={rotate !== 0} title={rotate !== 0 ? "Reset rotation to 0° to crop" : "Drag a region on the preview"} onClick={() => { setCropMode((v) => !v); setCrop(null); }}>⛶ Crop</button>
-      <label className="ocr-lang"><span className="globe">🌐</span><select value={srcLang} onChange={(e) => setSrcLang(e.target.value)} aria-label="Document language">
-        <option value="auto">Auto (detect)</option>
+      <button className="ocr-tool icon" onClick={() => turn(-90)} disabled={!files.length} title="Rotate left" aria-label="Rotate left"><Icon name="rotateL" size={17} /></button>
+      <button className="ocr-tool icon" onClick={() => turn(90)} disabled={!files.length} title="Rotate right" aria-label="Rotate right"><Icon name="rotateR" size={17} /></button>
+      <button className={`ocr-tool ${cropMode ? "on" : ""}`} disabled={!canCrop} aria-pressed={cropMode}
+        title={!srcUrl ? "Crop needs an image (PDF pages: crop after export)" : rotate !== 0 ? "Reset rotation to 0° to crop" : "Drag a region on the page"}
+        onClick={() => { backToSource(); setCropMode((v) => !v); setCrop(null); }}><Icon name="crop" size={16} />{cropMode ? "Cropping" : "Crop"}</button>
+      <label className="ocr-lang"><Icon name="globe" size={16} /><select value={srcLang} onChange={(e) => setSrcLang(e.target.value)} aria-label="Document language">
+        <option value="auto">Auto-detect</option>
+        <option value="vi">Vietnamese</option>
         <option value="en">English</option>
         <option value="zh">Chinese</option>
-        <option value="vi">Vietnamese</option>
       </select></label>
-      <span className="ocr-sep" />
-      <button className="ocr-tool" onClick={() => setZoom((z) => Math.max(0.5, +(z - 0.25).toFixed(2)))}>−</button>
-      <span className="ocr-zoom">{Math.round(zoom * 100)}%</span>
-      <button className="ocr-tool" onClick={() => setZoom((z) => Math.min(2.5, +(z + 0.25).toFixed(2)))}>+</button>
-      <button className="ocr-run" onClick={() => void run()} disabled={!files.length || busy}>▶ {busy ? "Reading…" : "Run OCR"}</button>
+      <button className="ocr-run" onClick={() => void run()} disabled={!files.length || busy}><Icon name="play" size={14} />{runLabel}</button>
     </div>
 
     <div className="gt-bar">
-      <div className="gt-tabs">
+      <div className="gt-tabs" role="group" aria-label="Recognition task">
         {[["ocr", "Text"], ["table", "Table"], ["formula", "Formula"], ["chart", "Chart"]].map(([code, label]) => (
-          <button key={code} className={task === code ? "active" : ""} onClick={() => setTask(code)} title={code === "ocr" ? "Block OCR with regions + confidence" : "VLM read (text only, no regions)"}>{label}</button>
+          <button key={code} className={task === code ? "active" : ""} aria-pressed={task === code} onClick={() => setTask(code)} title={code === "ocr" ? "Text with regions + confidence" : "VLM read (text only, no regions)"}>{label}</button>
         ))}
       </div>
-      <label className="check inline" style={{ display: "flex", alignItems: "center", gap: 7, color: "var(--c343d54)", fontSize: 12, fontWeight: 600 }}>
+      <label className="check inline ocr-tr-toggle">
         <input type="checkbox" checked={wantTr} onChange={(e) => setWantTr(e.target.checked)} />
-        Translate with Hy-MT2
+        Translate to
       </label>
       {wantTr && (
-        <div className="gt-tabs">
-          {["en", "zh", "vi"].map((c) => (
-            <button key={c} className={tgt === c ? "active" : ""} onClick={() => setTgt(c)}>
+        <div className="gt-tabs" role="group" aria-label="Translation language">
+          {["vi", "en", "zh"].map((c) => (
+            <button key={c} className={tgt === c ? "active" : ""} aria-pressed={tgt === c} onClick={() => setTgt(c)}>
               {DISPLAY_LANGS.find((l) => l.code === c)?.label ?? c}
             </button>
           ))}
@@ -1387,75 +1503,111 @@ function OcrView(props: {
       )}
     </div>
 
-    <div className="ocr-grid">
-      <aside className="ocr-thumbs" aria-label="Pages">
-        {pages.length === 0 && <p className="archive-empty">Pages appear here after Run OCR.</p>}
+    {pages.length > 1 && (
+      <div className="ocr-thumbs" role="tablist" aria-label="Pages">
         {pages.map((p, i) => (
-          <button key={i} className={`ocr-thumb ${i === sel ? "on" : ""}`} onClick={() => { setSel(i); setSelBlock(null); }}>
-            {p.preview && <img src={p.preview} alt={`${p.file} p${p.page}`} />}
+          <button key={i} role="tab" aria-selected={i === sel} className={`ocr-thumb ${i === sel ? "on" : ""}`} onClick={() => { setSel(i); setSelBlock(null); }} title={`${p.file} · page ${p.page}`}>
+            {p.preview && <img src={p.preview} alt="" />}
             <span className="ocr-thumb-n">{p.page}</span>
           </button>
         ))}
-      </aside>
+      </div>
+    )}
 
-      <div className="ocr-preview" style={{ width: `${Math.round(zoom * 100)}%` }}>
-        {!page?.preview && <div className="ocr-empty">Pick a document and Run OCR — the page renders here with region boxes.</div>}
-        {page?.preview && (
-          <div ref={previewRef} className="ocr-canvas"
-            style={{ cursor: cropMode ? "crosshair" : "default" }}
-            onMouseDown={(e) => { if (!cropMode || !previewRef.current) return; dragRef.current = { x0: relOf(e)[0], y0: relOf(e)[1] }; setCrop(null); }}
-            onMouseMove={(e) => {
-              const d = dragRef.current;
-              if (!d) return;
-              const [x, y] = relOf(e);
-              setCrop([Math.min(d.x0, x), Math.min(d.y0, y), Math.max(d.x0, x), Math.max(d.y0, y)]);
-            }}
-            onMouseUp={() => {
-              dragRef.current = null;
-              setCrop((c) => {
-                if (!c || c[2] - c[0] < 0.02 || c[3] - c[1] < 0.02) return null;
-                stamp(`Crop set — ${Math.round((c[2] - c[0]) * 100)}% × ${Math.round((c[3] - c[1]) * 100)}% of page`);
-                return c;
-              });
-            }}>
-            <img src={page.preview} alt="OCR page" style={{ transform: `rotate(${rotate}deg)` }} draggable={false} />
-            {blocks.map((b, i) => (
-              <button key={b.id} className={`ocr-box ob-${i % 5} ${selBlock === b.id ? "on" : ""}`}
-                style={{ left: `${b.box[0] * 100}%`, top: `${b.box[1] * 100}%`, width: `${(b.box[2] - b.box[0]) * 100}%`, height: `${(b.box[3] - b.box[1]) * 100}%` }}
-                onClick={() => focusBlock(b.id)} title={`Block ${b.id} · ${Math.round(b.conf * 100)}%`} />
-            ))}
-            {crop && (
-              <div className="ocr-crop" style={{ left: `${crop[0] * 100}%`, top: `${crop[1] * 100}%`, width: `${(crop[2] - crop[0]) * 100}%`, height: `${(crop[3] - crop[1]) * 100}%` }} />
-            )}
-          </div>
-        )}
+    <div className="ocr-grid">
+      <div className="ocr-stage">
+        <div ref={viewRef} className={`ocr-view ${zoom > 1 && !cropMode ? "pannable" : ""}`} tabIndex={0}
+          aria-label="Page viewer. Ctrl + scroll or + / − to zoom, 0 to fit"
+          onKeyDown={onViewKey}
+          onMouseDown={(e) => {
+            if (cropMode || zoom <= 1 || !viewRef.current) return;
+            panRef.current = { x: e.clientX, y: e.clientY, l: viewRef.current.scrollLeft, t: viewRef.current.scrollTop };
+          }}
+          onMouseMove={(e) => {
+            const p = panRef.current;
+            if (!p || !viewRef.current) return;
+            viewRef.current.scrollLeft = p.l - (e.clientX - p.x);
+            viewRef.current.scrollTop = p.t - (e.clientY - p.y);
+          }}
+          onMouseUp={() => { panRef.current = null; }}
+          onMouseLeave={() => { panRef.current = null; }}>
+          {!showing && <div className="ocr-empty">
+            <Icon name="scan" size={34} stroke={1.4} />
+            <p>{files.length ? "PDF pages render here after Run OCR." : "Add an image or PDF to start."}</p>
+            {!files.length && <button className="ocr-tool" onClick={() => fileRef.current?.click()}><Icon name="plus" size={16} />Add document</button>}
+          </div>}
+          {showing && (
+            <div ref={previewRef} className="ocr-canvas"
+              style={{ width: `${zoom * 100}%`, cursor: cropMode ? "crosshair" : undefined }}
+              onDoubleClick={(e) => { if (!cropMode) zoomTo(zoom > 1 ? 1 : 2, e.clientX, e.clientY); }}
+              onMouseDown={(e) => { if (!cropMode || !previewRef.current) return; dragRef.current = { x0: relOf(e)[0], y0: relOf(e)[1] }; setCrop(null); }}
+              onMouseMove={(e) => {
+                const d = dragRef.current;
+                if (!d) return;
+                const [x, y] = relOf(e);
+                setCrop([Math.min(d.x0, x), Math.min(d.y0, y), Math.max(d.x0, x), Math.max(d.y0, y)]);
+              }}
+              onMouseUp={() => {
+                if (!dragRef.current) return;
+                dragRef.current = null;
+                setCrop((c) => {
+                  if (!c || c[2] - c[0] < 0.02 || c[3] - c[1] < 0.02) return null;
+                  stamp(`Crop set — ${Math.round((c[2] - c[0]) * 100)}% × ${Math.round((c[3] - c[1]) * 100)}% of page`);
+                  return c;
+                });
+              }}>
+              <img src={showing} alt={isSource ? "Document to read" : `Page ${page?.page} with detected regions`} style={isSource && rotate ? { transform: `rotate(${rotate}deg)` } : undefined} draggable={false} />
+              {!isSource && blocks.map((b, i) => (
+                <button key={b.id} className={`ocr-box ob-${i % 5} ${selBlock === b.id ? "on" : ""}`}
+                  style={{ left: `${b.box[0] * 100}%`, top: `${b.box[1] * 100}%`, width: `${(b.box[2] - b.box[0]) * 100}%`, height: `${(b.box[3] - b.box[1]) * 100}%` }}
+                  onClick={() => focusBlock(b.id)} aria-label={`Block ${b.id}: ${b.text}`} title={`${b.id} · ${Math.round(b.conf * 100)}% · ${b.text}`} />
+              ))}
+              {crop && isSource && (
+                <div className="ocr-crop" style={{ left: `${crop[0] * 100}%`, top: `${crop[1] * 100}%`, width: `${(crop[2] - crop[0]) * 100}%`, height: `${(crop[3] - crop[1]) * 100}%` }} />
+              )}
+            </div>
+          )}
+        </div>
+        <div className="ocr-zoombar" role="group" aria-label="Zoom">
+          <button onClick={() => zoomTo(zoom / ZOOM_STEP)} disabled={!showing || zoom <= ZOOM_MIN} title="Zoom out (−)" aria-label="Zoom out"><Icon name="zoomOut" size={17} /></button>
+          <input type="range" min={ZOOM_MIN * 100} max={ZOOM_MAX * 100} step={5} value={zoomPct} disabled={!showing}
+            onChange={(e) => zoomTo(+e.target.value / 100)} aria-label="Zoom level" />
+          <button onClick={() => zoomTo(zoom * ZOOM_STEP)} disabled={!showing || zoom >= ZOOM_MAX} title="Zoom in (+)" aria-label="Zoom in"><Icon name="zoomIn" size={17} /></button>
+          <output className="ocr-zoom" aria-live="polite">{zoomPct}%</output>
+          <button className="ocr-fit" onClick={() => zoomTo(1)} disabled={!showing || zoom === 1} title="Fit width (0)"><Icon name="fit" size={15} />Fit</button>
+        </div>
       </div>
 
       <aside className="ocr-side">
-        <div className="ocr-tabs">
+        <div className="ocr-tabs" role="tablist">
           {(["text", "regions", "quality", "export"] as const).map((t) => (
-            <button key={t} className={tab === t ? "on" : ""} onClick={() => setTab(t)}>{t[0].toUpperCase() + t.slice(1)}</button>
+            <button key={t} role="tab" aria-selected={tab === t} className={tab === t ? "on" : ""} onClick={() => setTab(t)}>{t[0].toUpperCase() + t.slice(1)}</button>
           ))}
         </div>
         {tab === "text" && (
           <>
-            <div className="ocr-detected"><div><span>Detected text</span><p>Backend: {page?.backend ?? "—"}{page?.ocr_ms ? ` · ${(page.ocr_ms / 1000).toFixed(1)}s` : ""}</p></div>
-              <div className="ocr-conf">Overall confidence: <b>{pages.length ? `${Math.round(overall * 100)}%` : "—"}</b></div></div>
+            <div className="ocr-detected">
+              <div><span>Detected text</span><p>{page?.backend ?? "—"}{page?.ocr_ms ? ` · ${(page.ocr_ms / 1000).toFixed(1)} s` : ""}</p></div>
+              <div className="ocr-conf">Confidence <b>{pages.length ? `${Math.round(overall * 100)}%` : "—"}</b></div>
+            </div>
+            {page?.text && <button className="ocr-copy" onClick={() => void copyPage()}><Icon name="copy" size={15} />Copy page text</button>}
+            {page?.error && <p className="ocr-warn">{page.error}</p>}
             {blocks.map((b, i) => (
-              <div key={b.id} data-ocrblock={b.id} className={`ocr-block ob-bg-${i % 5} ${selBlock === b.id ? "on" : ""}`} onClick={() => setSelBlock(b.id)}>
-                <div className="ocr-block-head"><b>{b.id}</b><span className="ocr-block-conf">{Math.round(b.conf * 100)}%</span></div>
-                <p>{b.text}</p>
-                {wantTr && b.translation && <p className="ocr-block-tr"><b className="tr-lang">{tgt}</b>{b.translation}</p>}
+              <div key={b.id} data-ocrblock={b.id} className={`ocr-block ${selBlock === b.id ? "on" : ""} ${b.conf < 0.6 ? "low" : ""}`} onClick={() => setSelBlock(b.id)}>
+                <div className="ocr-block-head"><b className={`ocr-num ob-${i % 5}`}>{b.id}</b><span className="ocr-block-conf">{b.conf < 0.6 ? "check · " : ""}{Math.round(b.conf * 100)}%</span></div>
+                <p lang={textLang(b.text, srcLang)}>{b.text}</p>
+                {wantTr && b.translation && <p className="ocr-block-tr" lang={tgt === "zh" ? "zh-Hans" : tgt}><b className="tr-lang">{tgt}</b>{b.translation}</p>}
               </div>
             ))}
-            {task !== "ocr" && page?.text && <div className="ocr-block"><p style={{ whiteSpace: "pre-wrap" }}>{page.text}</p></div>}
-            {!page && <p className="archive-empty">No text yet.</p>}
-            {page?.translation && <div className="ocr-block"><div className="ocr-block-head"><b>Full translation</b></div><p style={{ whiteSpace: "pre-wrap" }}>{page.translation}</p></div>}
+            {!blocks.length && page?.text && <div className="ocr-block"><p lang={textLang(page.text, srcLang)} style={{ whiteSpace: "pre-wrap" }}>{page.text}</p></div>}
+            {!page && <p className="archive-empty">{busy ? "Reading…" : "Recognised text appears here, one block per region."}</p>}
+            {page?.translation && !blocks.length && <div className="ocr-block"><div className="ocr-block-head"><b>Translation</b></div><p lang={tgt === "zh" ? "zh-Hans" : tgt} style={{ whiteSpace: "pre-wrap" }}>{page.translation}</p></div>}
+            {page?.translation_error && <p className="ocr-warn">Translation failed: {page.translation_error}</p>}
           </>
         )}
         {tab === "regions" && (
           <>
-            <p className="archive-meta">{blocks.length} regions {task !== "ocr" ? "(VLM tasks carry no regions — switch to Text task)" : ""}</p>
+            <p className="archive-meta">{blocks.length} regions {task !== "ocr" ? "(Table / Formula / Chart reads carry no regions — use Text)" : ""}</p>
             {blocks.map((b) => (
               <button key={b.id} className={`ocr-region ${selBlock === b.id ? "on" : ""}`} onClick={() => focusBlock(b.id)}>
                 <b>#{b.id}</b><span>[{b.box.map((v) => v.toFixed(2)).join(", ")}]</span><i>{Math.round(b.conf * 100)}%</i>
@@ -1467,10 +1619,10 @@ function OcrView(props: {
           <>
             <div className="ocr-detected"><div><span>Quality</span><p>{blocks.length} blocks · {review.length} need review</p></div>
               <div className="ocr-conf"><b>{pages.length ? `${Math.round(overall * 100)}%` : "—"}</b></div></div>
-            {review.length > 0 && <p className="ocr-warn">⚠ Low-confidence blocks (possible handwriting — review):</p>}
+            {review.length > 0 && <p className="ocr-warn">Low-confidence blocks — blurred, handwritten or cut off. Check them against the page:</p>}
             {lowConf.map((b) => (
-              <button key={b.id} className="ocr-region" onClick={() => focusBlock(b.id)}>
-                <b>#{b.id}</b><span className="ocr-low-text">{b.text.slice(0, 42)}</span><i>{Math.round(b.conf * 100)}%</i>
+              <button key={b.id} className="ocr-region" onClick={() => { setTab("text"); focusBlock(b.id); }}>
+                <b>#{b.id}</b><span className="ocr-low-text" lang={textLang(b.text, srcLang)}>{b.text.slice(0, 42)}</span><i>{Math.round(b.conf * 100)}%</i>
               </button>
             ))}
             {lowConf.length === 0 && pages.length > 0 && <p className="archive-empty">All blocks above 85% — nothing to review.</p>}
@@ -1481,10 +1633,10 @@ function OcrView(props: {
           <>
             <p className="archive-meta">Downloads include all pages{wantTr ? " + translations" : ""}.</p>
             <div className="ocr-exports">
-              <button onClick={() => download("ocr.txt", exportTxt(), "text/plain")}>Export text (.txt)</button>
-              <button onClick={() => download("ocr.json", JSON.stringify(pages.map((p) => ({ file: p.file, page: p.page, text: p.text, blocks: p.blocks, overall_conf: p.overall_conf, translation: p.translation })), null, 2), "application/json")}>Export as JSON</button>
-              <button onClick={() => download("ocr.csv", "file,page,id,text,conf\n" + pages.flatMap((p) => (p.blocks ?? []).map((b) => `${p.file},${p.page},${b.id},"${(b.text ?? "").replace(/"/g, "'")}",${b.conf}`)).join("\n"), "text/csv")}>Export as CSV</button>
-              <button onClick={() => download("ocr.md", pages.map((p) => `## ${p.file} · page ${p.page}\n\n${p.text ?? ""}${p.translation ? `\n\n> [${tgt}] ${p.translation}` : ""}`).join("\n\n"), "text/markdown")}>Export Markdown</button>
+              <button disabled={!pages.length} onClick={() => download("ocr.txt", exportTxt(), "text/plain")}>Export text (.txt)</button>
+              <button disabled={!pages.length} onClick={() => download("ocr.json", JSON.stringify(pages.map((p) => ({ file: p.file, page: p.page, text: p.text, blocks: p.blocks, overall_conf: p.overall_conf, translation: p.translation })), null, 2), "application/json")}>Export as JSON</button>
+              <button disabled={!pages.length} onClick={() => download("ocr.csv", "﻿file,page,id,text,conf\n" + pages.flatMap((p) => (p.blocks ?? []).map((b) => `${p.file},${p.page},${b.id},"${(b.text ?? "").replace(/"/g, '""')}",${b.conf}`)).join("\n"), "text/csv")}>Export as CSV</button>
+              <button disabled={!pages.length} onClick={() => download("ocr.md", pages.map((p) => `## ${p.file} · page ${p.page}\n\n${p.text ?? ""}${p.translation ? `\n\n> [${tgt}] ${p.translation}` : ""}`).join("\n\n"), "text/markdown")}>Export Markdown</button>
             </div>
           </>
         )}
@@ -1494,14 +1646,12 @@ function OcrView(props: {
     <div className="ocr-bottom">
       <div className="ocr-trace">
         <div className="ocr-trace-tabs"><span className="on">OCR trace</span></div>
-        {trace.length === 0 && <p className="archive-empty">Trace appears here.</p>}
+        {trace.length === 0 && <p className="archive-empty">Each step of a job is logged here.</p>}
         {trace.map((t, i) => <p key={i}>{t}</p>)}
       </div>
       <div className="ocr-actions">
-        <span>Action panel</span>
-        <button className="ocr-run" onClick={() => void run()} disabled={!files.length || busy}>▶ {busy ? "Reading…" : "Run OCR"}</button>
-        <button disabled={!pages.length} onClick={() => download("ocr.txt", exportTxt(), "text/plain")}>Export text</button>
-        <button disabled={!pages.length} onClick={() => { setPages([]); setFiles([]); setTrace([]); setSelBlock(null); stamp("Cleared"); }}>Clear</button>
+        <button disabled={!pages.length} onClick={() => download("ocr.txt", exportTxt(), "text/plain")}><Icon name="download" size={15} />Export text</button>
+        <button disabled={!files.length} onClick={() => { pick([]); setTrace([]); stamp("Cleared"); }}>Clear</button>
       </div>
     </div>
   </section>;

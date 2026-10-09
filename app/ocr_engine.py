@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
+from pathlib import Path
 
 log = logging.getLogger("conf.ocr")
 
@@ -31,11 +33,76 @@ class MockOCR:
         return f"[ocr demo] task={task}"
 
 
+_CJK = re.compile(r"[　-〿぀-ヿ㐀-鿿가-힯＀-￯]")
+
+
+def _crop_quad(img, box):
+    """Warp a detected quad flat (PaddleOCR get_rotate_crop_image)."""
+    import cv2
+    import numpy as np
+
+    pts = np.array(box, dtype=np.float32)
+    w = int(max(np.linalg.norm(pts[0] - pts[1]), np.linalg.norm(pts[2] - pts[3])))
+    h = int(max(np.linalg.norm(pts[0] - pts[3]), np.linalg.norm(pts[1] - pts[2])))
+    m = cv2.getPerspectiveTransform(
+        pts, np.float32([[0, 0], [w, 0], [w, h], [0, h]]))
+    out = cv2.warpPerspective(img, m, (max(w, 1), max(h, 1)),
+                              borderMode=cv2.BORDER_REPLICATE, flags=cv2.INTER_CUBIC)
+    return np.rot90(out) if h and w and h / w >= 1.5 else out
+
+
+class VietRec:
+    """VietOCR vgg_seq2seq ONNX line reader (ocr_test/vietocr_onnx.py twin).
+
+    PP-OCR rec dicts lack most Vietnamese letters; VietOCR reads the full
+    alphabet + Latin/digits. Model dir = encoder.onnx, decoder.onnx,
+    vocab.txt from scripts/get_vietocr.py. Tokens: 1 sos, 2 eos, 4.. vocab.
+    """
+
+    def __init__(self, model_dir: str, threads: int = 4):
+        import onnxruntime as ort
+
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = threads
+        prov = ["CPUExecutionProvider"]
+        d = Path(model_dir)
+        self.enc = ort.InferenceSession(str(d / "encoder.onnx"), so, providers=prov)
+        self.dec = ort.InferenceSession(str(d / "decoder.onnx"), so, providers=prov)
+        self.vocab = (d / "vocab.txt").read_text(encoding="utf-8").split("\n")
+
+    def read(self, crop_rgb) -> tuple[str, float]:
+        import numpy as np
+        from PIL import Image
+
+        h, w = crop_rgb.shape[:2]
+        nw = min(max(int(np.ceil(int(32 * w / max(h, 1)) / 10) * 10), 32), 512)
+        # MEASURED ocr_test/README: LANCZOS is what it was trained on;
+        # bilinear/area cost 6-7% CER
+        x = np.asarray(Image.fromarray(np.ascontiguousarray(crop_rgb))
+                       .resize((nw, 32), Image.LANCZOS), dtype=np.float32)
+        enc_out, hidden = self.enc.run(None, {"image": (x / 255.0).transpose(2, 0, 1)[None]})
+        tok, chars, probs = 1, [], []
+        for _ in range(128):
+            logits, hidden = self.dec.run(None, {"token": np.array([tok], np.int64),
+                                                 "hidden": hidden, "enc_out": enc_out})
+            row = logits[0]
+            tok = int(row.argmax())
+            if tok == 2:
+                break
+            if tok > 3:
+                e = np.exp(row - row.max())
+                chars.append(self.vocab[tok - 4])
+                probs.append(float(e[tok] / e.sum()))
+        return "".join(chars), (float(np.mean(probs)) if probs else 0.0)
+
+
 class BlockOCR:
     """PP-OCR via rapidocr_onnxruntime: real boxes + text + scores on CPU.
 
     No paddle dependency (paddle 3.3 CPU is broken on this machine's
     executor); ONNX models run through the already-installed ORT.
+    With `vi_ocr_model` present, non-CJK lines are re-read by VietRec so
+    Vietnamese keeps its diacritics (and its boxes).
     """
 
     def __init__(self, cfg: dict):
@@ -43,6 +110,12 @@ class BlockOCR:
         self._lock = threading.Lock()
         self._engine = None
         self._failed = False
+        self._viet = None
+
+    @property
+    def has_viet(self) -> bool:
+        d = self.cfg.get("vi_ocr_model") or ""
+        return bool(d) and (Path(d) / "encoder.onnx").exists()
 
     @property
     def loaded(self) -> bool:
@@ -67,6 +140,13 @@ class BlockOCR:
             except Exception as e:
                 log.warning("RapidOCR unavailable (%s)", e)
                 self._failed = True
+                return
+            if self.has_viet:
+                try:
+                    self._viet = VietRec(self.cfg["vi_ocr_model"])
+                    log.info("VietOCR line reader ready (%s)", self.cfg["vi_ocr_model"])
+                except Exception as e:
+                    log.warning("VietOCR unavailable (%s) — PP-OCR text only", e)
 
     def read_blocks(self, image) -> dict:
         """-> {text, blocks: [{id, text, conf, box:[x0,y0,x1,y1] rel}], overall_conf}."""
@@ -77,17 +157,25 @@ class BlockOCR:
             raise RuntimeError("block OCR unavailable")
         img = image.convert("RGB")
         w, h = img.size
-        with self._lock:
-            out, _ = self._engine(np.asarray(img))
+        arr = np.asarray(img)
         blocks = []
-        if out:
-            for i, (box, text, conf) in enumerate(out):
+        with self._lock:
+            out, _ = self._engine(arr)
+            for i, (box, text, conf) in enumerate(out or []):
+                text, conf, rec = str(text or ""), float(conf or 0.0), "pp-ocr"
+                if self._viet is not None and not _CJK.search(text):
+                    try:
+                        text, conf = self._viet.read(_crop_quad(arr, box))
+                        rec = "vietocr"
+                    except Exception as e:
+                        log.warning("VietOCR line failed (%s), keeping PP-OCR", e)
                 xs = [p[0] for p in box]
                 ys = [p[1] for p in box]
                 blocks.append({
                     "id": i + 1,
-                    "text": str(text or ""),
-                    "conf": round(float(conf or 0.0), 4),
+                    "text": text,
+                    "conf": round(conf, 4),
+                    "rec": rec,
                     "box": [min(xs) / w, min(ys) / h,
                             max(xs) / w, max(ys) / h],
                 })

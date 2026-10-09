@@ -76,8 +76,9 @@ socket dies with 1011 keepalive timeout).
 - **Legacy WS** (message without `type`): fixed-window `pipe.process_chunk`. Browser-demo era.
 - **Translate tab** `POST /api/translate` → `main._translate_long` (chunked by
   `translate_chunk_chars`, CJK costs ×3).
-- **OCR** `POST /api/ocr` → PP-OCR blocks (`task=ocr`) or PaddleOCR-VL (table/formula/chart,
-  and `task=ocr` with `src=vi`), optional MT: blocks translated in one pass off the event loop,
+- **OCR** `POST /api/ocr` → PP-OCR blocks (`task=ocr`; non-CJK lines re-read by VietOCR when
+  `vi_ocr_model` exists) or PaddleOCR-VL (table/formula/chart, and `task=ocr` with `src=vi`
+  only when VietOCR is missing), optional MT: blocks translated in one pass off the event loop,
   page translation = their join. Entering OCR mode unloads the diarizer to free VRAM (`_enter_ocr_mode`).
 - **Exports** `GET /api/export.txt|.srt` read `pipe.history` (upload/legacy path only).
 
@@ -85,7 +86,7 @@ socket dies with 1011 keepalive timeout).
 
 | File | Role | When you change it, also check |
 | --- | --- | --- |
-| `run.py` | Starts uvicorn on `config.yaml` host/port | `electron/src/main.ts` (spawns it), `csharp/.../BackendManager.cs` |
+| `run.py` | chdirs to its own folder (so `config.yaml` and relative model paths resolve from any cwd), starts uvicorn on `config.yaml` host/port | `electron/src/main.ts` (spawns it), `csharp/.../BackendManager.cs` |
 | `config.yaml` | All tunables, with MEASURED comments | Code reading the key (grep it), README §3 |
 | `app/__init__.py` | `../pydeps` triton path, cache dirs, Windows EcoQoS opt-out | `mt_engine._enable_compile` |
 | `app/main.py` | FastAPI app: builds engines, REST routes, `/ws/live` protocol | `electron/ui/src/api.ts`, `csharp/ConfLive/ApiClient.cs` + `Models.cs`, `scripts/live_ws_e2e.mjs`, `scripts/ui_soak_server.py`, README §8 |
@@ -102,9 +103,9 @@ socket dies with 1011 keepalive timeout).
 | `app/df_sidecar.py` | Stand-alone DF worker under `../dfenv`; imports nothing from `app` | `enhancer._sidecar` |
 | `app/vad.py` | Silero VAD, stateful per stream, fail-open | `streaming.feed`, `/api/warmup` |
 | `app/langid.py` | lingua vi/en/zh detect, `None` = unsure | `streaming`, `pipeline` |
-| `app/ocr_engine.py` | `PaddleOCRVLEngine`, `BlockOCR`, `MockOCR` | `/api/ocr`, UI OCR view |
+| `app/ocr_engine.py` | `PaddleOCRVLEngine`, `BlockOCR` (+ `VietRec` VietOCR ONNX line reader, `_crop_quad`), `MockOCR` | `/api/ocr`, `/api/health` `ocr.vietocr`, UI OCR view, `ocr_test/vietocr_onnx.py` (reference twin) |
 | `app/audio_io.py`, `app/device.py` | Decode/resample to 16 kHz; CUDA/CPU + dtype resolution | All engines |
-| `electron/src/main.ts` | Find `run.py`, probe Python + CUDA, spawn backend, open window, grant `getDisplayMedia` loopback audio (System audio input) | `ConfLive.bat`, package.json `build.files` |
+| `electron/src/main.ts` | Find `run.py`, probe Python + CUDA, spawn backend, open window, grant `getDisplayMedia` loopback audio (System audio input), whole-UI zoom (Ctrl+=/-/0, Ctrl+wheel) | `ConfLive.bat`, package.json `build.files` |
 | `electron/src/preload.ts` | Exposes `window.conflive` (version, port) | — |
 | `electron/ui/src/api.ts` | **Client contract**: REST calls, `LiveSocket`, mic / system-audio capture (`SYSTEM_AUDIO` entry in `listMics`), TS types | `app/main.py`, `app/streaming.py` event fields |
 | `electron/ui/src/App.tsx` | Whole UI (Live / Library / Glossary / Translate / OCR / Settings) | `api.ts` types |
@@ -112,7 +113,9 @@ socket dies with 1011 keepalive timeout).
 | `installer/`, `.github/workflows/build-installer.yml` | Inno Setup + CI (builds UI + C# exe on `v*` tags) | `csharp/` paths |
 | `ConfLive.bat` | Tester one-click: venv, torch, requirements, models, build, launch | `requirements.txt`, `scripts/download_models.py`, `electron/package.json` |
 | `scripts/` | Checks and tools (see below) | — |
-| `ocr_test/` | Side experiment: OCR recogniser comparison/VietOCR ONNX for a phone app. Not wired into the backend | — |
+| `ocr_test/` | OCR recogniser comparison + `export_vietocr_onnx.py` (used by `scripts/get_vietocr.py`) | `scripts/get_vietocr.py` |
+| `scripts/get_vietocr.py` | Optional Vietnamese OCR: vietocr into a temp `--target` dir, export fp16 ONNX → `models/vietocr-s2s` | `config.yaml › vi_ocr_model`, `BlockOCR` |
+| `checkpoints/` | Source snapshots (no git): `snap.sh <name>`, history + restore steps in `WORKLOG.md` | — |
 
 ### WS contract (must match in `main.py`, `streaming.py`, `api.ts`, `ApiClient.cs`)
 
@@ -172,8 +175,12 @@ Env overrides: `DEVICE`, `MT_DTYPE`, `ASR_MODEL`, `MT_MODEL`, `DEMO_MODE`, `CONF
   (0.12 s); without it the last word before a hand-over vanished from both rows.
 - Sidecar startup is ~20–30 s of transformers 5.x imports (not network): `/api/warmup`
   starts the diarizer first, in a background thread.
-- PP-OCR rec dictionaries lack most Vietnamese letters (`CẤM ĐỖ XE` → `CAMDOXE`), so
-  `/api/ocr` sends `src=vi` to PaddleOCR-VL. The VLM decodes with `no_repeat_ngram_size=8`
+- PP-OCR rec dictionaries lack most Vietnamese letters (`CẤM ĐỖ XE` → `CAMDOXE`); PP-OCRv6
+  (2026) still lacks 88/146. So non-CJK lines go to VietOCR (`vi_ocr_model`); without it
+  `/api/ocr` sends `src=vi` to PaddleOCR-VL, which garbles Vietnamese signs (`Giờ` → `Giంద 00 00`).
+  VietOCR input must be PIL LANCZOS-resized (bilinear costs 6–7% CER); its vocab has no `–`.
+  SenOCR-Vi (PaddleOCR-VL-1.6 vi fine-tune) needs transformers ≥ 5 — not in the backend env.
+  The VLM decodes with `no_repeat_ngram_size=8`
   (without it a Vietnamese sign looped `00 00 …` to the 1024-token cap, 22 s → 1 s).
 
 ## Rules for every change (mandatory)

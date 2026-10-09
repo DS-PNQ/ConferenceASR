@@ -106,7 +106,7 @@ def health():
         "diarizer": type(RUNTIME.get("diarizer", diarizer)).__name__,
         "diarizer_status": _diarizer_status(),
         "denoise": enhancer.status(),
-        "ocr": ocr.status(),
+        "ocr": {**ocr.status(), "vietocr": blockocr.has_viet},
         "vad": vad.status(),
     }
 
@@ -389,8 +389,9 @@ async def ocr_docs(
     dpi = max(72, min(400, int(CFG.get("ocr_dpi", 200))))
     deloaded = _enter_ocr_mode()
     # PP-OCR rec dicts lack most Vietnamese letters ("CẤM ĐỖ XE" -> "CAMDOXE",
-    # ocr_test/README.md); the VLM keeps diacritics, at the cost of no boxes
-    use_blocks = (task == "ocr" and src_lang != "vi")
+    # ocr_test/README.md): with VietOCR installed blocks keep diacritics,
+    # otherwise src=vi goes to the VLM (diacritics, no boxes)
+    use_blocks = task == "ocr" and (src_lang != "vi" or blockocr.has_viet)
     if use_blocks:
         try:
             await asyncio.to_thread(blockocr.ensure_loaded)
@@ -434,7 +435,9 @@ async def ocr_docs(
                         res = await asyncio.to_thread(
                             blockocr.read_blocks, work)
                         entry.update(res)
-                        entry["backend"] = "pp-ocr"
+                        entry["backend"] = ("pp-ocr + vietocr" if any(
+                            b.get("rec") == "vietocr" for b in res["blocks"])
+                            else "pp-ocr")
                     else:
                         entry["text"] = await asyncio.to_thread(
                             ocr.read, work, task)
@@ -472,7 +475,8 @@ async def ocr_docs(
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
     return {"ok": True, "task": task, "pages": pages_out, "ocr": ocr.status(),
             "block_ocr": {"ready": blockocr.loaded,
-                          "available": blockocr.available},
+                          "available": blockocr.available,
+                          "vietocr": blockocr.has_viet},
             "diarizer": _diarizer_status(), "diarizer_deloaded": deloaded}
 
 
