@@ -88,6 +88,17 @@ def _ban_repeat_trigrams(logits_row, history: list[int], n: int = 3):
             pass
 
 
+class _EventStop:
+    """generate() stopping criterion: ends the decode once `ev` is set."""
+
+    def __init__(self, ev: threading.Event):
+        self.ev = ev
+
+    def __call__(self, input_ids, scores, **kw):
+        return torch.full((input_ids.shape[0],), self.ev.is_set(),
+                          dtype=torch.bool, device=input_ids.device)
+
+
 class _IdCollector:
     """Minimal generate() streamer: collects raw token ids (prompt included).
 
@@ -374,7 +385,8 @@ class HyMT2Engine:
         input_ids = input_ids.to(self._model.device)
         return input_ids, torch.ones_like(input_ids)
 
-    def _gen_kwargs(self, streamer=None, speculate: bool = False) -> dict:
+    def _gen_kwargs(self, streamer=None, speculate: bool = False,
+                    stop: threading.Event | None = None) -> dict:
         greedy = not bool(self.cfg.get("mt_do_sample", False))
         # NOTE: no repetition_penalty — it is a full-vocab (120k) op paid on
         # EVERY decode step and buys nothing for translation output.
@@ -404,6 +416,10 @@ class HyMT2Engine:
             kw["prompt_lookup_num_tokens"] = int(self.cfg.get("mt_lookup_tokens", 10))
         if streamer is not None:
             kw["streamer"] = streamer
+        if stop is not None:
+            from transformers import StoppingCriteriaList
+
+            kw["stopping_criteria"] = StoppingCriteriaList([_EventStop(stop)])
         return kw
 
     def _should_speculate(self, src: str, tgt: str, text: str = "") -> bool:
@@ -469,7 +485,8 @@ class HyMT2Engine:
 
     def translate(self, text: str, tgt: str = "en", src: str = "auto",
                   context: list[str] | None = None,
-                  terms: dict[str, str] | None = None) -> str:
+                  terms: dict[str, str] | None = None,
+                  stop: threading.Event | None = None) -> str:
         text = (text or "").strip()
         if not text:
             return ""
@@ -478,14 +495,15 @@ class HyMT2Engine:
             if self._mock:
                 return self._model.translate(text, src=src, tgt=tgt)
             return self._translate_locked(text, tgt, context, terms,
-                                          self._should_speculate(src, tgt, text))
+                                          self._should_speculate(src, tgt, text), stop)
 
     def _translate_locked(self, text: str, tgt: str, context: list[str] | None,
-                           terms: dict[str, str] | None, speculate: bool) -> str:
+                           terms: dict[str, str] | None, speculate: bool,
+                           stop: threading.Event | None = None) -> str:
         """Plain one-shot generation. Caller MUST hold _lock."""
         input_ids, attn_mask = self._prepare(text, tgt, context, terms)
         out = self._generate(input_ids, attn_mask,
-                             self._gen_kwargs(speculate=speculate))
+                             self._gen_kwargs(speculate=speculate, stop=stop))
         gen = out[0][input_ids.shape[-1]:]
         return self._tok.decode(gen, skip_special_tokens=True).strip()
 
@@ -497,7 +515,8 @@ class HyMT2Engine:
     # final drafts off its last partial translation.
     def translate_ssbd(self, text: str, draft_text: str, tgt: str = "en",
                        src: str = "auto", context: list[str] | None = None,
-                       terms: dict[str, str] | None = None) -> dict:
+                       terms: dict[str, str] | None = None,
+                       stop: threading.Event | None = None) -> dict:
         """SSBD one-shot. Caller MUST hold _lock (or call via translate()).
 
         Returns {text, draft_len, accepted, beta, path} where path is
@@ -516,14 +535,14 @@ class HyMT2Engine:
         m = int(draft_ids.shape[-1])
         if m == 0:
             out = self._generate(input_ids, attn_mask,
-                                 self._gen_kwargs(speculate=False))
+                                 self._gen_kwargs(speculate=False, stop=stop))
             gen = out[0][prompt_len:]
             return {"text": self._tok.decode(gen, skip_special_tokens=True).strip(),
                     "draft_len": 0, "accepted": 0, "beta": beta, "path": "scratch"}
 
         def _scratch():
             out = self._generate(input_ids, attn_mask,
-                                 self._gen_kwargs(speculate=False))
+                                 self._gen_kwargs(speculate=False, stop=stop))
             gen = out[0][prompt_len:]
             return {"text": self._tok.decode(gen, skip_special_tokens=True).strip(),
                     "draft_len": m, "accepted": 0, "beta": beta, "path": "scratch"}
@@ -533,7 +552,7 @@ class HyMT2Engine:
                 full = torch.cat([input_ids, draft_ids], dim=-1)
                 full_mask = torch.ones_like(full)
                 fwd = self._model(input_ids=full, attention_mask=full_mask,
-                                  use_cache=True)
+                                  use_cache=self._static is None)
                 logits = fwd.logits[0, prompt_len - 1:prompt_len - 1 + m]
                 probs = torch.softmax(logits, dim=-1)
                 draft = draft_ids[0]
@@ -552,6 +571,8 @@ class HyMT2Engine:
         # from an externally supplied past — its input preparation indexes
         # an empty cache_position). No second prefill.
         try:
+            if self._static is not None:  # re-prefill below runs CUDA-graphed: 3x the eager loop
+                raise LookupError("compiled decode")
             if past is None or not hasattr(past, "crop"):
                 raise RuntimeError("no croppable KV")
             past.crop(prompt_len + d)
@@ -578,17 +599,14 @@ class HyMT2Engine:
                     cur = torch.tensor([[nxt]], device=dev)
             path = "crop"
         except Exception as e:
-            log.warning("SSBD crop-resume failed (%s) — re-prefill", e)
+            if not isinstance(e, LookupError):
+                log.warning("SSBD crop-resume failed (%s) — re-prefill", e)
             try:
                 pre = torch.cat([input_ids, draft_ids[:, :d]], dim=-1) \
                     if d else input_ids
-                with torch.no_grad():
-                    out = self._model.generate(
-                        pre, attention_mask=torch.ones_like(pre),
-                        use_cache=True, max_new_tokens=max_new,
-                        do_sample=False,
-                        pad_token_id=self._tok.eos_token_id)
-                suffix = out[0][pre.shape[-1]:]
+                out = self._generate(pre, torch.ones_like(pre),
+                                     self._gen_kwargs(speculate=False, stop=stop))
+                suffix = out[0][pre.shape[-1]:].tolist()
                 path = "reprefill"
             except Exception as e2:
                 log.warning("SSBD re-prefill failed (%s) — scratch", e2)
@@ -604,99 +622,6 @@ class HyMT2Engine:
             pass
         return {"text": self._tok.decode(gen_ids, skip_special_tokens=True).strip(),
                 "draft_len": m, "accepted": d, "beta": beta, "path": path}
-
-    def translate_ssbd_stream(self, text: str, draft_text: str, tgt: str = "en",
-                              src: str = "auto",
-                              context: list[str] | None = None,
-                              terms: dict[str, str] | None = None):
-        """Streaming SSBD: accepted prefix as one instant delta, then suffix
-        tokens live. Sets self._last_ssbd metrics when done. Caller MUST hold
-        _lock. Falls back to plain streaming when SSBD is unusable."""
-        import torch
-
-        self._last_ssbd = {"path": "scratch", "draft_len": 0, "accepted": 0}
-        text = (text or "").strip()
-        if not text:
-            return
-            yield
-        self.ensure_loaded()
-        # compiled decode (3.3x) beats SSBD's eager manual loop (1.4x)
-        if self._mock or not draft_text or not draft_text.strip() or self._static is not None:
-            yield from self.translate_stream(text, tgt=tgt, src=src,
-                                             context=context, terms=terms)
-            return
-        with self._lock:
-            beta = float(self.cfg.get("ssbd_beta", 0.2))
-            max_new = int(self.cfg.get("mt_max_new_tokens", 128))
-            try:
-                input_ids, _ = self._prepare(text, tgt, context, terms)
-                prompt_len = int(input_ids.shape[-1])
-                draft_ids = self._tok(draft_text, return_tensors="pt",
-                                      add_special_tokens=False)["input_ids"].to(
-                    self._model.device)
-                m = int(draft_ids.shape[-1])
-                if m == 0:
-                    raise RuntimeError("empty draft")
-                with torch.no_grad():
-                    full = torch.cat([input_ids, draft_ids], dim=-1)
-                    fwd = self._model(
-                        input_ids=full,
-                        attention_mask=torch.ones_like(full), use_cache=True)
-                    logits = fwd.logits[0, prompt_len - 1:prompt_len - 1 + m]
-                    probs = torch.softmax(logits, dim=-1)
-                    draft = draft_ids[0]
-                    mixed = probs * (1.0 - beta)
-                    mixed[torch.arange(m, device=mixed.device), draft] += beta
-                    pred = mixed.argmax(dim=-1)
-                    match = (pred == draft)
-                    d = int(torch.nonzero(~match)[0, 0]) \
-                        if not bool(match.all()) else m
-                    past = getattr(fwd, "past_key_values", None)
-                    if past is None or not hasattr(past, "crop"):
-                        raise RuntimeError("no croppable KV")
-                    past.crop(prompt_len + d)
-                    cur = full[:, prompt_len + d - 1:prompt_len + d]
-                    dev = self._model.device
-                    eos = self._tok.eos_token_id
-                    prefix_ids = draft[:d].tolist()
-                    # Same cumulative-decode convention as translate_stream:
-                    # slice against the previous FULL decode (stable), never
-                    # against a separately decoded prefix (BPE merges shift).
-                    shown = self._tok.decode(prefix_ids,
-                                             skip_special_tokens=True).rstrip("\ufffd")
-                    if d:
-                        yield shown
-                    shown_ids: list[int] = []
-                    hist = list(prefix_ids)
-                    for _step in range(max_new):
-                        L = prompt_len + d + _step
-                        o = self._model(
-                            input_ids=cur,
-                            attention_mask=torch.ones(
-                                (1, L + 1), dtype=torch.long, device=dev),
-                            past_key_values=past, use_cache=True)
-                        past = o.past_key_values
-                        row = o.logits[0, -1]
-                        _ban_repeat_trigrams(row, hist + shown_ids)
-                        nxt = int(row.argmax())
-                        if nxt == eos:
-                            break
-                        shown_ids.append(nxt)
-                        cur = torch.tensor([[nxt]], device=dev)
-                        new_text = self._tok.decode(
-                            prefix_ids + shown_ids, skip_special_tokens=True).rstrip("\ufffd")
-                        if len(new_text) > len(shown):
-                            yield new_text[len(shown):]
-                            shown = new_text
-                    self._last_ssbd = {"path": "crop", "draft_len": m,
-                                       "accepted": d}
-                    return
-            except Exception as e:
-                log.warning("SSBD stream failed (%s) — plain streaming", e)
-            # Fallback: translate_stream re-locks, but the lock is an RLock
-            # held by this thread, so delegation is safe.
-            yield from self.translate_stream(text, tgt=tgt, src=src,
-                                             context=context, terms=terms)
 
     def translate_stream(self, text: str, tgt: str = "en", src: str = "auto",
                          context: list[str] | None = None,

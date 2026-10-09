@@ -10,7 +10,8 @@ asr_model: D:/CONFERENCE ASR/zipformer zh-en-vi onnx phaseB s2a   # or set ASR_M
 asr_provider: cpu      # sherpa-onnx wheels are CPU-only; cuda if you build with GPU
 asr_quant: auto        # auto | int8 | fp32  (auto = int8 on cpu, fp32 on cuda)
 asr_threads: 4
-asr_cuda_final: true       # kept for compat; finals now use asr_ort_provider
+asr_cuda_final: false      # one-shot ORT re-decode of each final. MEASURED live: 2-7 s per
+                           # segment under MT load -> off; finals use the live-stream text
 asr_ort_threads: 2         # final re-decode pool. MEASURED under live MT load: default
                            # (10) 13.4 s per 12 s segment, 2 -> 1.2 s, 4 -> 1.0-5.4 s
 asr_ort_provider: cpu      # cpu (verified: 15 s audio in ~1 s) | cuda (this
@@ -43,10 +44,6 @@ mt_speculative: false      # prompt-lookup speculative decoding (drafter-free, e
                            # on this task, so OFF by default; auto-rule still fires for
                            # src==tgt or ASCII->English where it can only help.
 mt_lookup_tokens: 10       # max draft tokens per step
-mt_ssbd_enable: true       # Self-Speculative Biased Decoding (COLM 2026):
-                           # draft finals off the last partial translation.
-                           # Measured RTX 4060: 1.35-1.48x vs from-scratch.
-mt_ssbd_beta: 0.2          # draft bias (paper sweet spot; >=0.5 degrades quality)
 mt_history_turns: 2        # past segments fed as translation context (2 keeps
 mt_history_chars: 400      # …prefill short; history is context-only anyway)
 mt_max_backlog: 4          # queued finals before shedding: >=4 display lang only,
@@ -86,9 +83,10 @@ frame_seconds: 0.5               # mic frame size fed to the streaming recognize
 endpoint_silence: 1.0            # pause (s) that finalizes a segment — breaks at pauses, not mid-word
 endpoint_min_speech: 0.5         # ignore shorter blips
 max_segment: 20.0                # force-finalize run-on speech without pauses
-partial_translate_interval: 2.0  # min seconds between live re-translations (partials
-partial_min_delta: 8            # …share the MT lock with finals — rarer partials
-partial_min_chars: 14           # …let finals start sooner; finals carry full set)
+ssbd_beta: 0.3                   # SSBD draft bias (paper: 0.2 best quality; 0.3 = +6% draft reuse, -1% COMET)
+mt_retranslate_words: 3          # re-translate the live sentence every 3 new words; each run
+                                 # drafts off the last (SSBD), so the final only verifies.
+                                 # MEASURED 15 s turns: final 0.1-1.1 s vs 0.8-2.2 s scratch
 silence_turn_gap: 0.6            # pause (s) that marks a possible speaker turn
 max_speakers: 3
 diarizer: nemo                   # nemo Titanet (direct-forward, CUDA) | pyannote | volume

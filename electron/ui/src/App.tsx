@@ -465,6 +465,7 @@ export default function App() {
         denoise: denoiseRef.current,
         terms: termsRef.current,
         displayLang: displayLangRef.current,
+        resume: true,
       });
     } catch {
       window.setTimeout(() => {

@@ -222,9 +222,10 @@ export class LiveSocket {
     if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify(obj));
   }
 
-  start(opts: { targets: string[]; srcLang: string | null; denoise: boolean; terms: Record<string, string>; displayLang: string }): void {
+  // resume: reconnect mid-meeting, keep the server's speaker clusters
+  start(opts: { targets: string[]; srcLang: string | null; denoise: boolean; terms: Record<string, string>; displayLang: string; resume?: boolean }): void {
     this.ready = false;
-    this.send({ type: "stream_start", targets: opts.targets, src_lang: opts.srcLang, denoise: opts.denoise, terms: opts.terms, display_lang: opts.displayLang });
+    this.send({ type: "stream_start", targets: opts.targets, src_lang: opts.srcLang, denoise: opts.denoise, terms: opts.terms, display_lang: opts.displayLang, resume: !!opts.resume });
   }
 
   config(opts: { targets?: string[]; denoise?: boolean; terms?: Record<string, string>; displayLang?: string }): void {

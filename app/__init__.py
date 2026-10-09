@@ -13,3 +13,19 @@ if _PYDEPS.is_dir():
     os.environ.setdefault("TRITON_CACHE_DIR", str(_cache / "triton"))
     os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(_cache / "inductor"))
 
+
+# Windows 11 runs a windowless backend as EcoQoS: threads parked on E-cores at
+# low clocks. MEASURED i7-13620H live: MT chunk 0.6 s -> 3-4 s, backlog grows;
+# opted out (or pinned to P-cores) every final lands < 1.1 s.
+if sys.platform == "win32":
+    import ctypes
+
+    class _PowerThrottling(ctypes.Structure):
+        _fields_ = [("Version", ctypes.c_ulong), ("ControlMask", ctypes.c_ulong),
+                    ("StateMask", ctypes.c_ulong)]
+
+    _s = _PowerThrottling(1, 0x1, 0)  # EXECUTION_SPEED controlled, state off
+    _k32 = ctypes.windll.kernel32
+    _k32.GetCurrentProcess.restype = ctypes.c_void_p
+    _k32.SetProcessInformation(ctypes.c_void_p(_k32.GetCurrentProcess()), 4,  # ProcessPowerThrottling
+                               ctypes.byref(_s), ctypes.sizeof(_s))

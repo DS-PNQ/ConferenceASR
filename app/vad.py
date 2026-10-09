@@ -46,7 +46,13 @@ class SileroVAD:
             global _WARNED
             try:
                 import torch
+
+                # silero_vad's import does torch.set_num_threads(1): that
+                # invalidates the compiled MT graph (full ~16 s recompile on
+                # the first live translation) and single-threads torch CPU.
+                n_threads = torch.get_num_threads()
                 from silero_vad import load_silero_vad
+                torch.set_num_threads(n_threads)
 
                 if self.want_cuda and torch.cuda.is_available():
                     self.device = "cuda"

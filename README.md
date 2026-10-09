@@ -197,7 +197,7 @@ frame_seconds: 0.5       # mic frame size for the streaming recognizer
 endpoint_silence: 1.0    # pause (s) that finalizes a segment
 endpoint_min_speech: 0.5
 max_segment: 20.0        # force-finalize run-on speech
-partial_translate_interval: 2.5
+mt_retranslate_words: 5  # live re-translation pace (new words); finals verify the last SSBD draft
 segment_seconds: 5.0     # fixed-window size for the /api/transcribe upload path
 max_speakers: 3
 ```

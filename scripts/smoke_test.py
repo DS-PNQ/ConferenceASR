@@ -16,7 +16,7 @@ class FakeASR:
 
 
 class FakeMT:
-    def translate(self, text, tgt="en", src="auto", context=None):
+    def translate(self, text, tgt="en", src="auto", context=None, terms=None, **kw):
         return f"[{tgt}] {text}"
 
 
@@ -61,6 +61,26 @@ def main():
     file_entries = pipe.process_file(np.concatenate([loud, quiet]), sr, targets=["en"])
     assert len(file_entries) >= 1, file_entries
     print(f"pipeline file: {len(file_entries)} utterances, denoised={file_entries[0]['denoised']}")
+
+    # live MT: SSBD off the last draft, plain without one; no history on short text
+    import queue
+    import threading
+
+    from app.streaming import StreamingSession
+
+    class SpyMT(FakeMT):
+        _lock = threading.RLock()
+
+        def translate_ssbd(self, text, draft, tgt="en", src="auto", context=None, terms=None, **kw):
+            return {"text": f"ssbd({draft}) {text}"}
+
+    s = StreamingSession(cfg, FakeASR(), SpyMT(), dia, enh, queue.Queue())
+    assert s._translate("ONE TWO", "vi", "en", ["hist"], None) == "[vi] one two"
+    assert s._translate("ONE TWO", "vi", "en", None, None, draft="d") == "ssbd(d) one two"
+    s._drafts[7] = {"vi": "d1"}
+    s._run_retr_job({"retr": "vi", "seg_id": 7, "stop": threading.Event(), "text": "ONE TWO THREE", "context": None, "terms": None})
+    assert s._drafts[7]["vi"] == "ssbd(d1) one two three", s._drafts
+    print("live SSBD routing OK")
 
     # FastAPI routes (no server needed)
     from fastapi.testclient import TestClient

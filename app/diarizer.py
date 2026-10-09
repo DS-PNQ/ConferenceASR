@@ -154,6 +154,7 @@ class NeMoDiarizer:
     def reset(self):
         self.centroids = []
         self.counts = []
+        self._volume.reset()
 
     # -- lifecycle ---------------------------------------------------------
     def ensure_loaded(self, demo_ok: bool = True):
@@ -337,6 +338,7 @@ class PyannoteDiarizer:
     def reset(self):
         self.centroids = []
         self.counts = []
+        self._volume.reset()
         self._nemo.reset()
 
     # -- lifecycle ---------------------------------------------------------

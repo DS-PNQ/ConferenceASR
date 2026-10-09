@@ -460,6 +460,7 @@ async def _ws_stream_msg(ws: WebSocket, data: dict, holder: dict):
                 denoise=_parse_denoise(data.get("denoise", "auto")),
                 terms=_parse_terms(data.get("terms")),
                 display_lang=data.get("display_lang") or None,
+                resume=bool(data.get("resume")),
             )
         except Exception as e:
             holder["starting"] = False
