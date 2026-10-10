@@ -39,6 +39,11 @@ if not exist "models\.downloaded" (
   echo ok> "models\.downloaded"
 )
 
+rem Listen-button voices (vi/en/zh, ~58 MB, CPU only); without them the OS voice is used
+if not exist "models\tts\zh" (
+  "%PY%" scripts\get_tts.py || echo [!] TTS voices download failed - Listen buttons fall back to the system voice.
+)
+
 echo [4/4] Building and launching the app...
 pushd electron
 if not exist node_modules call npm install || goto :fail

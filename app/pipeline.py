@@ -79,12 +79,13 @@ class ConferencePipeline:
         dia = self.diarizer.assign(pcm, t)
         if dia.get("silent"):
             return {"type": "silence", "rms_db": dia["rms_db"], "speaker": dia["speaker"]}
-        # Prefer the one-shot ORT re-decode (same text, reports backend);
-        # fall back to the streaming recognizer.
+        # The one-shot ORT re-decode gives the same text as the streaming
+        # recognizer and holds a second model copy (+1 GB RAM): only with
+        # asr_cuda_final, like the live path.
         lang_name, text, asr_backend = None, "", "sherpa-cpu"
         try:
             rd = getattr(self.asr, "redecode_cuda", None)
-            if callable(rd):
+            if callable(rd) and self.cfg.get("asr_cuda_final", False):
                 r_text, r_back = rd(pcm, sr)
                 if r_text:
                     text, asr_backend = r_text, r_back or "ort"

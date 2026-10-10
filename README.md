@@ -11,6 +11,43 @@ streaming Nemotron diarization, DeepFilterNet hook):
   partials and token-streamed finals. `npm run dist` builds a Windows installer.
 - **C# desktop app** (`csharp/ConfLive`): native WPF window, same protocol.
 
+## Memory (measured RTX 4060 Laptop 8 GB, i7-13620H)
+
+Same scenario before → after the October 2026 trim (`checkpoints/WORKLOG.md`), RAM = working
+set of the backend + Nemotron sidecar, GPU = `nvidia-smi` used:
+
+| Moment | GPU | RAM |
+| --- | --- | --- |
+| after `/api/warmup` | 4462 → **2480 MB** | 3725 → **3277 MB** |
+| after an OCR run (VLM loaded) | 5563 → **4171 MB** | 3241 → 2831 MB |
+| live session after OCR | 6044 → **2808 MB** | 4855 → **4066 MB** |
+
+Where it came from: MT keeps its FP8 weights under the compiled decode (−1.9 GB VRAM, also
+faster, see below); the ORT final re-decoder (+1043 MB RAM, same text as the live stream) only
+loads with `asr_cuda_final: true`; a live session frees the OCR models. Listen voices are CPU
+only (0 VRAM), ~100–140 MB RAM each while in use, dropped after `tts_idle_unload`.
+
+## Listen voices (offline TTS)
+
+`python scripts/get_tts.py` puts one sherpa-onnx Piper VITS int8 voice per language in
+`models/tts/` (sherpa-onnx is already the ASR runtime, so no new package). Chosen as the
+lightest that still read back through our own Zipformer ASR (i7-13620H, 2 threads):
+
+| Lang | Voice | Download | Load | RAM | RTF | ASR read-back |
+| --- | --- | --- | --- | --- | --- | --- |
+| vi | `vi_VN-vais1000-medium-int8` (CC BY 4.0) | 21.6 MB | 1.2 s | +119 MB | 0.15 | near-verbatim (sau→sáu) |
+| en | `en_US-ljspeech-medium-int8` (public domain) | 21.1 MB | 1.8 s | +142 MB | 0.17 | near-verbatim (one phoneme) |
+| zh | `zh_CN-chaowen-medium-int8` (CC0) | 14.0 MB | 1.4 s | +99 MB | 0.16 | verbatim |
+
+Also measured: `vivos-x_low-int8` (14.7 MB, vi) is smaller but trained on noisy ASR data;
+`25hours_single-low` (vi) has no stated licence; `lessac-medium` (en) reads as well but its
+licence is research-only; `kitten-nano-en` (26.6 MB) needs a second model type for no gain;
+`xiao_ya` (zh) is non-commercial. Windows ships only English OS voices (David/Zira/Mark), so
+OS speech alone can't cover vi/zh — it's the fallback for other languages only.
+Same-language "translations" are raw UPPERCASE ASR text; they are lowercased before synthesis
+(espeak would spell them out). sherpa logs `Skip unknown phonemes` for Vietnamese tone digits
+— harmless (Piper training skipped them too; the read-back keeps every tone).
+
 ## GPU usage notes (measured RTX 4060 Laptop)
 
 - The local `HY-MT` INT8 ONNX prose is driven directly (`app/onnx_mt.py`):
@@ -26,16 +63,22 @@ streaming Nemotron diarization, DeepFilterNet hook):
   (~1 s/token vs ~0.3 s/token). Local = no HF dependency; FP8 = 2.5x faster.
   Switch back anytime: `MT_MODEL=tencent/Hy-MT2-1.8B-FP8` (weights still cached).
 
-- Weights load to `cuda:0` as FP8, then `_dequantize_fp8` bakes them into plain fp16
-  Linears once (compressed-tensors otherwise re-dequantizes every forward: 3000 vs
-  1900 kernel launches/token, 72 vs 43 ms GPU/token; +1.4 GB VRAM). Generate
+- Weights load to `cuda:0` as FP8. compressed-tensors would re-dequantize every forward
+  (3000 vs 1900 kernel launches/token, 72 vs 43 ms GPU/token), so `_dequantize_fp8`
+  replaces its Linears once: with the compiled decode they stay **FP8** (`_FP8Linear`,
+  per-tensor scale; `coordinate_descent_tuning` turns each batch-1 matmul into one
+  reduction kernel that converts the weight in registers). MEASURED, 18 translations,
+  output identical: **2.09 GB vs 4.03 GB reserved, 50.4 vs 40.9 tok/s**, warmup 33 s vs
+  20 s (cached). Without the compile (no triton, `mt_compile: false`) they are baked into
+  plain fp16 Linears instead (3.5 GB), because eager decode would re-dequantize. Generate
   runs there too — verified: params on `cuda:0`, SM utilization 21–43% during
   decode, ~4 tok/s batch-1 greedy. If `nvidia-smi` shows ~0% between utterances,
   that is normal: single-stream decode of a 1.8B model is latency-bound with
   tiny kernels, and the GPU idles between segments.
-- ASR runs split-brain by design: live partials from sherpa-onnx CPU int8
-  (~15x realtime — the wheels are CPU-only builds), finalized segments
-  re-decoded on GPU by `app/cuda_zipformer.py`, which drives the same ONNX
+- ASR: live partials and finals from sherpa-onnx CPU int8 (~15x realtime — the wheels
+  are CPU-only builds). Optional (`asr_cuda_final: true`, off: 2-7 s per segment under MT
+  load, same text, +1 GB RAM): finalized segments
+  re-decoded by `app/cuda_zipformer.py`, which drives the same ONNX
   files through ORT CUDA directly (byte-identical protocol, verified
   character-for-character vs sherpa CPU; ~9x realtime steady, fp32).
   Entries carry `asr_backend: ort-cuda|stream`. Two load-bearing details:
@@ -58,9 +101,11 @@ streaming Nemotron diarization, DeepFilterNet hook):
 | Translation | `tencent/Hy-MT2-1.8B-FP8` (compressed-tensors, CUDA) | https://huggingface.co/collections/tencent/hy-mt2 |
 | Diarization | `nvidia/Nemotron-3-Diarization` streaming, 0.32 s, local + offline (→ NeMo Titanet → volume fallback chain) | https://huggingface.co/nvidia/Nemotron-3-Diarization |
 
-UI is a native desktop window (neutral tones + AI-purple `#7C3AED`):
-sidebar controls + chat-style transcript feed with live partials, token-streamed
-translations, speaker colours, volume meter, and TXT/SRT export. No browser needed.
+UI is a native desktop window in a macOS style (system font, Apple system colours,
+light + dark): a floating glass sidebar, a unified toolbar that is also the title bar
+(Windows draws its caption buttons over it), and a transcript feed with live partials,
+token-streamed translations, speaker colours, a Voice Memos-style recorder, and
+**Listen + Copy buttons under every translation**. No browser needed.
 
 ## 0. Quick start for testers
 
@@ -120,11 +165,18 @@ npx electron .     # launches; finds run.py, picks CUDA/CPU, opens the window
 npm run dist       # Windows NSIS installer (needs electron-builder downloads)
 ```
 
-The window is the `redesign-conferenceasr-desktop-ui` React design, wired live:
-dark sidebar (Live session / Library / Glossary + Settings), recording stage
-with real mic level, transcript rows with timestamps + speaker avatars, live
-caption partials, translation toggle + search, session stats panel, localStorage
-session archive, and a working glossary (terms steer every translation).
+The window follows macOS design (Liquid Glass only on the navigation layer: sidebar,
+toolbar, floating controls; content on solid surfaces): glass sidebar (Live Session /
+Library / Glossary / Translate / OCR + Settings), a toolbar with the translation-language
+segmented control, a recorder bar (red record button, timer, live waveform, Stop),
+transcript rows with timestamps + speaker avatars, live caption partials, translation
+toggle + search, session inspector, localStorage session archive, and a working glossary
+(terms steer every translation). Under every finished translation (live rows, Library,
+Translate tab) sit **Listen** (speaker icon) and **Copy**: Listen plays the backend's
+offline Piper voice for vi/en/zh (`POST /api/tts`, CPU, voices from
+`python scripts/get_tts.py`) and falls back to an installed OS voice for other languages
+(the button disables itself when there is none). One voice plays at a time; pressing
+another Listen, or the same one, stops it.
 Every row shows **all** requested target translations (display language first,
 with lang chips); live partials stream theirs the same way. The display
 language streams first at finalize too (`display_lang` in `stream_start`,
@@ -171,17 +223,17 @@ In the window (React redesign: Live session / Library / Glossary / Translate + S
   second event with full timings. Segments finalize on **pauses, not the
   clock**, so sentences are never cut mid-word.
 - **⇪ Upload**: any recording streams through the same endpointing pipeline.
-- **Translate view**: Google-style dual cards with source/target language tabs,
-  swap button, Enter-to-translate and copy — same Hy-MT2 engine, glossary
+- **Translate view**: dual cards with source/target language tabs,
+  swap button, Enter-to-translate, Listen and Copy — same Hy-MT2 engine, glossary
   applied. Glossary terms are injected original + UPPER + lower with a MUST
   instruction, because our ASR emits UPPERCASE English while users type
   lowercase (verified: `standup → 站会` lands on `STANDUP` input).
 - Settings: mic picker (hot-swappable mid-session; its last entry, **System audio**,
   transcribes what the computer plays — online meetings, videos — via Electron's
   Windows loopback capture), source language, **target
-  chooser (vi/en/zh)** for what gets translated, DeepFilterNet switch, diarizer
-  switch (nemotron/pyannote/nemo/volume), dev latency readout (on by default), model
-  status + reload.
+  chooser (vi/en/zh)** for what gets translated, noise-reduction switch, diarizer
+  switch (nemotron/pyannote/nemo/volume), dev latency readout (on by default), installed
+  voices, live memory readout (RAM of backend + sidecars, GPU), model status + reload.
 - Mic hardening: autoplay-policy resume, track-ended auto-stop, resume-pop
   guard, stall watchdog (one auto-recapture), WS auto-reconnect with fresh
   server session, and a "Catching up…" indicator when the server lags.
@@ -233,6 +285,10 @@ max_segment: 20.0        # force-finalize run-on speech
 mt_retranslate_words: 5  # live re-translation pace (new words); finals verify the last SSBD draft
 segment_seconds: 5.0     # fixed-window size for the /api/transcribe upload path
 vi_ocr_model: models/vietocr-s2s  # optional Vietnamese OCR reader (scripts/get_vietocr.py); missing = PP-OCR/VLM only
+tts_dir: models/tts      # Listen-button voices per language (scripts/get_tts.py); missing language = OS voice
+tts_threads: 2           # CPU threads per synth
+tts_idle_unload: 120     # s without a Listen request -> voices dropped from RAM
+asr_cuda_final: false    # ORT re-decode of finals (live + uploads); off = never loaded (+1 GB RAM saved)
 max_speakers: 3
 ```
 
@@ -288,7 +344,8 @@ per 80 ms chunk (77% GPU) and falls behind under MT load. Two-voice meeting with
 0–0.2 s hand-overs: 8/8 turns split and labelled correctly, every word on the right
 side, boundaries within ±60 ms. bf16 is no faster than fp32 (launch-bound) but halves
 VRAM. Startup ~20–30 s (transformers 5.x imports), overlapped with ASR/MT at warmup.
-OCR mode stops the sidecar (all its VRAM back); the next stream restarts it. If the
+OCR mode stops the sidecar (all its VRAM back); the next stream restarts it, and starting
+a stream frees what OCR loaded (PaddleOCR-VL ~2 GB VRAM, PP-OCR + VietOCR RAM). If the
 sidecar can't start (no `..\diardeps`, no local model) the chain falls to Titanet →
 volume, reported in `/api/health`.
 
@@ -349,8 +406,9 @@ so an in-flight session finishes on the Titanet/volume fallback).
 ## 7. Verify (engines need cached weights; fakes don't)
 
 ```powershell
-python -m scripts.smoke_test      # device, denoiser, diarizer, pipeline, API routes
+python -m scripts.smoke_test      # device, denoiser, diarizer, pipeline, FP8 layer, API routes (+ /api/tts errors)
 python scripts/streaming_smoke.py # REAL engines: live partials + endpointed finals + MT
+python -m app.tts_engine          # each installed voice synthesizes; a missing language raises LookupError
 ```
 
 ## 8. Backend API (serves Electron + C#)
@@ -368,7 +426,10 @@ python scripts/streaming_smoke.py # REAL engines: live partials + endpointed fin
   PaddleOCR-VL reader (diacritics, no boxes). `block_ocr.vietocr` / health `ocr.vietocr` say
   whether it is installed. Blocks are translated one MT pass, off the event loop.
 - `POST /api/settings` (`{"diarizer": "nemotron"|"pyannote"|"nemo"|"volume"}`) — runtime switch
-- `GET /api/health` — device, ASR/MT/denoise/diarizer status
+- `POST /api/tts` (`{text, lang}`) → `audio/wav` (16-bit mono) from the offline Piper voice for
+  `lang`; `404` when that language has no voice (the UI then uses an OS voice), `400` on empty text
+- `GET /api/health` — device, ASR/MT/denoise/diarizer status, `tts {langs, loaded}`,
+  `mem {ram_mb, vram_mb, gpu_used_mb}` (backend + sidecars RAM, this process's CUDA pool, GPU-wide)
 - Glossary `terms` (`{source: target}`) ride Hy-MT2's documented terminology
   block; verified steering output (e.g. forced `光子引擎`).
 
@@ -385,6 +446,7 @@ electron/ui/ (React+Vite+Tailwind redesign, wired live: src/App.tsx, src/api.ts)
 csharp/ConfLive/*.csproj,*.xaml,*.cs  installer/ConfLive.iss + build.ps1
 scripts/download_models.py  scripts/get_vietocr.py  scripts/smoke_test.py  scripts/streaming_smoke.py
 app/ocr_engine.py (PP-OCR blocks + VietRec + PaddleOCR-VL)  models/vietocr-s2s/ (optional)
+app/tts_engine.py (Piper voices, CPU)  scripts/get_tts.py  models/tts/{vi,en,zh}/ (optional)
 checkpoints/ (source snapshots, see checkpoints/WORKLOG.md)
 ```
 

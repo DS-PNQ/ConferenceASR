@@ -28,29 +28,62 @@ FULL = {
 CODE_FROM_NAME = {v.lower(): k for k, v in FULL.items()}
 
 
-def _dequantize_fp8(model) -> int:
-    """Bake compressed-tensors FP8 Linears into plain fp16 nn.Linear, once.
+class _FP8Linear(torch.nn.Module):
+    """FP8 weight (1 byte/param) + per-tensor scale, dequantized in forward.
+
+    Under the compiled decode (coordinate_descent_tuning) Inductor turns the
+    batch-1 matmul into one reduction kernel that reads the FP8 weight and
+    converts it in registers. MEASURED RTX 4060, 18 translations: 2.09 vs
+    4.03 GB reserved, 50.4 vs 40.9 tok/s, output identical to the fp16 bake.
+    Eager forwards (prefill, SSBD verify) materialize one layer's fp16 weight.
+    """
+
+    def __init__(self, weight, weight_scale, bias=None):
+        super().__init__()
+        self.out_features, self.in_features = weight.shape
+        self.register_buffer("weight", weight, persistent=False)
+        self.register_buffer("weight_scale", weight_scale, persistent=False)
+        self.bias = bias
+
+    def forward(self, x):
+        # scale the weight, not the output: same fp16 weights as the bake,
+        # and x @ raw-FP8 can overflow fp16 before the scale shrinks it
+        w = self.weight.to(x.dtype) * self.weight_scale.to(x.dtype)
+        return torch.nn.functional.linear(x, w, self.bias)
+
+
+def _dequantize_fp8(model, keep_fp8: bool = False) -> int:
+    """Replace compressed-tensors FP8 Linears, once.
 
     Left as-is, every forward re-dequantizes each weight and fake-quantizes
     its input (~3000 kernel launches per token): decode was CPU launch-bound
-    at ~3 tok/s with the GPU mostly idle. Costs ~2x weight VRAM (3.6 GB).
+    at ~3 tok/s with the GPU mostly idle. keep_fp8 (compiled decode only)
+    swaps in _FP8Linear; otherwise bake plain fp16 nn.Linear (2x weight VRAM,
+    but eager decode would re-dequantize every layer every token). Also
+    bakes _FP8Linear back to fp16 when the compile fails after the swap.
     """
     import torch.nn as nn
 
     swaps = [(name, mod) for name, mod in model.named_modules()
-             if isinstance(mod, nn.Linear) and hasattr(mod, "weight_scale")
+             if hasattr(mod, "weight_scale") and getattr(mod, "weight", None) is not None
              and mod.weight.dtype == torch.float8_e4m3fn]  # still-compressed only
     for name, mod in swaps:
-        w = mod.weight.to(torch.float16) * mod.weight_scale.to(torch.float16)
-        lin = nn.Linear(mod.in_features, mod.out_features, bias=mod.bias is not None,
-                        device=w.device, dtype=torch.float16)
-        lin.weight.data.copy_(w)
-        if mod.bias is not None:
-            lin.bias.data.copy_(mod.bias.to(torch.float16))
+        bias = mod.bias.to(torch.float16) if mod.bias is not None else None
+        if keep_fp8:
+            lin = _FP8Linear(mod.weight.data, mod.weight_scale.data.to(torch.float16),
+                             nn.Parameter(bias, requires_grad=False) if bias is not None else None)
+        else:
+            w = mod.weight.to(torch.float16) * mod.weight_scale.to(torch.float16)
+            lin = nn.Linear(mod.in_features, mod.out_features, bias=bias is not None,
+                            device=w.device, dtype=torch.float16)
+            lin.weight.data.copy_(w)
+            if bias is not None:
+                lin.bias.data.copy_(bias)
         parent, _, child = name.rpartition(".")
         setattr(model.get_submodule(parent) if parent else model, child, lin)
     if swaps:
-        log.info("FP8 -> fp16: %d Linear layers baked", len(swaps))
+        log.info("FP8 Linears: %d %s", len(swaps),
+                 "kept FP8 (dequant fused into the compiled decode)" if keep_fp8 else "baked to fp16")
         # compressed-tensors also wraps EVERY module's forward to re-send its
         # args to the device (~1100 .to() per token, and a graph break per
         # module under torch.compile). Weights are plain + on-device now.
@@ -58,7 +91,7 @@ def _dequantize_fp8(model) -> int:
             from compressed_tensors.offload.dispatch import remove_dispatch
 
             remove_dispatch(model, onload_tensors=True)
-        except ImportError:
+        except Exception:  # missing, or already removed (re-bake after a failed compile)
             pass
         # ...and its first-forward ct_decompress_hook would re-wrap all of them
         for k, h in list(model._forward_pre_hooks.items()):
@@ -297,7 +330,7 @@ class HyMT2Engine:
                     load_kw["dtype"] = self.dtype
                 self._model = AutoModelForCausalLM.from_pretrained(self.model_id, **load_kw)
                 if quant:
-                    _dequantize_fp8(self._model)
+                    _dequantize_fp8(self._model, keep_fp8=self._will_compile())
                 self._model.eval()
                 self._enable_compile()
                 log.info("MT ready: %s", self.model_id)
@@ -437,18 +470,30 @@ class HyMT2Engine:
             pass
         return False
 
+    def _will_compile(self) -> bool:
+        if not bool(self.cfg.get("mt_compile", True)) or self.device != "cuda":
+            return False
+        try:
+            import triton  # noqa: F401
+        except Exception:
+            return False
+        return True
+
     def _enable_compile(self):
         """CUDA-graph the decode step: generate() auto-compiles when handed a
         StaticCache. One fixed-size cache = one graph. Measured RTX 4060,
         same process: 9.6 -> 31.2 tok/s. Needs triton (triton-windows on
         Windows, see run.py); compiles here so warmup pays the ~100 s, not
         the first live segment."""
-        if not bool(self.cfg.get("mt_compile", True)) or self.device != "cuda":
+        if not self._will_compile():
             return
         try:
-            import triton  # noqa: F401
+            import torch._inductor.config as inductor_cfg
             from transformers import StaticCache
 
+            # batch-1 matmuls become reductions that fuse _FP8Linear's dequant
+            # (without it Inductor writes + re-reads a fp16 copy every token)
+            inductor_cfg.coordinate_descent_tuning = True
             self._static = StaticCache(
                 config=self._model.config, max_batch_size=1,
                 max_cache_len=int(self.cfg.get("mt_cache_len", 1024)),
@@ -459,6 +504,7 @@ class HyMT2Engine:
         except Exception as e:
             log.warning("MT compile unavailable (%s) — eager decode.", e)
             self._static = None
+            _dequantize_fp8(self._model)  # eager: kept-FP8 layers -> fp16 bake
 
     def _generate(self, input_ids, attn_mask, gen_kwargs: dict):
         """generate() with graceful fallback if the modeling rejects a kwarg

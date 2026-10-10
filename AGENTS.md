@@ -72,7 +72,8 @@ socket dies with 1011 keepalive timeout).
 ### Other paths
 
 - **Upload** `POST /api/transcribe` → `app/pipeline.py › ConferencePipeline.process_file`:
-  whole-file denoise → fixed `segment_seconds` chunks → ASR → diarize → MT (synchronous).
+  whole-file denoise → fixed `segment_seconds` chunks → ASR (streaming recognizer; the ORT
+  re-decoder only with `asr_cuda_final`) → diarize → MT (synchronous).
 - **Legacy WS** (message without `type`): fixed-window `pipe.process_chunk`. Browser-demo era.
 - **Translate tab** `POST /api/translate` → `main._translate_long` (chunked by
   `translate_chunk_chars`, CJK costs ×3).
@@ -81,6 +82,12 @@ socket dies with 1011 keepalive timeout).
   only when VietOCR is missing), optional MT: blocks translated in one pass off the event loop,
   page translation = their join. Entering OCR mode unloads the diarizer to free VRAM (`_enter_ocr_mode`).
 - **Exports** `GET /api/export.txt|.srt` read `pipe.history` (upload/legacy path only).
+- **Listen buttons** `POST /api/tts {text, lang}` → `app/tts_engine.py › PiperTTS.synth` (sherpa-onnx
+  Piper VITS int8, CPU, off the event loop) → `audio/wav`; `404` = no voice for `lang`, the UI then
+  uses a matching OS voice (`api.ts › speak`). Voices load on first use, all dropped after
+  `tts_idle_unload` s idle.
+- **Live mode** `stream_start` → `main._enter_live_mode`: unloads PaddleOCR-VL (VRAM) and
+  `BlockOCR` (PP-OCR + VietOCR RAM); the next OCR reloads them. Mirror of `_enter_ocr_mode`.
 
 ## File map (what each file does → what else to check when you change it)
 
@@ -89,13 +96,13 @@ socket dies with 1011 keepalive timeout).
 | `run.py` | chdirs to its own folder (so `config.yaml` and relative model paths resolve from any cwd), starts uvicorn on `config.yaml` host/port | `electron/src/main.ts` (spawns it), `csharp/.../BackendManager.cs` |
 | `config.yaml` | All tunables, with MEASURED comments | Code reading the key (grep it), README §3 |
 | `app/__init__.py` | `../pydeps` triton path, cache dirs, Windows EcoQoS opt-out | `mt_engine._enable_compile` |
-| `app/main.py` | FastAPI app: builds engines, REST routes, `/ws/live` protocol | `electron/ui/src/api.ts`, `csharp/ConfLive/ApiClient.cs` + `Models.cs`, `scripts/live_ws_e2e.mjs`, `scripts/ui_soak_server.py`, README §8 |
+| `app/main.py` | FastAPI app: builds engines, REST routes (incl. `/api/tts`, health `tts`/`mem`), `/ws/live` protocol, `_enter_live_mode` / `_enter_ocr_mode` | `electron/ui/src/api.ts`, `csharp/ConfLive/ApiClient.cs` + `Models.cs`, `scripts/live_ws_e2e.mjs`, `scripts/ui_soak_server.py`, README §8 |
 | `app/engines.py` | `build_app()` / `make_mt_engine` for scripts | **`main.py` wires its own engines** — keep both in sync |
 | `app/streaming.py` | Live session: endpointing, partials, SSBD re-translation, MT worker, backlog | Event shapes in `api.ts`/`Models.cs`; `scripts/streaming_smoke.py`, `soak_long.py` |
 | `app/pipeline.py` | Upload/legacy fixed-window pipeline + exports | `/api/transcribe`, `smoke_test.py` |
 | `app/zipformer_engine.py` | sherpa-onnx streaming recognizer (`_rec`), `redecode_cuda` | `streaming.py` (uses `asr._rec` directly), `cuda_zipformer.py` |
 | `app/cuda_zipformer.py` | Same ONNX via ORT CUDA (final re-decode). Import torch **before** onnxruntime | `requirements.txt` pin `onnxruntime-gpu~=1.22` |
-| `app/mt_engine.py` | `HyMT2Engine` (HF transformers, FP8→fp16 bake, compile, SSBD, streaming, batched) + `MockMT` | `onnx_mt.py` (subclass), `streaming._translate`, `main._translate_long` |
+| `app/mt_engine.py` | `HyMT2Engine` (HF transformers, FP8 kept as `_FP8Linear` under the compiled decode / fp16 bake without it, compile, SSBD, streaming, batched) + `MockMT` | `onnx_mt.py` (subclass), `streaming._translate`, `main._translate_long` |
 | `app/onnx_mt.py` | `OnnxMTEngine(HyMT2Engine)` for local INT8 ONNX; overrides `_prepare`/`_generate` | Any `HyMT2Engine` signature change |
 | `app/diarizer.py` | `VolumeDiarizer`, `NeMoDiarizer`, `PyannoteDiarizer`, `NemotronDiarizer` (streaming: `push`/`turn`, sidecar client, falls back to Titanet), `make_diarizer` | `/api/settings`, `_enter_ocr_mode`, UI diarizer switch, `streaming._track_speaker/_split`, `smoke_test.py` turn() check |
 | `app/nemotron_sidecar.py` | Stand-alone Nemotron-3-Diarization worker (transformers 5.19 from `../diardeps`, offline, local model dir); binary stdin/stdout protocol in its docstring | `NemotronDiarizer._start/_send/_read_loop` |
@@ -103,19 +110,22 @@ socket dies with 1011 keepalive timeout).
 | `app/df_sidecar.py` | Stand-alone DF worker under `../dfenv`; imports nothing from `app` | `enhancer._sidecar` |
 | `app/vad.py` | Silero VAD, stateful per stream, fail-open | `streaming.feed`, `/api/warmup` |
 | `app/langid.py` | lingua vi/en/zh detect, `None` = unsure | `streaming`, `pipeline` |
-| `app/ocr_engine.py` | `PaddleOCRVLEngine`, `BlockOCR` (+ `VietRec` VietOCR ONNX line reader, `_crop_quad`), `MockOCR` | `/api/ocr`, `/api/health` `ocr.vietocr`, UI OCR view, `ocr_test/vietocr_onnx.py` (reference twin) |
+| `app/ocr_engine.py` | `PaddleOCRVLEngine`, `BlockOCR` (+ `VietRec` VietOCR ONNX line reader, `_crop_quad`, `unload`), `MockOCR` | `/api/ocr`, `/api/health` `ocr.vietocr`, UI OCR view, `ocr_test/vietocr_onnx.py` (reference twin) |
+| `app/tts_engine.py` | `PiperTTS`: per-language sherpa-onnx Piper voices from `tts_dir/<lang>/`, lazy load, idle unload, WAV out; `__main__` self-check | `/api/tts`, health `tts`, `scripts/get_tts.py` (folder layout), `api.ts › speak` |
 | `app/audio_io.py`, `app/device.py` | Decode/resample to 16 kHz; CUDA/CPU + dtype resolution | All engines |
-| `electron/src/main.ts` | Find `run.py`, probe Python + CUDA, spawn backend, open window, grant `getDisplayMedia` loopback audio (System audio input), whole-UI zoom (Ctrl+=/-/0, Ctrl+wheel) | `ConfLive.bat`, package.json `build.files` |
-| `electron/src/preload.ts` | Exposes `window.conflive` (version, port) | — |
-| `electron/ui/src/api.ts` | **Client contract**: REST calls, `LiveSocket`, mic / system-audio capture (`SYSTEM_AUDIO` entry in `listMics`), TS types | `app/main.py`, `app/streaming.py` event fields |
-| `electron/ui/src/App.tsx` | Whole UI (Live / Library / Glossary / Translate / OCR / Settings) | `api.ts` types |
+| `electron/src/main.ts` | Find `run.py`, probe Python + CUDA, spawn backend, open window (hidden title bar + `titleBarOverlay`: caption buttons over the 52 px toolbar, recoloured on the renderer's `theme` IPC), grant `getDisplayMedia` loopback audio (System audio input), whole-UI zoom (Ctrl+=/-/0, Ctrl+wheel) | `ConfLive.bat`, package.json `build.files`, `index.css` `.topbar` (height 52, `env(titlebar-area-*)` padding, drag region) |
+| `electron/src/preload.ts` | Exposes `window.conflive` (version, port, `setTheme`) | `App.tsx` theme effect |
+| `electron/ui/src/api.ts` | **Client contract**: REST calls, `LiveSocket`, mic / system-audio capture (`SYSTEM_AUDIO` entry in `listMics`), `speak`/`stopSpeaking` (one player app-wide, OS-voice fallback), TS types | `app/main.py`, `app/streaming.py` event fields |
+| `electron/ui/src/App.tsx` | Whole UI (Live / Library / Glossary / Translate / OCR / Settings); `TrActions` = Listen + Copy under each finished translation | `api.ts` types, `index.css` |
+| `electron/ui/src/index.css` | macOS-style design: semantic tokens (light + `[data-theme="dark"]`), `.glass` only on navigation (sidebar, toolbar, floating controls), components, OCR workbench | `App.tsx` class names |
 | `csharp/ConfLive/*` | WPF client: `BackendManager` spawns backend, `ApiClient` WS, `MicCapture`, `Models` DTOs | Same protocol as `api.ts` |
 | `installer/`, `.github/workflows/build-installer.yml` | Inno Setup + CI (builds UI + C# exe on `v*` tags) | `csharp/` paths |
-| `ConfLive.bat` | Tester one-click: venv, torch, requirements, models, build, launch | `requirements.txt`, `scripts/download_models.py`, `electron/package.json` |
+| `ConfLive.bat` | Tester one-click: venv, torch, requirements, models, Listen voices (`get_tts.py`), build, launch | `requirements.txt`, `scripts/download_models.py`, `scripts/get_tts.py`, `electron/package.json` |
 | `scripts/` | Checks and tools (see below) | — |
 | `ocr_test/` | OCR recogniser comparison + `export_vietocr_onnx.py` (used by `scripts/get_vietocr.py`) | `scripts/get_vietocr.py` |
 | `scripts/get_vietocr.py` | Optional Vietnamese OCR: vietocr into a temp `--target` dir, export fp16 ONNX → `models/vietocr-s2s` | `config.yaml › vi_ocr_model`, `BlockOCR` |
-| `checkpoints/` | Source snapshots (no git): `snap.sh <name>`, history + restore steps in `WORKLOG.md` | — |
+| `scripts/get_tts.py` | Listen voices: downloads the vi/en/zh Piper int8 archives (sherpa-onnx `tts-models` release) → `models/tts/<lang>/` | `config.yaml › tts_dir`, `PiperTTS`, `ConfLive.bat`, README "Listen voices" |
+| `checkpoints/` | Source snapshots (no git): `snap.sh <name>` (app, scripts, config, docs, `electron/src`, `electron/ui/src`), history + restore steps in `WORKLOG.md` | — |
 
 ### WS contract (must match in `main.py`, `streaming.py`, `api.ts`, `ApiClient.cs`)
 
@@ -136,6 +146,7 @@ Errors: `{"ok": false, "error": ...}`. Rows are **upserted by `id`** (process-wi
 cd electron; npm run build; npx electron .         # app (spawns backend if not running)
 python -m scripts.smoke_test                       # no weights needed: device, denoise, diarizer (+ Nemotron turn()), pipeline, routes
 python scripts/test_translate_chunks.py            # no weights: Translate-tab chunker
+python scripts/get_tts.py; python -m app.tts_engine # Listen voices: install, then each synthesizes
 python scripts/streaming_smoke.py                  # REAL engines: partials, endpointed finals, MT
 python scripts/test_denoise.py                     # denoise chain + spectral gate
 node scripts/live_ws_e2e.mjs [file.wav]            # backend up: drives /ws/live like the UI
@@ -182,6 +193,17 @@ Env overrides: `DEVICE`, `MT_DTYPE`, `ASR_MODEL`, `MT_MODEL`, `DEMO_MODE`, `CONF
   SenOCR-Vi (PaddleOCR-VL-1.6 vi fine-tune) needs transformers ≥ 5 — not in the backend env.
   The VLM decodes with `no_repeat_ngram_size=8`
   (without it a Vietnamese sign looped `00 00 …` to the 1024-token cap, 22 s → 1 s).
+
+- `_FP8Linear` is only fast under the compiled decode with
+  `torch._inductor.config.coordinate_descent_tuning = True` (set in `_enable_compile`): that
+  turns the batch-1 matmul into a reduction that fuses the FP8→fp16 cast. Without the compile
+  every token would materialize fp16 weights, so `_dequantize_fp8` bakes fp16 instead (and
+  re-bakes if the compile fails). It scales the *weight*, not the output: x @ raw-FP8 can
+  overflow fp16 before the scale shrinks it.
+- The ORT final re-decoder (`asr._ort()`) holds a second Zipformer copy: +1043 MB RAM. Never
+  warm it unless `asr_cuda_final` is on; uploads get identical text from the streaming recognizer.
+- Piper voices: lessac (en) and xiao_ya (zh) licences are research / non-commercial — keep
+  ljspeech / chaowen. Windows' own voices are English-only, so OS speech can't replace them.
 
 ## Rules for every change (mandatory)
 

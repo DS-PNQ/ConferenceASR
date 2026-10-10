@@ -17,7 +17,7 @@ from pathlib import Path
 import yaml
 from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 from .audio_io import chunk_stream, decode_b64_pcm16, decode_bytes
 from .device import device_report, resolve_device, resolve_dtype
@@ -27,6 +27,7 @@ from .engines import make_mt_engine
 from .ocr_engine import BlockOCR, PaddleOCRVLEngine
 from .pipeline import ConferencePipeline
 from .streaming import StreamingSession
+from .tts_engine import PiperTTS
 from .vad import SileroVAD
 from .zipformer_engine import ZipformerEngine
 
@@ -53,6 +54,7 @@ enhancer = DeepFilterNetEnhancer(CFG)
 ocr = PaddleOCRVLEngine(CFG)  # lazy: loads on first /api/ocr, never in warmup
 blockocr = BlockOCR(CFG)  # PP-OCR boxes+scores (CPU); lazy like ocr
 vad = SileroVAD(CFG)  # neural speech gate; fail-open when unavailable
+tts = PiperTTS(CFG)  # speaker buttons: CPU voices, load on first use, idle-unload
 pipe = ConferencePipeline(CFG, asr, mt, diarizer, enhancer)
 # Runtime-swappable diarizer (POST /api/settings). New streaming sessions and
 # the legacy pipeline resolve through here; in-flight sessions keep theirs.
@@ -108,7 +110,31 @@ def health():
         "denoise": enhancer.status(),
         "ocr": {**ocr.status(), "vietocr": blockocr.has_viet},
         "vad": vad.status(),
+        "tts": tts.status(),
+        "mem": _mem(),
     }
+
+
+def _mem() -> dict:
+    """RAM of the backend + its sidecars, this process's CUDA pool, GPU-wide use (MB)."""
+    out: dict = {}
+    try:
+        import psutil  # comes with accelerate
+
+        me = psutil.Process()
+        out["ram_mb"] = round(sum(p.memory_info().rss for p in [me, *me.children(recursive=True)]) / 2**20)
+    except Exception:
+        pass
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            free, total = torch.cuda.mem_get_info(0)
+            out["vram_mb"] = round(torch.cuda.memory_reserved() / 2**20)
+            out["gpu_used_mb"] = round((total - free) / 2**20)
+    except Exception:
+        pass
+    return out
 
 
 def _parse_terms(v) -> dict[str, str]:
@@ -158,10 +184,11 @@ def warmup():
         # before it's done waits in configure() (ensure_loaded locks).
         threading.Thread(target=_load, daemon=True).start()
     asr.ensure_loaded(demo_ok=demo_ok)
-    try:
-        asr._ort().ensure_loaded()  # final re-decoder: else ~10 s on the first segment
-    except Exception as e:
-        log.warning("ORT re-decoder warmup failed: %s", e)
+    if CFG.get("asr_cuda_final", False):  # the only user of the re-decoder (+1 GB RAM)
+        try:
+            asr._ort().ensure_loaded()  # else ~10 s on the first segment
+        except Exception as e:
+            log.warning("ORT re-decoder warmup failed: %s", e)
     mt.ensure_loaded(demo_ok=demo_ok)
     enhancer.ensure_loaded(demo_ok=demo_ok)
     try:
@@ -239,6 +266,31 @@ async def translate(payload: dict):
     # off the event loop: a long text takes minutes and /ws/live must keep flowing
     return {"ok": True, "translations": {
         t: await asyncio.to_thread(_translate_long, text, t, src, terms) for t in targets}}
+
+
+@app.post("/api/tts")
+async def speak(payload: dict):
+    """{text, lang} -> audio/wav (speaker buttons). 404 = no voice for lang:
+    the UI falls back to the OS voice (speechSynthesis)."""
+    text = str((payload or {}).get("text") or "").strip()
+    lang = str((payload or {}).get("lang") or "").strip().lower()
+    if not text:
+        return JSONResponse({"ok": False, "error": "text is empty"}, status_code=400)
+    try:
+        wav = await asyncio.to_thread(tts.synth, text, lang)
+    except LookupError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=404)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"tts failed: {e}"}, status_code=500)
+    return Response(wav, media_type="audio/wav")
+
+
+def _enter_live_mode() -> None:
+    """A live session frees what OCR left loaded: the PaddleOCR-VL reader
+    (~2 GB VRAM) and PP-OCR + VietOCR (CPU RAM). Both reload on the next OCR."""
+    if ocr.loaded:
+        ocr.unload()
+    blockocr.unload()
 
 
 def _enter_ocr_mode() -> dict:
@@ -502,6 +554,7 @@ async def _ws_stream_msg(ws: WebSocket, data: dict, holder: dict):
             except Exception:
                 pass
             holder["session"] = None
+        await asyncio.to_thread(_enter_live_mode)
         session = StreamingSession(CFG, asr, mt, RUNTIME.get("diarizer", diarizer),
                                    enhancer, holder["q"], vad=vad)
         try:

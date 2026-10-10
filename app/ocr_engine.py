@@ -148,6 +148,18 @@ class BlockOCR:
                 except Exception as e:
                     log.warning("VietOCR unavailable (%s) — PP-OCR text only", e)
 
+    def unload(self) -> dict:
+        """Drop PP-OCR + VietOCR sessions (CPU RAM). Next read reloads lazily."""
+        with self._lock:
+            was = self.loaded
+            self._engine = self._viet = None
+        if was:
+            import gc
+
+            gc.collect()
+            log.info("Block OCR unloaded")
+        return {"unloaded": was}
+
     def read_blocks(self, image) -> dict:
         """-> {text, blocks: [{id, text, conf, box:[x0,y0,x1,y1] rel}], overall_conf}."""
         import numpy as np

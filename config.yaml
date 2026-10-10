@@ -10,8 +10,9 @@ asr_model: D:/CONFERENCE ASR/zipformer zh-en-vi onnx phaseB 2e    # or set ASR_M
 asr_provider: cpu      # sherpa-onnx wheels are CPU-only; cuda if you build with GPU
 asr_quant: auto        # auto | int8 | fp32  (auto = int8 on cpu, fp32 on cuda)
 asr_threads: 4
-asr_cuda_final: false      # one-shot ORT re-decode of each final. MEASURED live: 2-7 s per
-                           # segment under MT load -> off; finals use the live-stream text
+asr_cuda_final: false      # one-shot ORT re-decode of each final (live + uploads). MEASURED live:
+                           # 2-7 s per segment under MT load, same text, and the second model copy
+                           # holds +1043 MB RAM -> off: never loaded; finals use the live-stream text
 asr_ort_threads: 2         # final re-decode pool. MEASURED under live MT load: default
                            # (10) 13.4 s per 12 s segment, 2 -> 1.2 s, 4 -> 1.0-5.4 s
 asr_ort_provider: cpu      # cpu (verified: 15 s audio in ~1 s) | cuda (this
@@ -30,10 +31,14 @@ mt_onnx_provider: cpu          # MEASURED: this int8 export crashes mid-inferenc
 mt_compile: true           # CUDA-graph the decode step (needs triton-windows in ../pydeps).
                            # MEASURED RTX 4060 same process: 9.6 -> 31.2 tok/s. First
                            # start compiles ~100 s at warmup (cached on disk after).
+                           # Also keeps the FP8 weights (mt_engine._FP8Linear, dequant fused
+                           # into the decode). MEASURED 18 translations, same output: 4.03 ->
+                           # 2.09 GB VRAM, 40.9 -> 50.4 tok/s; warmup 20 -> 33 s (cached).
+                           # false (or no triton) = eager decode on an fp16 bake (3.5 GB)
 mt_max_new_tokens: 128     # short utterances only; lower = faster (20 s speech ≈ 90 tgt toks)
 mt_do_sample: false        # false = greedy decode (fastest, deterministic)
 mt_use_cache: true         # KV-cache (repo default false = slow recompute)
-mt_kvquant: false          # quanto KV cache. MEASURED RTX 4060 after the fp16 bake:
+mt_kvquant: false          # quanto KV cache. MEASURED RTX 4060 on the fp16 bake:
                            # 12.7 vs 19.3 tok/s off — prompts are short (history is
                            # capped), so the 4x cache saving buys nothing here.
 mt_batch: false            # batched multi-target generate. MEASURED 0.09x on this
@@ -63,6 +68,14 @@ vi_ocr_model: models/vietocr-s2s  # optional VietOCR seq2seq fp16 ONNX (44.7 MB,
                              # diacritics + boxes. MEASURED ocr_test/samples: vi_sign 'CAMDOXE' -> 'CÁM ĐỖ XE',
                              # ~0.1 s/line; fp32 (89 MB) gave identical text. Missing dir = PP-OCR/VLM as before
 translate_chunk_chars: 240   # Translate tab + OCR: chunk cost (CJK x3) so each MT call fits mt_max_new_tokens
+
+# ---- Speaker buttons: offline TTS (sherpa-onnx Piper VITS int8, CPU only = 0 VRAM) ----
+tts_dir: models/tts          # <lang>/ voice folders from scripts/get_tts.py: vi vais1000, en ljspeech,
+                             # zh chaowen (medium int8, 14-22 MB). Missing language = UI uses the OS voice.
+                             # MEASURED i7-13620H, 2 threads: load 1.2-1.8 s, +99-142 MB RAM per voice,
+                             # RTF 0.15-0.17; all three read back through the Zipformer ASR near-verbatim
+tts_threads: 2               # CPU threads per synth (live ASR keeps its own 4)
+tts_idle_unload: 120         # s without a speak request -> voices dropped (RAM back)
 
 # ---- Voice activity (Silero VAD: https://github.com/snakers4/silero-vad) ----
 vad_enable: true             # neural speech gate in front of the diarizer;

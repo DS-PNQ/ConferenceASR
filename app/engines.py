@@ -14,6 +14,7 @@ from app.enhancer import DeepFilterNetEnhancer
 from app.mt_engine import HyMT2Engine
 from app.onnx_mt import OnnxMTEngine
 from app.pipeline import ConferencePipeline
+from app.tts_engine import PiperTTS
 from app.zipformer_engine import ZipformerEngine
 
 log = logging.getLogger("conf.engines")
@@ -52,4 +53,4 @@ def build_app() -> dict:
     pipe = ConferencePipeline(cfg, asr, mt, diarizer, enhancer)
 
     return {"cfg": cfg, "device": device_report(cfg), "asr": asr, "mt": mt,
-            "diarizer": diarizer, "enhancer": enhancer, "pipe": pipe}
+            "diarizer": diarizer, "enhancer": enhancer, "pipe": pipe, "tts": PiperTTS(cfg)}

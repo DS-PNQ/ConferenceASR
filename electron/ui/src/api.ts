@@ -44,6 +44,8 @@ export interface Health {
   diarizer_status: { backend: string; model?: string; device?: string; ready: boolean; latency_ms?: number };
   denoise: { backend: string; ready: boolean; device?: string };
   ocr?: { model: string; device?: string; ready: boolean; vietocr?: boolean };
+  tts?: { backend: string; device: string; langs: string[]; loaded: string[] };
+  mem?: { ram_mb?: number; vram_mb?: number; gpu_used_mb?: number }; // backend + sidecars
   langs: string[];
 }
 
@@ -149,6 +151,71 @@ export async function apiOcr(
   const j = await r.json();
   if (!j.ok) throw new Error(j.error || "ocr failed");
   return j as OcrResult;
+}
+
+// ---------- speaker buttons: backend Piper voice (POST /api/tts), else the OS voice ----------
+const BCP47: Record<string, string> = { vi: "vi-VN", en: "en-US", zh: "zh-CN", fr: "fr-FR", de: "de-DE",
+  ja: "ja-JP", ko: "ko-KR", es: "es-ES", pt: "pt-PT", ru: "ru-RU", th: "th-TH", ar: "ar-SA", it: "it-IT" };
+let player: HTMLAudioElement | null = null;
+let utter: SpeechSynthesisUtterance | null = null; // held: Chromium GCs it and its events never fire
+let speakSeq = 0;
+
+/** One voice at a time app-wide: stops whatever is playing (its onEnd fires). */
+export function stopSpeaking() {
+  speakSeq++;
+  const p = player;
+  player = null;
+  p?.pause();
+  window.speechSynthesis?.cancel();
+}
+
+/** false = no voice for this language anywhere (no backend voice, no matching OS voice). */
+export async function speak(text: string, lang: string, cb: { onStart: () => void; onEnd: () => void }): Promise<boolean> {
+  stopSpeaking();
+  const my = speakSeq;
+  let wav: Blob | null = null;
+  try {
+    const r = await fetch(`${BASE}/api/tts`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, lang }),
+    });
+    if (r.ok) wav = await r.blob();
+  } catch { /* backend down: OS voice below */ }
+  if (my !== speakSeq) { cb.onEnd(); return true; } // another button was pressed meanwhile
+  if (wav) {
+    const url = URL.createObjectURL(wav);
+    const a = new Audio(url);
+    player = a;
+    let ended = false;
+    const done = () => {
+      if (ended) return;
+      ended = true;
+      URL.revokeObjectURL(url);
+      if (player === a) player = null;
+      cb.onEnd();
+    };
+    a.onended = a.onerror = a.onpause = done;
+    try {
+      await a.play();
+      cb.onStart();
+    } catch { done(); }
+    return true;
+  }
+  // no backend voice for this language (404): an OS voice for it, if one is installed
+  const synth = window.speechSynthesis;
+  const want = (BCP47[lang] ?? lang).toLowerCase();
+  const voice = synth?.getVoices().find((v) => v.lang.toLowerCase() === want)
+    ?? synth?.getVoices().find((v) => v.lang.toLowerCase().startsWith(lang.toLowerCase()));
+  if (!synth || !voice) { cb.onEnd(); return false; }
+  const u = new SpeechSynthesisUtterance(text);
+  utter = u;
+  u.voice = voice;
+  u.lang = voice.lang;
+  u.onstart = cb.onStart;
+  u.onend = u.onerror = () => { if (utter === u) utter = null; cb.onEnd(); };
+  synth.speak(u);
+  return true;
 }
 
 export type WSEvents = {

@@ -1,5 +1,5 @@
 // Main process: window + Python backend lifecycle (find, CUDA-detect, spawn, reap).
-import { app, BrowserWindow, Menu, desktopCapturer, powerSaveBlocker, session } from "electron";
+import { app, BrowserWindow, Menu, desktopCapturer, ipcMain, powerSaveBlocker, session } from "electron";
 import { spawn, execFile, ChildProcess } from "child_process";
 import * as path from "path";
 import * as fs from "fs";
@@ -113,18 +113,29 @@ async function createWindow(): Promise<void> {
   // Electron menu renders as a light strip that clashes with the design.
   Menu.setApplicationMenu(null);
   win = new BrowserWindow({
-    width: 1200,
-    height: 780,
+    width: 1280,
+    height: 820,
     minWidth: 980,
     minHeight: 640,
     title: "ConfLive",
     icon: path.join(__dirname, "..", "build", "icon.png"),
-    backgroundColor: "#F2F2F7",
+    backgroundColor: "#F5F5F7",
     autoHideMenuBar: true,
+    // macOS-style unified toolbar: the page's 52 px toolbar is the title bar and
+    // Windows draws its caption buttons over it (the UI pads for env(titlebar-area-*))
+    titleBarStyle: "hidden",
+    titleBarOverlay: { color: "#00000000", symbolColor: "#1d1d1f", height: 52 },
     // minimized during an hour-long meeting must not throttle the mic/WS loop
     webPreferences: { preload: path.join(__dirname, "preload.js"), backgroundThrottling: false },
   });
   win.setMenu(null);
+  // the renderer reports its light/dark choice: recolour the caption buttons to match
+  ipcMain.removeAllListeners("theme");
+  ipcMain.on("theme", (_e, t: string) => {
+    const dark = t === "dark";
+    win?.setTitleBarOverlay({ color: "#00000000", symbolColor: dark ? "#f5f5f7" : "#1d1d1f", height: 52 });
+    win?.setBackgroundColor(dark ? "#161617" : "#F5F5F7");
+  });
   // Whole-UI zoom, which the removed menu used to provide: Ctrl+= / Ctrl+- /
   // Ctrl+0 and Ctrl+wheel (the OCR viewer keeps Ctrl+wheel for the page).
   const wc = win.webContents;

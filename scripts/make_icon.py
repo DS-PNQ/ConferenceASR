@@ -8,7 +8,7 @@ OUT = Path(__file__).resolve().parent.parent / "electron" / "build"
 
 grad = Image.new("RGB", (S, S))
 g = ImageDraw.Draw(grad)
-top, bot = (0x7C, 0x78, 0xE0), (0x1D, 0x26, 0x40)  # app purple -> sidebar navy
+top, bot = (0x47, 0x47, 0x47), (0x14, 0x14, 0x14)  # same charcoal as the app's pill buttons
 for y in range(S):
     t = y / S
     g.line([(0, y), (S, y)], fill=tuple(int(a + (b - a) * t) for a, b in zip(top, bot)))
@@ -18,11 +18,9 @@ img = Image.new("RGBA", (S, S))
 img.paste(grad, mask=mask)
 
 d = ImageDraw.Draw(img)
-d.rounded_rectangle([200, 240, 824, 700], radius=150, fill="white")          # speech bubble
-d.polygon([(330, 660), (300, 830), (480, 690)], fill="white")                # its tail
-for i, h in enumerate((90, 200, 300, 200, 90)):                              # live waveform
-    x = 335 + i * 90
-    d.rounded_rectangle([x, 470 - h // 2, x + 54, 470 + h // 2], radius=27, fill=(0x63, 0x5F, 0xBD))
+for i, h in enumerate((220, 400, 580, 400, 220)):                            # live waveform
+    x = 272 + i * 100
+    d.rounded_rectangle([x, 512 - h // 2, x + 72, 512 + h // 2], radius=36, fill="white")
 
 OUT.mkdir(parents=True, exist_ok=True)
 img.resize((512, 512), Image.LANCZOS).save(OUT / "icon.png")

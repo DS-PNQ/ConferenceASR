@@ -98,6 +98,23 @@ def main():
     assert s._drafts[7]["vi"] == "ssbd(d1) one two three", s._drafts
     print("live SSBD routing OK")
 
+    # kept-FP8 Linear == fp16 bake, and a failed compile re-bakes it to nn.Linear
+    import torch
+
+    from app.mt_engine import _dequantize_fp8, _FP8Linear
+
+    w8 = (torch.randn(8, 16) * 40).to(torch.float8_e4m3fn)
+    scale = torch.tensor([0.01])
+    x = torch.randn(3, 16)
+    lin = _FP8Linear(w8, scale)
+    ref = x @ (w8.to(torch.float32) * scale).T
+    assert torch.allclose(lin(x), ref, atol=1e-5), "FP8Linear mismatch"
+    holder = torch.nn.Sequential(lin)
+    holder.hf_quantizer = None
+    assert _dequantize_fp8(holder) == 1 and isinstance(holder[0], torch.nn.Linear)
+    assert torch.allclose(holder[0](x.half()).float(), ref, atol=0.05)
+    print("FP8Linear + re-bake OK")
+
     # FastAPI routes (no server needed)
     from fastapi.testclient import TestClient
 
@@ -109,7 +126,10 @@ def main():
     assert "denoise" in h.json(), h.json().keys()
     print("health denoise:", h.json()["denoise"])
     assert c.get("/").status_code == 200, "landing failed"
-    print("API health + landing OK")
+    assert "tts" in h.json() and "mem" in h.json(), h.json().keys()
+    assert c.post("/api/tts", json={"text": "", "lang": "en"}).status_code == 400
+    assert c.post("/api/tts", json={"text": "hi", "lang": "xx"}).status_code == 404
+    print("API health + landing + tts errors OK (voices:", h.json()["tts"]["langs"], ")")
     print("SMOKE TEST PASSED")
 
 
