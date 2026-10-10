@@ -112,7 +112,7 @@ class StreamingSession:
         self._rec = self.asr._rec
         if self._rec is False or self._rec is None:
             raise RuntimeError("ASR unavailable for streaming")
-        self._stream = self._rec.create_stream()
+        self._stream = self.asr.new_stream(self.terms)
         if callable(getattr(self.diarizer, "push", None)):
             self.diarizer.ensure_loaded()  # streaming diarizer: up before the first frame
         if self.vad is not None:
@@ -446,7 +446,7 @@ class StreamingSession:
                 # streaming ASR ran on raw audio — re-decode the enhanced
                 # segment one-shot so the final text matches what was heard
                 try:
-                    s2 = self._rec.create_stream()
+                    s2 = self.asr.new_stream(self.terms)
                     s2.accept_waveform(16000, np.clip(seg, -1.0, 1.0))
                     s2.accept_waveform(16000, np.zeros(int(16000 * 0.4), dtype=np.float32))
                     s2.input_finished()
@@ -466,6 +466,7 @@ class StreamingSession:
         if not text:
             self._discard_segment()
             return
+        text = self.asr.correct(text, self.terms)
         t_asr = time.time()
         if t_asr - t_start > 3:
             log.warning("slow finalize ASR: %.1fs for %.1fs audio", t_asr - t_start, seg.size / 16000)
@@ -668,7 +669,7 @@ class StreamingSession:
     def _fresh_stream(self):
         self._stream_s0 = self._pos_end if self._live_diar else None
         try:
-            self._stream = self._rec.create_stream()
+            self._stream = self.asr.new_stream(self.terms)
         except Exception as e:
             log.warning("stream reset failed: %s", e)
 

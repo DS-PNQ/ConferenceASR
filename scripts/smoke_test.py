@@ -8,11 +8,14 @@ from app.pipeline import ConferencePipeline
 
 
 class FakeASR:
-    def transcribe_array(self, pcm, sr, language=None):
+    def transcribe_array(self, pcm, sr, language=None, terms=None):
         return ("English", "hello conference, this is a smoke test")
 
     def transcribe_file(self, p, language=None):
         return ("English", "hello file")
+
+    def correct(self, text, terms=None):
+        return text
 
 
 class FakeMT:
@@ -130,6 +133,22 @@ def main():
     assert c.post("/api/tts", json={"text": "", "lang": "en"}).status_code == 400
     assert c.post("/api/tts", json={"text": "hi", "lang": "xx"}).status_code == 404
     print("API health + landing + tts errors OK (voices:", h.json()["tts"]["langs"], ")")
+    from types import SimpleNamespace
+    from app.zipformer_engine import ZipformerEngine
+    z = ZipformerEngine({"asr_hotwords_score": 1.5})
+    z._rec = SimpleNamespace(create_stream=lambda hotwords=None: hotwords)
+    assert set(z.new_stream({"PyTorch": "lượng tử hóa", "说话人": "Speaker A/B"}).split("/")) ==         {"PYTORCH", "lượng tử hóa", "说话人", "SPEAKER A B"}
+    assert z.new_stream({}) is None and ZipformerEngine({})._hotword_kw("x") == {}
+    print("ASR hotwords OK")
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+        f.write("conference 50\nconferences 5\nquantization 9\nhội 30\nnghị 30\n")
+    z = ZipformerEngine({"asr_lexicon": f.name})
+    assert z.correct("THE CONFERANCE ON QUANTIZASION hội nghi 说话人 KUBERNETES") == \
+        "THE CONFERENCE ON QUANTIZATION hội nghi 说话人 KUBERNETES", z.correct("CONFERANCE")
+    assert z.correct("CONFERANCE", {"Conferance": "x"}) == "CONFERANCE"  # Glossary wins
+    assert ZipformerEngine({}).correct("CONFERANCE") == "CONFERANCE"     # no lexicon = off
+    print("ASR lexicon correction OK")
     print("SMOKE TEST PASSED")
 
 

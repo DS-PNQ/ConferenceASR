@@ -18,8 +18,11 @@ language is always reported as "auto" (pipeline then fills every target).
 """
 from __future__ import annotations
 
+import difflib
+import functools
 import logging
 import os
+import tempfile
 import threading
 from pathlib import Path
 
@@ -53,6 +56,8 @@ class ZipformerEngine:
         # int8 encoder is ~2x smaller/faster on CPU; fp32 for CUDA builds
         self.quant = "int8" if (quant == "int8" or (quant == "auto" and self.provider == "cpu")) else "fp32"
         self.num_threads = int(cfg.get("asr_threads", 4))
+        self.hotwords_score = float(cfg.get("asr_hotwords_score", 0))
+        self.lex_cutoff = float(cfg.get("asr_lexicon_cutoff", 0.85))
         self._lock = threading.Lock()
         self._rec = None
         self.model_id = f"zipformer zh-en-vi (onnx {self.quant}, local)"
@@ -72,6 +77,67 @@ class ZipformerEngine:
                 "joiner": model_file(self.model_dir, "joiner", q),
                 "tokens": str(tokens)}
 
+    def _hotword_kw(self, tokens: str) -> dict:
+        """Beam search + bpe vocab so new_stream() can bias toward glossary terms.
+
+        The model ships no bpe.model, so tokens.txt becomes the bpe vocab (equal scores =
+        fewest pieces). Off (greedy) when asr_hotwords_score is 0.
+        """
+        if self.hotwords_score <= 0:
+            return {}
+        vocab = Path(tempfile.gettempdir()) / "conflive-asr-bpe.vocab"
+        with open(tokens, encoding="utf-8") as f, open(vocab, "w", encoding="utf-8") as v:
+            v.writelines(f"{t}\t-1\n" for t in (l.rsplit(" ", 1)[0] for l in f) if not t.startswith("<"))
+        return dict(decoding_method="modified_beam_search", modeling_unit="cjkchar+bpe",
+                    bpe_vocab=str(vocab), hotwords_score=self.hotwords_score)
+
+    def new_stream(self, terms: dict | None = None):
+        """Recognizer stream biased toward both sides of the glossary {source: target}."""
+        if not terms or self.hotwords_score <= 0:
+            return self._rec.create_stream()
+        # Pieces are case-split: English CAPS, Vietnamese lowercase.
+        # ponytail: ASCII word = English, so a diacritic-free Vietnamese word gets English pieces
+        hw = {" ".join(w.upper() if w.isascii() else w.lower() for w in t.replace("/", " ").split())
+              for kv in terms.items() for t in kv}
+        return self._rec.create_stream(hotwords="/".join(h for h in hw if h))
+
+    @functools.cached_property
+    def lexicon(self) -> dict:
+        """{first letter: {word: count}} from asr_lexicon (scripts/get_lexicon.py); {} = off."""
+        path = Path(self.cfg.get("asr_lexicon") or "")
+        if not path.is_file():
+            return {}
+        lex: dict[str, dict[str, int]] = {}
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                w, n = line.split()
+                lex.setdefault(w[0], {})[w] = int(n)
+        log.info("ASR lexicon: %d words from %s", sum(map(len, lex.values())), path)
+        return lex
+
+    def correct(self, text: str, terms: dict | None = None) -> str:
+        """Snap misheard (out-of-lexicon) words to the closest frequent lexicon word.
+
+        Glossary words are never touched; CJK, short and non-alphabetic words pass through.
+        ponytail: per-word spelling only, no context (a real-word mishearing like
+        "there"/"their" stays); an n-gram LM (sherpa-onnx lm=) is the upgrade.
+        """
+        if not self.lexicon or not text:
+            return text
+        keep = {w.lower() for kv in (terms or {}).items() for t in kv for w in t.split()}
+        out = []
+        for word in text.split():
+            k = word.lower()
+            bucket = self.lexicon.get(k[0], {})
+            if (len(k) >= 4 and k.isalpha() and k not in bucket and k not in keep
+                    and not any("\u3400" <= c <= "\u9fff" for c in k)):
+                hits = difflib.get_close_matches(k, bucket, 3, self.lex_cutoff)
+                if hits:
+                    best = max(hits, key=bucket.get)
+                    word = best.upper() if word.isupper() else best
+            out.append(word)
+        return " ".join(out)
+
     def ensure_loaded(self, demo_ok: bool = True):
         if self._rec is not None:
             return
@@ -87,7 +153,7 @@ class ZipformerEngine:
                 self._rec = sherpa_onnx.OnlineRecognizer.from_transducer(
                     encoder=p["encoder"], decoder=p["decoder"], joiner=p["joiner"],
                     tokens=p["tokens"], provider=self.provider,
-                    num_threads=self.num_threads)
+                    num_threads=self.num_threads, **self._hotword_kw(p["tokens"]))
                 log.info("ASR ready: %s", self.model_id)
             except Exception as e:
                 log.warning("Zipformer load failed: %s", e)
@@ -96,7 +162,7 @@ class ZipformerEngine:
                 log.warning("ASR unavailable and demo_ok=True — transcriptions will be empty.")
                 self._rec = False
 
-    def transcribe_array(self, pcm: np.ndarray, sr: int, language=None) -> tuple[str, str]:
+    def transcribe_array(self, pcm: np.ndarray, sr: int, language=None, terms=None) -> tuple[str, str]:
         """Transcribe mono float32 audio @16 kHz. Returns ("auto", text)."""
         self.ensure_loaded()
         x = np.asarray(pcm, dtype=np.float32).ravel()
@@ -109,7 +175,7 @@ class ZipformerEngine:
         with self._lock:
             import sherpa_onnx  # noqa: F401 (already imported in ensure_loaded)
 
-            s = self._rec.create_stream()
+            s = self.new_stream(terms)
             s.accept_waveform(16000, np.clip(x, -1.0, 1.0))
             s.accept_waveform(16000, np.zeros(int(16000 * TAIL_SECONDS), dtype=np.float32))
             s.input_finished()

@@ -11,6 +11,40 @@ streaming Nemotron diarization, DeepFilterNet hook):
   partials and token-streamed finals. `npm run dist` builds a Windows installer.
 - **C# desktop app** (`csharp/ConfLive`): native WPF window, same protocol.
 
+## Pipeline
+
+Live mic and system audio go through one streaming path (`/ws/live`, `app/streaming.py`).
+ASR text is shown the moment a segment ends; translation never blocks it and streams in token by token.
+
+```mermaid
+flowchart TD
+    A["Mic or system audio<br/>16 kHz PCM16, 0.5 s frames"] --> B["/ws/live → StreamingSession.feed"]
+    B --> D["Diarizer (Nemotron sidecar)<br/>speaker label per frame"]
+    B --> V["Silero VAD + energy gate<br/>speech / silence"]
+    B --> R["Zipformer streaming ASR<br/>(sherpa-onnx, CPU int8)"]
+    R -->|text changed| P["partial event<br/>live caption, never waits on MT"]
+    V --> E{"Endpoint?<br/>pause or max segment"}
+    R --> E
+    E -->|yes| F["Finalize segment"]
+    F --> F1["Denoise (spectral gate / DeepFilterNet)"]
+    F1 --> F2["Final text + lexicon snap + Glossary"]
+    F2 --> F3["Speaker turn + language ID"]
+    F3 --> U["utterance event (pending)<br/>ASR text shown now"]
+    F3 --> M["MT queue: Hy-MT2 FP8<br/>display language first, then the others"]
+    M -->|tok events| T["Translations stream into the same row"]
+    T --> U2["utterance event (done)"]
+```
+
+| Path | Route | What it does |
+| --- | --- | --- |
+| Live | `/ws/live` | The pipeline above: partials, speaker rows, token-streamed translations |
+| Upload | `POST /api/transcribe` | Whole-file denoise → fixed chunks → ASR → diarize → MT |
+| Translate tab | `POST /api/translate` | Long text, chunked, same Hy-MT2 engine, Glossary applied |
+| OCR | `POST /api/ocr` | PP-OCR blocks (VietOCR for Vietnamese) or PaddleOCR-VL, optional MT |
+| Listen | `POST /api/tts` | Offline Piper voice per language, OS voice as fallback |
+
+Details and tunables: §3 (config), §5 (diarization), §6 (MT). Per-file map: `AGENTS.md`.
+
 ## Memory (measured RTX 4060 Laptop 8 GB, i7-13620H)
 
 Same scenario before → after the October 2026 trim (`checkpoints/WORKLOG.md`), RAM = working
@@ -249,6 +283,9 @@ asr_model: D:/CONFERENCE ASR/zipformer zh-en-vi onnx phaseB 2e  # local ONNX dir
 asr_provider: cpu       # sherpa-onnx wheels are CPU-only
 asr_quant: auto         # auto = int8 on cpu
 asr_threads: 4
+asr_hotwords_score: 1.5 # Glossary terms bias the recognizer (beam search); 0 = off. >=2 mangles neighbours
+asr_lexicon: models/lexicon/words.txt  # scripts/get_lexicon.py: Tatoeba spell-snap of misheard en/vi words in finals
+asr_lexicon_cutoff: 0.85  # similarity needed to snap; lower fixes more but also bends names/jargon
 mt_model: tencent/Hy-MT2-1.8B-FP8
 mt_max_new_tokens: 256
 mt_do_sample: false     # greedy decode = fastest
@@ -431,7 +468,11 @@ python -m app.tts_engine          # each installed voice synthesizes; a missing 
 - `GET /api/health` — device, ASR/MT/denoise/diarizer status, `tts {langs, loaded}`,
   `mem {ram_mb, vram_mb, gpu_used_mb}` (backend + sidecars RAM, this process's CUDA pool, GPU-wide)
 - Glossary `terms` (`{source: target}`) ride Hy-MT2's documented terminology
-  block; verified steering output (e.g. forced `光子引擎`).
+  block; verified steering output (e.g. forced `光子引擎`). Both sides of each pair also bias
+  the recognizer (sherpa-onnx hotwords, `asr_hotwords_score`) on live streams and uploads.
+  With `python scripts/get_lexicon.py` run once, final transcripts also snap misheard English/Vietnamese
+  words that are not in a Tatoeba word list to the closest frequent one (`asr_lexicon`); Glossary
+  words are kept as heard, so add names and jargon there.
 
 ## Layout
 
@@ -442,11 +483,13 @@ app/diarizer.py  app/nemotron_sidecar.py  app/enhancer.py  app/audio_io.py  app/
 app/streaming.py  app/main.py
 electron/package.json  electron/tsconfig.json
 electron/src/main.ts  electron/src/preload.ts
+electron/build/icon.svg (app icon source; `python scripts/make_icon.py` → icon.png/.ico)
 electron/ui/ (React+Vite+Tailwind redesign, wired live: src/App.tsx, src/api.ts)
 csharp/ConfLive/*.csproj,*.xaml,*.cs  installer/ConfLive.iss + build.ps1
 scripts/download_models.py  scripts/get_vietocr.py  scripts/smoke_test.py  scripts/streaming_smoke.py
 app/ocr_engine.py (PP-OCR blocks + VietRec + PaddleOCR-VL)  models/vietocr-s2s/ (optional)
 app/tts_engine.py (Piper voices, CPU)  scripts/get_tts.py  models/tts/{vi,en,zh}/ (optional)
+scripts/get_lexicon.py (Tatoeba en+vi words)  models/lexicon/words.txt (optional, ASR spell-snap)
 checkpoints/ (source snapshots, see checkpoints/WORKLOG.md)
 ```
 

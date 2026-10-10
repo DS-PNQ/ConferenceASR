@@ -90,12 +90,13 @@ class ConferencePipeline:
                 if r_text:
                     text, asr_backend = r_text, r_back or "ort"
             if not text:
-                lang_name, text = self.asr.transcribe_array(pcm, sr, language=src_lang)
+                lang_name, text = self.asr.transcribe_array(pcm, sr, language=src_lang, terms=terms)
         except Exception as e:
             log.warning("ASR chunk failed: %s", e)
             return {"type": "error", "error": str(e), "speaker": dia["speaker"]}
         if not (text or "").strip():
             return {"type": "empty", "speaker": dia["speaker"], "rms_db": dia["rms_db"]}
+        text = self.asr.correct(text, terms)
         detected = norm_lang_code(lang_name)
         targets = targets or list(self.cfg.get("default_targets", ["en", "zh"]))
         # Skip MT where the target IS the detected source (a copy, not a

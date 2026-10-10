@@ -10,6 +10,16 @@ asr_model: D:/CONFERENCE ASR/zipformer zh-en-vi onnx phaseB 2e    # or set ASR_M
 asr_provider: cpu      # sherpa-onnx wheels are CPU-only; cuda if you build with GPU
 asr_quant: auto        # auto | int8 | fp32  (auto = int8 on cpu, fp32 on cuda)
 asr_threads: 4
+asr_hotwords_score: 1.5    # bias recognition toward Glossary terms (both sides of each pair), per
+                           # stream; 0 = greedy decode, no biasing. >0 switches to beam search.
+                           # MEASURED 9 TTS sentences, same audio: 1.5 fixed PITORCH->PYTORCH and
+                           # ZIP FORMER->ZIPFORMER, no change on term-free vi/en/zh; >=2.0 mangled
+                           # neighbours (KUBERNETES->KUBERES, WE DEPLOY->WLOY). RTF unchanged (~0.1)
+asr_lexicon: models/lexicon/words.txt   # scripts/get_lexicon.py (Tatoeba en+vi word counts). Final
+                           # transcripts only: an out-of-lexicon en/vi word (>= 4 letters) snaps to the most
+                           # frequent close lexicon word; Glossary words are never touched. Missing file = off
+asr_lexicon_cutoff: 0.85   # difflib similarity a snap needs. Lower = fixes more mishearings, but also
+                           # "corrects" names/jargon missing from Tatoeba (add those to the Glossary)
 asr_cuda_final: false      # one-shot ORT re-decode of each final (live + uploads). MEASURED live:
                            # 2-7 s per segment under MT load, same text, and the second model copy
                            # holds +1043 MB RAM -> off: never loaded; finals use the live-stream text
