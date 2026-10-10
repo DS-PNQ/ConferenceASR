@@ -56,6 +56,10 @@ release/
 [Oo]bj/
 .cache/
 .impeccable/
+checkpoints/
+models/
+CLAUDE.md
+AGENTS.md
 
 # --- Electron / Python build outputs ---
 node_modules/
