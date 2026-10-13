@@ -33,6 +33,7 @@ type IconName =
   | "book"
   | "settings"
   | "plus"
+  | "menu"
   | "chevron"
   | "mic"
   | "pause"
@@ -81,6 +82,7 @@ function Icon({ name, size = 18, stroke = 1.8 }: { name: IconName; size?: number
     book: <><path d="M6.5 3.5h11.2a.8.8 0 0 1 .8.8v15.4a.8.8 0 0 1-.8.8H6.5a2 2 0 0 1-2-2v-13a2 2 0 0 1 2-2Z" /><path d="M4.5 18.5a2 2 0 0 1 2-2h12" /><path d="m9.2 13 2.3-6 2.3 6M10 11h3" /></>,
     settings: <><path d="M18.96 10.59 20.92 10.83 20.92 13.17 18.96 13.41 17.92 15.92 19.14 17.49 17.49 19.14 15.92 17.92 13.41 18.96 13.17 20.92 10.83 20.92 10.59 18.96 8.08 17.92 6.51 19.14 4.86 17.49 6.08 15.92 5.04 13.41 3.08 13.17 3.08 10.83 5.04 10.59 6.08 8.08 4.86 6.51 6.51 4.86 8.08 6.08 10.59 5.04 10.83 3.08 13.17 3.08 13.41 5.04 15.92 6.08 17.49 4.86 19.14 6.51 17.92 8.08Z" /><circle cx="12" cy="12" r="2.8" /></>,
     plus: <path d="M12 5v14M5 12h14" />,
+    menu: <path d="M4 7h16M4 12h16M4 17h16" />,
     chevron: <path d="m7 10 5 5 5-5" />,
     mic: <><rect x="8.5" y="3" width="7" height="12" rx="3.5" /><path d="M5 11.5a7 7 0 0 0 14 0M12 18.5V22M8.5 22h7" /></>,
     pause: <path d="M8.5 5v14M15.5 5v14" />,
@@ -276,7 +278,7 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [targets, setTargets] = useState<string[]>(["vi", "en", "zh"]);
   const [srcChoice, setSrcChoice] = useState("auto");
-  const [denoise, setDenoise] = useState(true);
+  const [denoise, setDenoise] = useState(false);
   const [micId, setMicId] = useState<string | undefined>(undefined);
   const [mics, setMics] = useState<{ id: string; label: string }[]>([]);
   const [terms, setTerms] = useState<Record<string, string>>(() => loadGlossary());
@@ -290,6 +292,9 @@ export default function App() {
     } catch { /* noop */ }
     return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
   });
+  // YouTube-style sidebar: full, or a mini rail of icons with small labels
+  const [mini, setMini] = useState(() => { try { return localStorage.getItem("conflive.navMini") === "1"; } catch { return false; } });
+  useEffect(() => { try { localStorage.setItem("conflive.navMini", mini ? "1" : "0"); } catch { /* noop */ } }, [mini]);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     // Electron: recolour the native window buttons drawn over the toolbar
@@ -336,12 +341,13 @@ export default function App() {
   pausedRef.current = paused;
   elapsedRef.current = elapsed;
 
-  // push display/target changes into a live session without resetting it
+  // push display/target/glossary changes into a live session without resetting it
+  // (new glossary terms steer the recognizer from the next segment on)
   useEffect(() => {
     if (liveRef.current && socketRef.current) {
-      socketRef.current.config({ displayLang, targets });
+      socketRef.current.config({ displayLang, targets, terms });
     }
-  }, [displayLang, targets]);
+  }, [displayLang, targets, terms]);
 
   // session clock
   useEffect(() => {
@@ -767,15 +773,18 @@ export default function App() {
 
   return (
     <main className="app-shell">
-      <aside className="sidebar glass">
-        <div className="brand-lockup"><AppLogo size={24} /><span>ConfLive</span></div>
-        <button className="new-session" onClick={newSession}><Icon name="plus" size={16} stroke={2.2} /><span>New Session</span></button>
+      <aside className={`sidebar glass ${mini ? "mini" : ""}`}>
+        <div className="brand-lockup">
+          <button className="nav-toggle" onClick={() => setMini((m) => !m)} aria-label={mini ? "Expand menu" : "Collapse menu"} aria-expanded={!mini} title={mini ? "Expand menu" : "Collapse menu"}>{mini ? <AppLogo size={30} /> : <Icon name="menu" size={20} stroke={1.8} />}</button>
+          <AppLogo size={24} /><span>ConfLive</span>
+        </div>
+        <button className="new-session" onClick={newSession} title="New Session"><Icon name="plus" size={16} stroke={2.2} /><span>New Session</span></button>
         <nav className="primary-nav" aria-label="Main navigation">
           <p className="nav-kicker">Workspace</p>
           {navigation.map((item) => (
             <button className={`nav-item ${activeView === item.label ? "active" : ""}`} key={item.label} aria-current={activeView === item.label ? "page" : undefined}
               onClick={() => { setActiveView(item.label); setOpenArchived(null); }}>
-              <Icon name={item.icon} size={20} stroke={1.6} /><span>{VIEW_TITLES[item.label] ?? item.label}</span>{item.label === "Live session" && live && <i className="nav-live-dot" aria-label="recording" />}
+              <Icon name={item.icon} size={20} stroke={1.6} /><span>{mini && item.label === "Live session" ? "Live" : VIEW_TITLES[item.label] ?? item.label}</span>{item.label === "Live session" && live && <i className="nav-live-dot" aria-label="recording" />}
             </button>
           ))}
         </nav>

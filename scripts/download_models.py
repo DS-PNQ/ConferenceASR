@@ -43,6 +43,17 @@ try:
 except Exception as e:
     print("DeepFilterNet note (app will run in pass-through mode):", e)
 
+GTCRN = Path(__file__).resolve().parent.parent / "models" / "gtcrn" / "gtcrn_simple.onnx"
+print(f"Downloading GTCRN denoiser (0.5 MB, denoise_mode: gtcrn) -> {GTCRN}")
+try:
+    import urllib.request
+
+    GTCRN.parent.mkdir(parents=True, exist_ok=True)
+    urllib.request.urlretrieve("https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+                               "speech-enhancement-models/gtcrn_simple.onnx", GTCRN)
+except Exception as e:
+    print("GTCRN note (denoise_mode: gtcrn falls back to the spectral gate):", e)
+
 # The app loads it offline from this folder (diarizer falls back here when
 # config's nemotron_model dir doesn't exist on this machine, like the ASR).
 NEMOTRON_DIR = Path(__file__).resolve().parent.parent / "models" / "nemotron-3-diarization"

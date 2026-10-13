@@ -22,10 +22,13 @@ def noise_left(y):  # energy where the "voice" is silent, relative to input
 
 
 enh = DeepFilterNetEnhancer({"noise_suppress": True})
-enh.ensure_loaded()
-enh.enhance_array(x[:sr], sr)  # warm
+gt = DeepFilterNetEnhancer({"noise_suppress": True, "denoise_mode": "gtcrn"})  # gate if model missing
+for e in (enh, gt):
+    e.ensure_loaded()
+    e.enhance_array(x[:sr], sr)  # warm
 spectral_gate(x[:sr], sr)  # warm scipy import
 for name, fn in ((enh.status()["backend"] + "/" + enh.mode, lambda a: enh.enhance_array(a, sr)),
+                 (gt.status()["backend"] + "/" + gt.mode, lambda a: gt.enhance_array(a, sr)),
                  ("spectral-gate", lambda a: spectral_gate(a, sr))):
     t0 = time.time()
     y = fn(x)

@@ -8,13 +8,20 @@ cuda_fallback_on_oom: true
 # Folder holds encoder/decoder/joiner .onnx (fp32 + int8) + tokens.txt.
 asr_model: D:/CONFERENCE ASR/zipformer zh-en-vi onnx phaseB 2e    # or set ASR_MODEL
 asr_provider: cpu      # sherpa-onnx wheels are CPU-only; cuda if you build with GPU
-asr_quant: auto        # auto | int8 | fp32  (auto = int8 on cpu, fp32 on cuda)
+asr_quant: auto        # auto | int8 | fp32  (auto = int8 on cpu, fp32 on cuda). MEASURED i7-13620H, 342 s
+                       # real audio (zh news + en ad): int8 RTF 0.058 / 385 MB peak, fp32 0.091 / 531 MB;
+                       # 87-97% word agreement, differences split both ways -> int8 stays
 asr_threads: 4
-asr_hotwords_score: 1.5    # bias recognition toward Glossary terms (both sides of each pair), per
+asr_hotwords_score: 3.0    # bias recognition toward Glossary terms (both sides of each pair), per
                            # stream; 0 = greedy decode, no biasing. >0 switches to beam search.
                            # MEASURED 9 TTS sentences, same audio: 1.5 fixed PITORCH->PYTORCH and
                            # ZIP FORMER->ZIPFORMER, no change on term-free vi/en/zh; >=2.0 mangled
-                           # neighbours (KUBERNETES->KUBERES, WE DEPLOY->WLOY). RTF unchanged (~0.1)
+                           # neighbours (KUBERNETES->KUBERES, WE DEPLOY->WLOY). RTF unchanged (~0.1).
+                           # MEASURED 2026-10-13, real audio (311 s zh news, 31 s en ad), terms 教皇/Porsche/
+                           # Macan/马克龙/梅拉尼亚: 1.5 -> 教皇 4/7, MACAN 2/3; 3.0 -> 教皇 5/7, MACAN 3/3, no
+                           # other word changed vs 1.5; 4.0 = 3.0. Raised to 3.0 (TTS-only damage above is older)
+asr_glossary_cutoff: 0.75  # finals: an out-of-lexicon word this close (difflib) to a Glossary word becomes it
+                           # (MACON -> MACAN). Lower = more snaps, more wrong ones
 asr_lexicon: models/lexicon/words.txt   # scripts/get_lexicon.py (Tatoeba en+vi word counts). Final
                            # transcripts only: an out-of-lexicon en/vi word (>= 4 letters) snaps to the most
                            # frequent close lexicon word; Glossary words are never touched. Missing file = off
@@ -98,11 +105,16 @@ vad_skip_denoise: false      # also skip DeepFilterNet when VAD frac >= 0.9
                              # (extra ms; off — denoise quality first)
 
 # ---- Voice suppression (DeepFilterNet: https://github.com/Rikorose/DeepFilterNet) ----
-noise_suppress: true       # master toggle; also flippable per-request from the UI
-denoise_mode: gate         # gate = lightest: numpy/scipy spectral gate, stationary noise only
-                           # | deepfilternet = DF in-proc -> DF sidecar -> gate chain.
-                           # MEASURED 10 s noisy audio: gate 24 ms / -13.4 dB,
-                           # DF sidecar 445 ms / -26.5 dB (scripts/test_denoise.py)
+noise_suppress: true       # master enable; the UI toggle (default OFF) decides per session.
+                           # MEASURED 18 noisy TTS clips (white/fan/babble, 5+10 dB, vi/en/zh), ASR CER
+                           # vs clean: none 0.060, gate 0.073, gtcrn 0.088, DF 0.112 -> no denoiser helps
+                           # this Zipformer. Live e2e (12 sentences): denoise ON final 0.97 s / all MT
+                           # 1.46 s after speech end, OFF 0.69 s / 1.15 s (ON re-decodes every segment)
+denoise_mode: gate         # gate = lightest: numpy/scipy spectral gate, 2 ms per s audio
+                           # | gtcrn = GTCRN (sherpa-onnx, 0.5 MB, CPU, in-process) 40 ms per s
+                           # | deepfilternet = DF in-proc -> DF sidecar -> gate chain, 105-120 ms per s.
+                           # 15 s segment: gate 29 ms, gtcrn 597 ms, DF sidecar 1784 ms
+gtcrn_model: models/gtcrn/gtcrn_simple.onnx   # sherpa-onnx speech-enhancement-models release; missing = gate
 df_model: null             # null = package default (DeepFilterNet3). Alt: DeepFilterNet2, DeepFilterNet
 df_post_filter: false      # extra attenuation of very noisy sections
 df_atten_lim_db: null      # e.g. 12 = cap suppression at 12 dB, keep some ambience; null = full
@@ -111,9 +123,17 @@ df_python: null            # Python with deepfilternet for the sidecar (null = .
 
 # ---- Conference / diarization ----
 sample_rate: 16000
-segment_seconds: 5.0             # fixed-window size for the /api/transcribe upload path
+segment_seconds: 5.0             # max chunk for the /api/transcribe upload path, cut at the quietest 50 ms of
+                                 # its 2nd half (pause / sentence end), not mid-word. MEASURED 311 s zh news + 31 s
+                                 # en ad: sentences come out whole (PRACTICALITY, DRIVER SEAT, 会谈 recovered); same RTF
 frame_seconds: 0.5               # mic frame size fed to the streaming recognizer
-endpoint_silence: 1.0            # pause (s) that finalizes a segment — breaks at pauses, not mid-word
+endpoint_silence: 1.0            # pause (s) that finalizes a segment — breaks at pauses, not mid-word.
+                                 # Counted in 0.5 s UI frames, so 0.5 = one silent frame, 1.0 = two.
+                                 # MEASURED live e2e, 12 TTS sentences, denoise off: 1.0 -> final text
+                                 # 0.69 s / all MT 1.15 s after speech end; 0.5 -> 0.00 s / 0.60 s, same
+                                 # rows, last word kept (_finalize pads the look-ahead). ASR CER vs script
+                                 # 1.0: 0.053/0.065, 0.5: 0.060/0.076/0.063/0.042 (= noise). 15 s real speech
+                                 # stayed one row. Kept at 1.0: mid-sentence pauses of slow talkers are untested at 0.5
 endpoint_min_speech: 0.5         # ignore shorter blips
 max_segment: 20.0                # force-finalize run-on speech without pauses
 ssbd_beta: 0.3                   # SSBD draft bias (paper: 0.2 best quality; 0.3 = +6% draft reuse, -1% COMET)

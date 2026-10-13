@@ -58,6 +58,7 @@ class ZipformerEngine:
         self.num_threads = int(cfg.get("asr_threads", 4))
         self.hotwords_score = float(cfg.get("asr_hotwords_score", 0))
         self.lex_cutoff = float(cfg.get("asr_lexicon_cutoff", 0.85))
+        self.gloss_cutoff = float(cfg.get("asr_glossary_cutoff", 0.75))
         self._lock = threading.Lock()
         self._rec = None
         self.model_id = f"zipformer zh-en-vi (onnx {self.quant}, local)"
@@ -116,23 +117,28 @@ class ZipformerEngine:
         return lex
 
     def correct(self, text: str, terms: dict | None = None) -> str:
-        """Snap misheard (out-of-lexicon) words to the closest frequent lexicon word.
+        """Snap misheard words: near a Glossary word -> that word (asr_glossary_cutoff), else
+        out-of-lexicon -> the closest frequent lexicon word.
 
         Glossary words are never touched; CJK, short and non-alphabetic words pass through.
         ponytail: per-word spelling only, no context (a real-word mishearing like
         "there"/"their" stays); an n-gram LM (sherpa-onnx lm=) is the upgrade.
         """
-        if not self.lexicon or not text:
+        keep = {w.lower(): w for kv in (terms or {}).items() for t in kv for w in t.split()}
+        if not (self.lexicon or keep) or not text:
             return text
-        keep = {w.lower() for kv in (terms or {}).items() for t in kv for w in t.split()}
+        gloss = [w for w in keep if len(w) >= 4]
         out = []
         for word in text.split():
             k = word.lower()
             bucket = self.lexicon.get(k[0], {})
-            if (len(k) >= 4 and k.isalpha() and k not in bucket and k not in keep
+            if (len(k) >= 4 and k.isalpha() and k not in keep and k not in bucket  # real words stay
                     and not any("\u3400" <= c <= "\u9fff" for c in k)):
-                hits = difflib.get_close_matches(k, bucket, 3, self.lex_cutoff)
-                if hits:
+                g = difflib.get_close_matches(k, gloss, 1, self.gloss_cutoff)
+                hits = [] if g else difflib.get_close_matches(k, bucket, 3, self.lex_cutoff)
+                if g:
+                    word = g[0].upper() if word.isupper() else keep[g[0]]
+                elif hits:
                     best = max(hits, key=bucket.get)
                     word = best.upper() if word.isupper() else best
             out.append(word)

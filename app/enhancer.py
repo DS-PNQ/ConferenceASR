@@ -137,7 +137,7 @@ class DeepFilterNetEnhancer:
         self._df_state = None
         self._ready = False
         self._available = False  # some denoiser is running (mode != "off")
-        self.mode = "off"  # inproc (df here) | sidecar (df in a 3.11 venv) | gate (spectral)
+        self.mode = "off"  # inproc (df here) | sidecar (df in a 3.11 venv) | gtcrn | gate (spectral)
         self._proc = None
 
     # -- lifecycle ---------------------------------------------------------
@@ -148,7 +148,23 @@ class DeepFilterNetEnhancer:
             if self._ready:
                 return
             global _WARNED
-            if str(self.cfg.get("denoise_mode", "deepfilternet")).lower() == "gate":
+            want = str(self.cfg.get("denoise_mode", "deepfilternet")).lower()
+            if want == "gtcrn":
+                try:
+                    import sherpa_onnx
+
+                    self._gtcrn = sherpa_onnx.OfflineSpeechDenoiser(sherpa_onnx.OfflineSpeechDenoiserConfig(
+                        model=sherpa_onnx.OfflineSpeechDenoiserModelConfig(
+                            gtcrn=sherpa_onnx.OfflineSpeechDenoiserGtcrnModelConfig(
+                                model=str(self.cfg.get("gtcrn_model", "models/gtcrn/gtcrn_simple.onnx"))),
+                            num_threads=1, provider="cpu")))
+                    self.mode, self._ready, self._available = "gtcrn", True, True
+                    log.info("Denoise: GTCRN (sherpa-onnx, CPU)")
+                    return
+                except Exception as e:
+                    log.warning("GTCRN unavailable (%s) — spectral gate.", e)
+                    want = "gate"
+            if want == "gate":
                 self.mode, self._ready, self._available = "gate", True, True
                 log.info("Denoise: spectral gate (denoise_mode: gate)")
                 return
@@ -227,6 +243,9 @@ class DeepFilterNetEnhancer:
             try:
                 if self.mode == "gate":
                     return spectral_gate(x, int(sr))
+                if self.mode == "gtcrn":  # 16 kHz model
+                    y = np.asarray(self._gtcrn(_resample(x, int(sr), 16000), 16000).samples, np.float32)
+                    return _resample(y, 16000, int(sr))[: x.size]
                 if self.mode == "sidecar":
                     return _resample(self._sidecar(_resample(x, int(sr), 16000)), 16000, int(sr))
                 import torch
@@ -261,9 +280,9 @@ class DeepFilterNetEnhancer:
                 pass
         return {
             "backend": {"inproc": "deepfilternet", "sidecar": "deepfilternet",
-                        "gate": "spectral-gate"}.get(self.mode, "passthrough"),
+                        "gtcrn": "gtcrn", "gate": "spectral-gate"}.get(self.mode, "passthrough"),
             "mode": self.mode,
-            "model": self.model_name or "DeepFilterNet3 (default)",
+            "model": "GTCRN" if self.mode == "gtcrn" else self.model_name or "DeepFilterNet3 (default)",
             "device": device,
             "target_sr": DF_SR,
             "enabled": self.enabled,

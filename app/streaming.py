@@ -33,6 +33,7 @@ import numpy as np
 
 from .diarizer import rms_dbfs
 from .langid import detect as detect_lang
+from .zipformer_engine import TAIL_SECONDS
 
 log = logging.getLogger("conf.stream")
 
@@ -460,6 +461,15 @@ class StreamingSession:
                 text = text_override
             else:
                 try:
+                    # the recognizer holds back its last ~0.66 s (look-ahead) until it
+                    # hears that much more audio: pad what the trailing silence didn't
+                    # cover, or a short endpoint / max_segment cut drops the last word
+                    pad = TAIL_SECONDS - self._trailing_sil
+                    if pad > 0:
+                        self._stream.accept_waveform(16000, np.zeros(int(16000 * pad), np.float32))
+                        self._stream.input_finished()
+                        while self._rec.is_ready(self._stream):
+                            self._rec.decode_stream(self._stream)
                     text = self._rec.get_result(self._stream).strip()
                 except Exception:
                     text = self._last_partial

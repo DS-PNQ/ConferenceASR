@@ -136,8 +136,9 @@ Same-language "translations" are raw UPPERCASE ASR text; they are lowercased bef
 | Diarization | `nvidia/Nemotron-3-Diarization` streaming, 0.32 s, local + offline (→ NeMo Titanet → volume fallback chain) | https://huggingface.co/nvidia/Nemotron-3-Diarization |
 
 UI is a native desktop window in a macOS style (system font, Apple system colours,
-light + dark): a floating glass sidebar, a unified toolbar that is also the title bar
-(Windows draws its caption buttons over it), and a transcript feed with live partials,
+light + dark): a floating glass sidebar (☰ left of the logo shrinks it to an icon rail, like YouTube), a unified toolbar that is also the title bar
+(Windows draws its caption buttons over it; the page scrollbar starts below it), a
+Newsreader Light wordmark (free stand-in for Hyperliquid's Teodor Light), and a transcript feed with live partials,
 token-streamed translations, speaker colours, a Voice Memos-style recorder, and
 **Listen + Copy buttons under every translation**. No browser needed.
 
@@ -281,9 +282,10 @@ No weights / no GPU? The backend boots in clearly-labelled **demo mode**
 device: auto            # auto | cuda | cpu   (env DEVICE overrides, affects MT)
 asr_model: D:/CONFERENCE ASR/zipformer zh-en-vi onnx phaseB 2e  # local ONNX dir (any phaseB tag)
 asr_provider: cpu       # sherpa-onnx wheels are CPU-only
-asr_quant: auto         # auto = int8 on cpu
+asr_quant: auto         # auto = int8 on cpu (fp32: same accuracy on 342 s of real zh/en audio, 1.55x slower, +146 MB)
 asr_threads: 4
-asr_hotwords_score: 1.5 # Glossary terms bias the recognizer (beam search); 0 = off. >=2 mangles neighbours
+asr_hotwords_score: 3.0 # Glossary terms bias the recognizer (beam search); 0 = off. 3.0 measured best on real audio
+asr_glossary_cutoff: 0.75 # finals: an out-of-lexicon word this close to a Glossary word becomes it (MACON -> MACAN)
 asr_lexicon: models/lexicon/words.txt  # scripts/get_lexicon.py: Tatoeba spell-snap of misheard en/vi words in finals
 asr_lexicon_cutoff: 0.85  # similarity needed to snap; lower fixes more but also bends names/jargon
 mt_model: tencent/Hy-MT2-1.8B-FP8
@@ -298,8 +300,9 @@ mt_lookup_tokens: 10
 mt_history_turns: 3     # past segments as translation context (terminology/style)
 mt_history_chars: 600
 mt_do_sample: false     # greedy decode = fastest
-noise_suppress: true    # pre-ASR denoising (UI toggle overrides per request)
-denoise_mode: gate      # gate = lightest (spectral gate, 24 ms / -13.4 dB per 10 s) | deepfilternet
+noise_suppress: true    # master enable; the UI Noise reduction toggle (default off) decides per session
+denoise_mode: gate      # gate = lightest (spectral gate, 24 ms / -13.4 dB per 10 s) | gtcrn | deepfilternet
+gtcrn_model: models/gtcrn/gtcrn_simple.onnx   # denoise_mode: gtcrn (download_models.py fetches it)
 df_model: null          # null = DeepFilterNet3; alt: DeepFilterNet2, DeepFilterNet
 df_post_filter: false
 df_atten_lim_db: null   # e.g. 12 caps suppression, keeps ambience
@@ -316,11 +319,11 @@ split_token_slack: 0.12          # ASR token-time lag allowance at a split
 nemo_embedding_model: nvidia/speakerverification_en_titanet_large
 nemo_cos_thresh: 0.55            # below this cosine -> new speaker (to max_speakers)
 frame_seconds: 0.5       # mic frame size for the streaming recognizer
-endpoint_silence: 1.0    # pause (s) that finalizes a segment
+endpoint_silence: 1.0    # pause (s) that finalizes a segment (0.5 = ~0.6 s faster rows, may split slow talkers)
 endpoint_min_speech: 0.5
 max_segment: 20.0        # force-finalize run-on speech
 mt_retranslate_words: 5  # live re-translation pace (new words); finals verify the last SSBD draft
-segment_seconds: 5.0     # fixed-window size for the /api/transcribe upload path
+segment_seconds: 5.0     # max chunk for the /api/transcribe upload path; cut at the quietest point of its 2nd half
 vi_ocr_model: models/vietocr-s2s  # optional Vietnamese OCR reader (scripts/get_vietocr.py); missing = PP-OCR/VLM only
 tts_dir: models/tts      # Listen-button voices per language (scripts/get_tts.py); missing language = OS voice
 tts_threads: 2           # CPU threads per synth
@@ -337,9 +340,19 @@ Backend chain (`/api/health → denoise.mode`): **inproc** (deepfilternet import
 i.e. Python 3.11) → **sidecar** (`app/df_sidecar.py` under `../dfenv`, a Python 3.11
 venv with CPU torch 2.5.1 + deepfilternet; used when the backend runs on 3.12 for
 triton) → **gate** (numpy/scipy spectral gate, the lightest option). `denoise_mode: gate`
-(the default) skips straight to the gate; `denoise_mode: deepfilternet` runs the chain. Measured on 10 s
-of noisy audio: DF sidecar 445 ms / −26.5 dB, spectral gate 24 ms / −13.4 dB
-(`py -3 scripts/test_denoise.py`). Recreate the sidecar env:
+(the default) skips straight to the gate; `denoise_mode: gtcrn` runs GTCRN in-process through
+sherpa-onnx (0.5 MB model, CPU, no extra Python env; gate if the file is missing);
+`denoise_mode: deepfilternet` runs the chain. Measured on 10 s of noisy audio: DF sidecar
+404–445 ms / −26.5 dB, GTCRN 392 ms / −28.4 dB, spectral gate 21–24 ms / −13.4 dB
+(`py -3 scripts/test_denoise.py`).
+
+**Denoise is off by default in both UIs.** On 18 noisy clips (white, fan and babble noise
+at 5 and 10 dB SNR, vi/en/zh), the ASR error rate against the clean transcript was 0.060
+with no denoise, 0.073 with the gate, 0.088 with GTCRN and 0.112 with DeepFilterNet, so no
+denoiser helps this Zipformer. Turning it on also re-decodes every final segment: in the live
+test, the final text came 0.97 s after speech ended with denoise on and 0.69 s with it off.
+GTCRN beats DeepFilterNet on every count here (lighter, faster, more suppression, lower ASR
+error), so it is the one to use when you do want denoising. Recreate the DF sidecar env:
 
 ```powershell
 uv venv ..\dfenv --python 3.11
@@ -347,8 +360,8 @@ uv pip install --python ..\dfenv\Scripts\python.exe torch==2.5.1 torchaudio==2.5
 uv pip install --python ..\dfenv\Scripts\python.exe deepfilternet "numpy<2"
 ```
 
-Every segment is denoised *before* diarization/ASR (`app/enhancer.py`):
-16 kHz audio → 48 kHz → `DeepFilterNet3` enhance → back to 16 kHz.
+When on, every final segment is denoised and re-decoded (`app/enhancer.py`); the diarizer
+and live partials always hear raw audio. DeepFilterNet runs 16 kHz → 48 kHz → `DeepFilterNet3` → 16 kHz.
 Uploads are denoised whole-file in one pass (no chunk boundaries); live-mic
 chunks per segment. DeepFilterNet puts its own model on GPU when available,
 CPU otherwise; if the package/weights are missing it becomes a transparent
@@ -446,6 +459,7 @@ so an in-flight session finishes on the Titanet/volume fallback).
 python -m scripts.smoke_test      # device, denoiser, diarizer, pipeline, FP8 layer, API routes (+ /api/tts errors)
 python scripts/streaming_smoke.py # REAL engines: live partials + endpointed finals + MT
 python -m app.tts_engine          # each installed voice synthesizes; a missing language raises LookupError
+python scripts/bench_latency.py   # backend up: speech end -> final text / all translations (measured: 0.69 s / 1.15 s median)
 ```
 
 ## 8. Backend API (serves Electron + C#)
@@ -471,8 +485,9 @@ python -m app.tts_engine          # each installed voice synthesizes; a missing 
   block; verified steering output (e.g. forced `光子引擎`). Both sides of each pair also bias
   the recognizer (sherpa-onnx hotwords, `asr_hotwords_score`) on live streams and uploads.
   With `python scripts/get_lexicon.py` run once, final transcripts also snap misheard English/Vietnamese
-  words that are not in a Tatoeba word list to the closest frequent one (`asr_lexicon`); Glossary
-  words are kept as heard, so add names and jargon there.
+  words that are not in a Tatoeba word list to the closest frequent one (`asr_lexicon`). A near miss of a
+  Glossary word (MACON for Macan) snaps to the Glossary spelling first (`asr_glossary_cutoff`), so add names
+  and jargon there. Glossary edits during a live session apply from the next segment.
 
 ## Layout
 

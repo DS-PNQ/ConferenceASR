@@ -148,6 +148,8 @@ def main():
         "THE CONFERENCE ON QUANTIZATION hội nghi 说话人 KUBERNETES", z.correct("CONFERANCE")
     assert z.correct("CONFERANCE", {"Conferance": "x"}) == "CONFERANCE"  # Glossary wins
     assert ZipformerEngine({}).correct("CONFERANCE") == "CONFERANCE"     # no lexicon = off
+    assert ZipformerEngine({}).correct("THE MACON HAS", {"Macan": "Macan"}) == "THE MACAN HAS"  # Glossary snap
+    assert z.correct("CONFERENCES", {"Conference": "x"}) == "CONFERENCES"  # lexicon word: no snap
     print("ASR lexicon correction OK")
     print("SMOKE TEST PASSED")
 
